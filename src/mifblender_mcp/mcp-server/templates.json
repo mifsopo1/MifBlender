@@ -1,0 +1,4 @@
+{
+ "__doc__": "Templates: a start that asks the user what they want to make, plans it with them, and builds it with the bridge's own tools after their yes. Each registers as an MCP prompt (its `prompt` name, with an optional `idea` argument) and answers mif_help('<id>') for a client that shows no prompts - server.py _register_template_prompts and _render_template. A template builds nothing itself and has no look of its own: every value comes from the user's answers and is shown in the plan. Every tool and parameter a `calls` entry names is checked against server.py's own signatures by tools/test_mcp_packs.py.",
+ "templates": {}
+}

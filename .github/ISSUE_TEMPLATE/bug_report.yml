@@ -1,0 +1,32 @@
+name: Bug report
+description: Something did not work the way it should
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: MifBlender version
+      description: "`uvx mifblender-mcp --version`, or the version in Blender's add-on list"
+    validations:
+      required: true
+  - type: input
+    id: blender
+    attributes:
+      label: Blender version and operating system
+      placeholder: Blender 5.2.1, Windows 11
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: AI app
+      placeholder: Claude Code, Claude Desktop, Cursor, Windsurf, VS Code, Codex, or another
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+      description: The call and the reply help most, if you have them. Please leave out tokens and anything private.
+    validations:
+      required: true

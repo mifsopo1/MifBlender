@@ -1,0 +1,24 @@
+MifBlender MCP Server License
+
+Copyright (c) 2026 Mifsopo ("Mif"). All rights reserved except as granted below.
+
+1. Grant. You may download, install and use this MCP server (the files in this mcp-server folder and the launcher and setup files published with it, "the Server") free
+   of charge, on any number of computers, for any purpose, including commercial work. Anything you make with it is
+   yours.
+
+2. Changes. You may change the Server for your own use.
+
+3. Sharing. You may not sell or sublicense the Server. You may share it only unchanged, and only:
+   (a) by linking to the official download at https://mifshowcase.store, the official GitHub repository, or the official
+   package on the Python Package Index;
+   (b) through the forking and copying features GitHub provides for public repositories;
+   (c) through package indexes, their mirrors, and caches or proxies that serve the official package.
+   You may not publish a changed copy of the Server, except a fork made only to propose your change back to this project.
+
+4. No warranty. THE SERVER IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+   LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+   SHALL THE AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+   SERVER OR ITS USE.
+
+5. The MifBlender add-on that this Server talks to is licensed separately, under the MIT license
+   (blender-addon/MifBlender/LICENSE). The Server runs as its own process and does not use Blender's Python API.

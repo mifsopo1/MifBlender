@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "mifblender": {
+      "command": "python",
+      "args": ["<the full path of this folder>/server.py"],
+      "env": {
+        "MIF_BLENDER_PORT": "8792",
+        "MIF_BLENDER_TOKEN": "dev"
+      }
+    }
+  }
+}

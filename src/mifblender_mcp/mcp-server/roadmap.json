@@ -1,0 +1,58 @@
+{
+ "__doc__": "The roadmap catalog: goals, each an ordered list of steps made of this bridge's own tools. It says WHICH calls a step is made of and why, and nothing about whether they work: mif_roadmap derives that per engine, project and editor at call time (mif_roadmap_ground.py; docs/30_ROADMAP.md). A step is made of tools, or is `manual` with why the bridge cannot do it and what to do instead. A `check` is a read-only call that says the step is already done in the project; its endpoint must be on mif_roadmap_ground.CHECK_ENDPOINTS and its params are the endpoint's own (camelCase). tools/test_mif_roadmap.py checks every tool, check endpoint and check parameter named here.",
+ "goals": {
+  "blender_prop": {
+   "title": "A prop modelled in Blender, with collision, measured for a game engine",
+   "kind": "both",
+   "words": [
+    "blender",
+    "model",
+    "modelled",
+    "modeled",
+    "prop",
+    "mesh",
+    "modelling",
+    "modeling",
+    "asset",
+    "fbx",
+    "crate",
+    "barrel",
+    "furniture",
+    "object",
+    "collision",
+    "export"
+   ],
+   "steps": [
+    {
+     "id": "blender",
+     "say": "Blender answers, which version, and whether the add-on is the one this server expects.",
+     "tools": [
+      "bl_status"
+     ]
+    },
+    {
+     "id": "model",
+     "say": "Model it from primitives and edits - rounded edges catch the light.",
+     "tools": [
+      "bl_create_primitive",
+      "bl_bevel_edges"
+     ]
+    },
+    {
+     "id": "game_ready",
+     "say": "Make it game-ready and measure it: transforms, a UV layer, and the mesh quality checks.",
+     "tools": [
+      "bl_recipe_game_ready"
+     ]
+    },
+    {
+     "id": "collision",
+     "say": "Convex collision hulls named for Unreal's UCX_ convention.",
+     "tools": [
+      "bl_create_collision_hull"
+     ]
+    }
+   ]
+  }
+ }
+}

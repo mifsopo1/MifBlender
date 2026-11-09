@@ -1,0 +1,12 @@
+MifBlender 1.3.1 - which license covers which part
+
+- The Blender add-on (src/mifblender_mcp/blender-addon/MifBlender/) is MIT licensed. Its license, and the notice for the
+  third-party code it adapts, are in src/mifblender_mcp/blender-addon/MifBlender/LICENSE.
+
+- The MCP server (src/mifblender_mcp/mcp-server/), the launcher and setup files (src/mifblender_mcp/) and the packaging files
+  at the top of this repository are covered by src/mifblender_mcp/mcp-server/LICENSE: free for any use, including
+  commercial work, and shareable only as that license says. It is not an open source license.
+
+- The images in assets/ are covered by assets/LICENSE.
+
+All of it is free of charge.

@@ -1,0 +1,1376 @@
+{
+ "_source": "Filtered by tools/build_blender_mcp.py from MifBridge's packs.json: the Blender packs and core's backend-neutral tools. Do not edit by hand.",
+ "packs": {
+  "core": {
+   "title": "Core",
+   "description": "Loaded with any named selection - a selection of Blender packs only keeps just its six backend-neutral tools, the ones that find, load and call the rest, and run_python - while the unset default loads only find_tools, mif_call and run_python. Orientation and the commonest reads and writes: self_audit, describe_endpoint, mif_help, find_tools (finds tools in packs that are not loaded, and names the pack), the pack tools, mif_call (reaches ANY tool by name, loaded or not), run_python (a Python script in Blender, when the add-on allows it, or in the Unreal Editor, where its Python plugin is on), find_assets, get/set_property, list_level_actors, batch, saving (list_dirty_packages, save_package, save_dirty_packages), ping, project_paths.",
+   "backend": "any",
+   "tools": [
+    "find_tools",
+    "mif_call",
+    "mif_enable_pack",
+    "mif_help",
+    "mif_list_packs",
+    "run_python",
+    "mif_project_mode"
+   ],
+   "neutral": [
+    "find_tools",
+    "mif_call",
+    "mif_enable_pack",
+    "mif_help",
+    "mif_list_packs",
+    "run_python",
+    "mif_project_mode"
+   ],
+   "rules": [
+    {
+     "rule": "Test get_property's typed, never value (export text: a false bool is the truthy string 'False'). Write set_property values in typed's form: lists, objects for structs (typed's keys are case-sensitive: X/Y/Z, Pitch/Yaw/Roll), enum names, references as '/Game/Dir/Mesh.Mesh'.",
+     "tools": [
+      "get_property",
+      "set_property"
+     ]
+    },
+    {
+     "rule": "For a placed actor's component, pass the actorPath as set_property/get_property path and walk by property name, e.g. 'StaticMeshComponent.StaticMesh'. A component held in an array is addressed by index ('Switches[0].StaticMesh'), never by its object name ('Switch0').",
+     "tools": [
+      "set_property",
+      "get_property"
+     ]
+    },
+    {
+     "rule": "An error does not mean nothing changed: a failed call keeps any edit it made before failing, and a value of the wrong JSON type (2 for a boolean, 1.5 for an integer) can fail the call after the handler already ran with that parameter's default. Re-read the target after any error.",
+     "tools": []
+    },
+    {
+     "rule": "Edits live only in editor memory until saved: a new asset vanishes on restart, and list_dirty_packages lists what would be lost. Read mode refuses every write. Scratch mode refuses saves and writes outside /Game/_Mif*; only a person can raise it to full, in the panel.",
+     "tools": [
+      "list_dirty_packages"
+     ]
+    },
+    {
+     "rule": "batch ops are {op: '<endpoint>', ...} written in its tool's arguments (graph_id, src_node) or camelCase (graphId, srcNode). Every op runs even after one fails and nothing rolls back: read each results[i] error; ok:false says only that some op or the final compile failed.",
+     "tools": [
+      "batch"
+     ]
+    },
+    {
+     "rule": "When describe_endpoint answers status params_not_declared it omits acceptedParams: the parameters are unknown, not none (only acceptsNoParameters:true means none). Fall back to mif_help('<tool>') and the tool's own parameter list.",
+     "tools": [
+      "describe_endpoint",
+      "mif_help"
+     ]
+    },
+    {
+     "rule": "list_level_actors' rotation is {x: pitch, y: yaw, z: roll} in degrees (location in cm), renormalised on read, so compare with a tolerance. It reads the editor world: check world is the map you expect, and while PIE runs it returns count 0 with worldType still 'editor'.",
+     "tools": [
+      "list_level_actors"
+     ]
+    },
+    {
+     "rule": "find_assets' count is the match total and returned the rows sent (limit defaults to 100): check truncated. It reads the asset registry, so files copied into Content/ while the editor runs can come back count 0 with no error; rescan with audit_unused(path_prefix, rescan=True).",
+     "tools": [
+      "find_assets",
+      "audit_unused"
+     ]
+    },
+    {
+     "rule": "set_property reaches a Blueprint's class defaults (bReplicates, variable defaults) only on its class default object, '/Game/Dir/BP.Default__BP_C'; '/Game/Dir/BP.BP' is the Blueprint editor object. The edit survives a compile; save the package to keep it.",
+     "tools": [
+      "set_property"
+     ]
+    },
+    {
+     "rule": "set_property writes a value outside the property's ClampMin/ClampMax (flagged in clampViolation) unless enforce_clamps=True, and by default also sets the property's EditCondition flag (overrideFlagWritten) so the engine reads it; override_flag='refuse' refuses instead.",
+     "tools": [
+      "set_property"
+     ]
+    }
+   ]
+  },
+  "blender_core": {
+   "title": "Blender: Scene & Objects",
+   "description": "Start here for any Blender work: status, scene and object info, the op describer, the call log, batch, undo, transforms and parenting, visibility, collections, custom properties, scenes and .blend files.",
+   "backend": "blender",
+   "tools": [
+    "bl_add_collection_instance",
+    "bl_append_from_file",
+    "bl_artifact_inventory",
+    "bl_batch",
+    "bl_batch_rename",
+    "bl_call_log",
+    "bl_call_operator",
+    "bl_clear_scene",
+    "bl_create_collection",
+    "bl_create_scene",
+    "bl_delete_collection",
+    "bl_delete_object",
+    "bl_delete_scene",
+    "bl_describe_op",
+    "bl_duplicate_collection",
+    "bl_duplicate_object",
+    "bl_enable_addon",
+    "bl_file_info",
+    "bl_link_objects",
+    "bl_list_collections",
+    "bl_list_custom_properties",
+    "bl_list_library_assets",
+    "bl_list_objects",
+    "bl_list_previews",
+    "bl_list_recent_operators",
+    "bl_list_scenes",
+    "bl_manage_external_data",
+    "bl_object_info",
+    "bl_object_relations",
+    "bl_open_file",
+    "bl_purge_orphans",
+    "bl_redo",
+    "bl_remap_datablock",
+    "bl_rename_object",
+    "bl_run_python",
+    "bl_save_file",
+    "bl_scene_info",
+    "bl_set_collection_visibility",
+    "bl_set_current_scene",
+    "bl_set_custom_property",
+    "bl_set_object_visibility",
+    "bl_set_parent",
+    "bl_set_scene_units",
+    "bl_status",
+    "bl_transform_object",
+    "bl_undo",
+    "bl_undo_history",
+    "bl_unlink_objects"
+   ],
+   "rules": [
+    {
+     "rule": "Pass rotations in radians - bl_transform_object's and every create call's; degrees go through silently (90 is read as 90 rad). bl_transform_object sets location, rotation and scale in the parent's space, while its before/after are read off the world matrix.",
+     "tools": [
+      "bl_transform_object"
+     ]
+    },
+    {
+     "rule": "Creating an object or scene under a taken name does not fail: Blender adds '.001' (nameWasSuffixed; renamed on bl_create_scene and bl_append_from_file) - use the returned name. A failed bl_batch keeps what it applied, so re-running it duplicates; one bl_undo takes it back.",
+     "tools": [
+      "bl_create_scene",
+      "bl_append_from_file",
+      "bl_batch",
+      "bl_undo"
+     ]
+    },
+    {
+     "rule": "In bl_object_info, dimensionsBU is the evaluated size (modifiers, shape keys, world scale) while boundsLocal* and vertex counts are the base mesh; instances (geometry nodes, particles) are in neither - drawnInstances counts them. bl_list_objects' dimensionsBU is Blender's box.",
+     "tools": [
+      "bl_object_info",
+      "bl_list_objects"
+     ]
+    },
+    {
+     "rule": "bl_clear_scene (purge_orphans on by default), bl_delete_object with purge_orphans, and bl_purge_orphans without only remove zero-user datablocks file-wide, not just what the call orphaned: a material or node group made but not yet assigned goes too. Assign or use it first.",
+     "tools": [
+      "bl_clear_scene",
+      "bl_delete_object",
+      "bl_purge_orphans"
+     ]
+    },
+    {
+     "rule": "bl_delete_object without purge_orphans leaves the object's data (light, camera, curve, text) holding its name, so creating it again under that name comes back '<name>.001'. Free just that name with bl_purge_orphans {confirm: true, only: ['lights:<name>']}.",
+     "tools": [
+      "bl_delete_object",
+      "bl_purge_orphans"
+     ]
+    },
+    {
+     "rule": "Treat a timeout as unknown, not failed: a call past the add-on's job timeout (150 s by default) or the MCP's may still finish. bl_call_log lists each call's ok or error once it ends; after a crash, bl_call_log {disk: true} names the call Blender died in under unfinished.",
+     "tools": [
+      "bl_call_log"
+     ]
+    },
+    {
+     "rule": "bl_object_info's rotationEulerRad and isIdentityTransform read rotation_euler only, which Blender ignores in QUATERNION or AXIS_ANGLE mode (glTF imports are quaternion): a turned object can read zero. bl_transform_object's reply gives rotationMode and the world rotation.",
+     "tools": [
+      "bl_object_info",
+      "bl_transform_object"
+     ]
+    },
+    {
+     "rule": "In run_python or bl_run_python a subscript write - obj['key'] = v, or a geometry-nodes modifier input - reaches no evaluated object, nor a driver on another object reading it, until obj.update_tag(); tag before adding the driver. bl_set_custom_property tags for you.",
+     "tools": [
+      "run_python",
+      "bl_run_python",
+      "bl_set_custom_property"
+     ]
+    },
+    {
+     "rule": "bl_undo steps back one bridge call at a time - a refused call and a whole bl_batch are one step each - and no further than Blender's undo_steps (32 by default). It records nothing while the file holds a fluid domain, and exported, rendered or saved files stay.",
+     "tools": [
+      "bl_undo",
+      "bl_batch"
+     ]
+    },
+    {
+     "rule": "bl_list_objects, bl_scene_info's counts and bl_clear_scene cover every object in the .blend - all scenes, and objects bl_delete_scene left behind - not just the current scene. With several scenes, read sceneObjectCount, filter rows on inViewLayer and delete by name.",
+     "tools": [
+      "bl_list_objects",
+      "bl_scene_info",
+      "bl_clear_scene",
+      "bl_delete_scene"
+     ]
+    }
+   ]
+  },
+  "blender_modeling": {
+   "title": "Blender: Modelling & Mesh",
+   "description": "Build and shape geometry: primitives, mesh from data, curves, text, trees with real geometry leaves, rocks, ground cover, kit pieces, wooden props, booleans, join/separate, convert, the modifier stack, origins and the placement audit. Edit a mesh's parts - select, delete, bevel, clean up, UVs, vertex colors, the geometric queries - in blender_mesh_edit. Where a model, prop or asset for Unreal is made: when bl_status answers, build it here (bl_build_rock, bl_build_plant, bl_build_tree, bl_build_kit_piece, bl_build_prop, or primitives and modifiers) and send it with mif_send_to_unreal; build in Unreal only where its tool is the better maker - landscape, foliage painting, PCG.",
+   "backend": "blender",
+   "tools": [
+    "bl_add_modifier",
+    "bl_apply_modifier",
+    "bl_apply_transform",
+    "bl_audit_placement",
+    "bl_boolean_op",
+    "bl_build_downspout",
+    "bl_build_dumpster",
+    "bl_build_kit_piece",
+    "bl_build_lathe",
+    "bl_build_plant",
+    "bl_build_prop",
+    "bl_build_rock",
+    "bl_build_trash_bag",
+    "bl_build_tree",
+    "bl_build_tube",
+    "bl_build_vehicle_body",
+    "bl_build_wall_fixture",
+    "bl_convert_object",
+    "bl_create_collision_hull",
+    "bl_create_curve",
+    "bl_create_empty",
+    "bl_create_mesh",
+    "bl_create_point_cloud",
+    "bl_create_primitive",
+    "bl_create_text",
+    "bl_garment_reshape",
+    "bl_join_objects",
+    "bl_list_modifiers",
+    "bl_mesh_distance",
+    "bl_mesh_stats",
+    "bl_remove_mesh_attributes",
+    "bl_remove_modifier",
+    "bl_separate_mesh",
+    "bl_set_curve",
+    "bl_set_modifier",
+    "bl_set_origin",
+    "bl_set_shading",
+    "bl_set_skin_vertices",
+    "bl_set_text",
+    "bl_transform_objects"
+   ],
+   "requires": [
+    "blender_core"
+   ],
+   "makes": [
+    "model",
+    "mesh",
+    "prop",
+    "asset",
+    "rock",
+    "boulder",
+    "cliff",
+    "stone",
+    "plant",
+    "tree",
+    "bush",
+    "fern",
+    "grass",
+    "building",
+    "house",
+    "wall",
+    "floor",
+    "pillar",
+    "kit",
+    "crate",
+    "barrel",
+    "furniture",
+    "statue",
+    "pallet",
+    "table",
+    "bench",
+    "chair",
+    "shelf"
+   ],
+   "rules": [
+    {
+     "rule": "Before you answer, run bl_mesh_quality game_ready=true on every mesh you built; send each reason's fix as given, and where it has choices instead, look, then pick. Finish hard-surface props with bl_bevel_edges finish=true. Give every bl_boolean_op cleanup=true.",
+     "tools": [
+      "bl_mesh_quality",
+      "bl_boolean_op",
+      "bl_bevel_edges"
+     ]
+    },
+    {
+     "rule": "bl_create_primitive, bl_create_curve, bl_create_text, bl_create_empty and bl_create_lattice never refuse a taken name: the new object becomes Name.001 (nameWasSuffixed: true). Use the name the reply returns, and don't re-run a build step blindly - duplicates render and export.",
+     "tools": [
+      "bl_create_primitive",
+      "bl_create_curve",
+      "bl_create_text",
+      "bl_create_empty",
+      "bl_create_lattice"
+     ]
+    },
+    {
+     "rule": "bl_mesh_stats' `base` and top-level bboxWorld are the unmodified mesh (no modifiers, armature pose or shape keys); what renders is under `evaluated`, which is null when it has no modifiers and no shape key past the basis. Read evaluated when present, else base.",
+     "tools": [
+      "bl_mesh_stats"
+     ]
+    },
+    {
+     "rule": "After a bl_boolean_op difference, compare topologyAfter's boundsLocal with topologyBefore's: a difference can only shrink the target, so a bigger box means cutter faces outside the target were kept (seen with EXACT on 5.0) - under a success reply, in the target's material.",
+     "tools": [
+      "bl_boolean_op"
+     ]
+    },
+    {
+     "rule": "bl_audit_placement runs only the tests you switch on - bounds for containment, floor for floating/sunken, check_overlaps=True for collisions - so a bare call returns all-zero totals having tested nothing. Its overlaps are bounding-box candidates; confirm with bl_objects_overlap.",
+     "tools": [
+      "bl_audit_placement",
+      "bl_objects_overlap"
+     ]
+    },
+    {
+     "rule": "bl_set_shading's auto_smooth_angle: up to 4.0 it sets the mesh's auto smooth; from 4.1 it adds a Smooth by Angle modifier (it exports; bl_list_modifiers shows it) or, if that operator cancels (headless 4.2/4.4), marks sharp edges with no modifier. autoSmoothVia says which.",
+     "tools": [
+      "bl_set_shading",
+      "bl_list_modifiers"
+     ]
+    }
+   ]
+  },
+  "blender_mesh_edit": {
+   "title": "Blender: Mesh Editing",
+   "description": "Edit a mesh's parts: select faces and edges, delete elements, bevel, extrude a skirt, move a selection, bisect, clean up and decimate, UV unwrap, layers and checks, vertex colors, and the geometric queries (ray cast, closest point, overlap, face/vertex info, mesh quality); a garment against its body - the gap by region and how a skinned mesh stretches over frames - and a source's skin weights blended in under a soft mask.",
+   "backend": "blender",
+   "tools": [
+    "bl_add_quads_on_surface",
+    "bl_bevel_edges",
+    "bl_bisect_plane",
+    "bl_circularize",
+    "bl_clean_mesh",
+    "bl_closest_point_on_mesh",
+    "bl_cut_eyelets",
+    "bl_decimate_mesh",
+    "bl_delete_mesh_elements",
+    "bl_dissolve_mesh_elements",
+    "bl_extrude_mesh",
+    "bl_extrude_skirt",
+    "bl_face_info",
+    "bl_fill_mesh_loop",
+    "bl_fold_boundary_under",
+    "bl_inset_faces",
+    "bl_join_boundary_loops",
+    "bl_knife_cut",
+    "bl_knife_project",
+    "bl_loop_cut",
+    "bl_mark_seams",
+    "bl_merge_vertices",
+    "bl_mesh_from_outline",
+    "bl_mesh_quality",
+    "bl_mesh_sections",
+    "bl_objects_overlap",
+    "bl_offset_edges",
+    "bl_push_out_of",
+    "bl_ray_cast",
+    "bl_relax_loop",
+    "bl_rip_edges",
+    "bl_select_edges",
+    "bl_select_faces",
+    "bl_set_uv_layer",
+    "bl_set_vertex_color",
+    "bl_slide_edges",
+    "bl_snap_to_surface",
+    "bl_subdivide_mesh",
+    "bl_transform_selection",
+    "bl_uv_info",
+    "bl_uv_stitch",
+    "bl_uv_straighten_islands",
+    "bl_uv_transform_islands",
+    "bl_vertex_info"
+   ],
+   "requires": [
+    "blender_core"
+   ],
+   "rules": [
+    {
+     "rule": "Read bl_bevel_edges' offsetAppliedBU - clamp_overlap (default on) can cap the offset - and selfIntersectingFacePairs: from Blender 4.4 clamping no longer stops a big bevel crossing itself. preserve_x=True flattens the bevel at the X ends; use it for tiles only.",
+     "tools": [
+      "bl_bevel_edges"
+     ]
+    },
+    {
+     "rule": "bl_uv_unwrap with no uv_layer unwraps into the ACTIVE UV layer and replaces whatever layout is there - replace only guards a layer you name. To keep existing UVs pass a new uv_layer name; judge a layout with bl_uv_info (texel density, bounds), not by which unwrap ran last.",
+     "tools": [
+      "bl_uv_unwrap",
+      "bl_uv_info"
+     ]
+    },
+    {
+     "rule": "bl_vertex_info returns only the first 200 vertices unless you pass limit (max 20000) or indices - check verticesTruncated before acting on the rows. Each row's `co` is object-local and `world` is world space; with evaluated=True the indices are the modifier result's own.",
+     "tools": [
+      "bl_vertex_info"
+     ]
+    },
+    {
+     "rule": "Judge contact with bl_objects_overlap - any distance test misses solids that interpenetrate - and use bl_closest_point_on_mesh for near misses, never vertex-to-vertex distance. A TOUCHING verdict means coplanar faces OR a thin real intersection the sampling missed.",
+     "tools": [
+      "bl_objects_overlap",
+      "bl_closest_point_on_mesh"
+     ]
+    },
+    {
+     "rule": "bl_mesh_quality's `concerns` never lists open edges - a hole shows only in checks.boundaryEdges.count - and it judges the base mesh, not the modifier result. Read `checks` and `notMeasured` (no UV layer means no UV verdict at all) before calling a mesh clean.",
+     "tools": [
+      "bl_mesh_quality"
+     ]
+    }
+   ]
+  },
+  "blender_materials": {
+   "title": "Blender: Materials & Textures",
+   "description": "Surface looks: materials, Principled inputs and settings, procedural patterns, colour ramps, image textures, volumes, per-face material assignment, texture baking. Custom shader graphs need blender_nodes too.",
+   "backend": "blender",
+   "tools": [
+    "bl_add_procedural_texture",
+    "bl_assign_material_to_faces",
+    "bl_bake_hidden_face_map",
+    "bl_bake_texture",
+    "bl_build_lod_chain",
+    "bl_channel_pack_image",
+    "bl_create_image",
+    "bl_create_material",
+    "bl_create_texture",
+    "bl_create_udim_image",
+    "bl_derive_image_map",
+    "bl_describe_material",
+    "bl_fix_normal_map",
+    "bl_image_stats",
+    "bl_import_pbr_texture_set",
+    "bl_list_images",
+    "bl_list_materials",
+    "bl_paint_texture",
+    "bl_project_image_decal",
+    "bl_recipe_detail_bake",
+    "bl_reload_image",
+    "bl_resize_image",
+    "bl_save_image",
+    "bl_set_color_ramp",
+    "bl_set_material_properties",
+    "bl_set_material_settings",
+    "bl_set_material_slots",
+    "bl_set_material_texture",
+    "bl_set_material_volume",
+    "bl_set_vertex_color_by_rule",
+    "bl_spray_text_art",
+    "bl_transfer_face_materials",
+    "bl_uv_move_vertices",
+    "bl_uv_pack",
+    "bl_uv_relax",
+    "bl_uv_set_texel_density",
+    "bl_uv_unwrap"
+   ],
+   "requires": [
+    "blender_core"
+   ],
+   "rules": [
+    {
+     "rule": "bl_add_procedural_texture defaults to Generated coordinates (0-1 over each object's bounds); space 'Object' gives object units. scale multiplies the node's own Scale (default 5) - add settings {\"Scale\": 1}. One number scales X and Y only; pass [x, y, z] or it stretches in Z.",
+     "tools": [
+      "bl_add_procedural_texture"
+     ]
+    },
+    {
+     "rule": "bl_add_procedural_texture input 'normal' builds a Bump node; with no distance it writes 1.0 on every build (Blender 5.0+ defaults it to 0.001) - up to a full unit of height per unit of pattern value, too deep for grain, mortar or pores. Pass distance: mm to cm for fine detail.",
+     "tools": [
+      "bl_add_procedural_texture"
+     ]
+    },
+    {
+     "rule": "Blender's Noise output clusters around 0.5 (measured 0.26-0.73 at detail 6-9), not 0-1. Keep ramp stops (bl_set_color_ramp, or bl_add_procedural_texture's color_ramp) inside that band: a stop at 0.85 meant as 'top 15%' is never reached: the mask is empty, with no error.",
+     "tools": [
+      "bl_set_color_ramp",
+      "bl_add_procedural_texture"
+     ]
+    },
+    {
+     "rule": "On 4.2+ bl_set_material_settings' blend_method stores only HASHED or BLEND: OPAQUE and CLIP come back HASHED (see `clamped`). Use surface_render_method (DITHERED or BLENDED) there. Both are EEVEE settings; Cycles takes transparency from the shader's Alpha and Transmission.",
+     "tools": [
+      "bl_set_material_settings"
+     ]
+    },
+    {
+     "rule": "A bl_bake_texture DIFFUSE bake reads only the diffuse lobe: metal comes out black, part-metal darker, and the call still succeeds. Route Base Color (or Metallic) into an Emission shader and bake EMIT; EMIT is saved as sRGB, so decode a data map baked that way as sRGB.",
+     "tools": [
+      "bl_bake_texture"
+     ]
+    },
+    {
+     "rule": "A uv_map naming a layer the mesh lacks (bl_set_material_texture, bl_add_procedural_texture) is accepted and renders a fixed fallback, not the active one. uvMapNote checks only meshes already using the material, so assign it (bl_set_material_slots) before wiring a named UV layer.",
+     "tools": [
+      "bl_set_material_texture",
+      "bl_add_procedural_texture",
+      "bl_set_material_slots"
+     ]
+    },
+    {
+     "rule": "For smoke, fire or fog use bl_set_material_volume with surface 'disconnect': a Principled BSDF left on Surface (bl_create_material's) renders the domain as a solid box in both engines. Keep density_attribute 'density': empty fills the box in EEVEE and shows nothing in Cycles.",
+     "tools": [
+      "bl_set_material_volume",
+      "bl_create_material"
+     ]
+    },
+    {
+     "rule": "bl_set_material_settings' displacement_method is read by both engines, but in EEVEE BOTH renders exactly like DISPLACEMENT (the reply's bothNote); only Cycles adds the bump on top of the displacement.",
+     "tools": [
+      "bl_set_material_settings"
+     ]
+    },
+    {
+     "rule": "A procedural baked with bl_bake_texture does not tile on its own. Noise and Voronoi tile when sampled in 4D on a torus (u and v each mapped to a circle, the fourth axis in W); Brick, Wave and Checker have no W and mirror under that mapping - give them plain UV with whole cells.",
+     "tools": [
+      "bl_bake_texture"
+     ]
+    },
+    {
+     "rule": "Bake ROUGHNESS and NORMAL with bl_bake_texture at 1-2 samples: those passes read a shader value per texel, so more samples only cost time - at 2048 px, 24 samples overran the add-on's 150 s job timeout in a GUI Blender.",
+     "tools": [
+      "bl_bake_texture"
+     ]
+    }
+   ]
+  },
+  "blender_nodes": {
+   "title": "Blender: Nodes (Geometry, Shader, Compositor)",
+   "description": "Node graphs: create node groups, add and link nodes, set node properties and group interfaces, assign geometry-node groups, and the compositor; the generic mesh attributes geometry nodes read, and part of a mesh spun about an axis.",
+   "backend": "blender",
+   "tools": [
+    "bl_add_group_interface",
+    "bl_add_group_node",
+    "bl_assign_node_group",
+    "bl_build_pass_composite",
+    "bl_compositor_info",
+    "bl_create_node_group",
+    "bl_group_nodes",
+    "bl_inspect_node_output",
+    "bl_link_group_nodes",
+    "bl_list_group_nodes",
+    "bl_list_node_groups",
+    "bl_remove_node",
+    "bl_run_node_tool",
+    "bl_set_compositing",
+    "bl_set_mesh_attribute",
+    "bl_set_node_property",
+    "bl_spin_mesh"
+   ],
+   "requires": [
+    "blender_core"
+   ],
+   "rules": [
+    {
+     "rule": "bl_create_node_group leaves Group Input and Group Output unlinked, and an unlinked Group Output does not pass geometry through: the object it drives evaluates to empty and vanishes. Link into Group Output before bl_assign_node_group; bl_list_group_nodes reports outputReachable.",
+     "tools": [
+      "bl_create_node_group",
+      "bl_assign_node_group",
+      "bl_list_group_nodes"
+     ]
+    },
+    {
+     "rule": "bl_link_group_nodes into an input that already has a link REPLACES it with no error, and the tree's link count does not change; the displaced link comes back in replacedLinks so it can be restored. Only multi-input sockets such as Join Geometry keep both links.",
+     "tools": [
+      "bl_link_group_nodes"
+     ]
+    },
+    {
+     "rule": "A Math node's inputs are all named 'Value' and a name reaches only the first: use 'Value_001' / 'Value_002' for operands two and three in inputs and sockets, or a second bl_link_group_nodes to 'Value' replaces the first. bl_list_group_nodes values:true lists identifiers.",
+     "tools": [
+      "bl_link_group_nodes",
+      "bl_list_group_nodes"
+     ]
+    },
+    {
+     "rule": "A Bump node added with bl_add_group_node keeps this build's default Distance: 1.0 up to 4.4 but 0.001 from 5.0, which renders almost flat. Always set it - inputs {\"Distance\": ...} when adding, or bl_set_node_property inputs on an existing Bump.",
+     "tools": [
+      "bl_add_group_node",
+      "bl_set_node_property"
+     ]
+    },
+    {
+     "rule": "bl_assign_node_group does not fail when an input does: a name the group does not expose, or a value that will not convert, is listed in inputsRefused while the call succeeds and the modifier stays. Read inputsRefused and inputsApplied after every assign with inputs.",
+     "tools": [
+      "bl_assign_node_group"
+     ]
+    },
+    {
+     "rule": "Change a geometry-node modifier's inputs by calling bl_assign_node_group again with inputs by name (updating the same modifier). A keyframe path needs the stored identifier: take it from bl_list_group_nodes' interface rows - it varies by build (Input_0 on 3.6, Socket_2 on 4.4).",
+     "tools": [
+      "bl_assign_node_group",
+      "bl_list_group_nodes"
+     ]
+    },
+    {
+     "rule": "The compositor changes the render only while render.use_compositing is on (bl_set_compositing use_compositing); from Blender 5.0 scene.use_nodes stays on whatever is written (useNodesFixed). Judge by bl_compositor_info's compositorAffectsRender and blockers, not by the tree.",
+     "tools": [
+      "bl_set_compositing",
+      "bl_compositor_info"
+     ]
+    },
+    {
+     "rule": "Curves and points a geometry-nodes group generates carry no material - the object's slots do not reach them, so they render default grey while every call reports ok (measured on 4.4). Add a Set Material node inside the group with bl_add_group_node.",
+     "tools": [
+      "bl_add_group_node"
+     ]
+    },
+    {
+     "rule": "Set geometry-nodes modifier inputs with bl_assign_node_group rather than by hand in run_python or bl_run_python: on 5.2 they live in mod.properties.inputs[identifier]['value'] and mod[identifier] raises, and on every build the write needs obj.update_tag() to reach the result.",
+     "tools": [
+      "bl_assign_node_group",
+      "run_python",
+      "bl_run_python"
+     ]
+    }
+   ]
+  },
+  "blender_lighting": {
+   "title": "Blender: Lights, Cameras & World",
+   "description": "Lighting and framing: lights and their shadows, IES, linking and influence, light probes, cameras and panoramas, aiming, the world, and the viewport's view and shading.",
+   "backend": "blender",
+   "tools": [
+    "bl_aim_object",
+    "bl_bake_light_probe",
+    "bl_create_camera",
+    "bl_create_light",
+    "bl_create_light_probe",
+    "bl_create_world",
+    "bl_frame_viewport",
+    "bl_list_cameras",
+    "bl_list_lights",
+    "bl_list_worlds",
+    "bl_set_camera",
+    "bl_set_camera_display",
+    "bl_set_camera_panorama",
+    "bl_set_light",
+    "bl_set_light_ies",
+    "bl_set_light_influence",
+    "bl_set_light_linking",
+    "bl_set_light_probe",
+    "bl_set_light_shadow",
+    "bl_set_sun_position",
+    "bl_set_viewport_shading",
+    "bl_set_viewport_view",
+    "bl_set_world",
+    "bl_world_info"
+   ],
+   "requires": [
+    "blender_core"
+   ],
+   "rules": [
+    {
+     "rule": "Cycles alone renders IES profiles (bl_set_light_ies) and bl_set_world use_as_light; EEVEE alone reads bl_set_light diffuse_factor/specular_factor and bl_set_light_shadow filter_radius/jitter. Replies flag this in engineHonoursIES, inertUnderThisEngine or measuredNoEffect.",
+     "tools": [
+      "bl_set_light_ies",
+      "bl_set_world",
+      "bl_set_light",
+      "bl_set_light_shadow"
+     ]
+    },
+    {
+     "rule": "Soften a shadow by light type through bl_set_light: radius on POINT and SPOT, size/size_y on AREA, angle (radians) on SUN. bl_set_light_shadow soft_size is stored but changes no pixel on AREA or SUN lights (measuredNoEffect).",
+     "tools": [
+      "bl_set_light",
+      "bl_set_light_shadow"
+     ]
+    },
+    {
+     "rule": "Blender never refuses a taken name: re-running bl_create_light or bl_create_camera adds a .001 copy that also renders (a duplicate key light adds its energy to the first). Check nameWasSuffixed, and change existing ones with bl_set_light or bl_set_camera.",
+     "tools": [
+      "bl_create_light",
+      "bl_create_camera",
+      "bl_set_light",
+      "bl_set_camera"
+     ]
+    },
+    {
+     "rule": "Cameras and SPOT, AREA and SUN lights point down their local -Z, and rotations are radians. Aim with look_at (bl_create_camera, bl_set_camera) or bl_aim_object, which measures aimErrorRadians; do not verify aim by comparing eulers - Blender may return one 2*pi away.",
+     "tools": [
+      "bl_create_camera",
+      "bl_set_camera",
+      "bl_aim_object"
+     ]
+    },
+    {
+     "rule": "In bl_world_info, when colorLinked is true the world's light comes from colorDrivenBy (an HDRI or Sky Texture) and `color` is the unused socket value - judge by contributesLight and blockers. Passing color to bl_set_world unlinks that source for a flat colour.",
+     "tools": [
+      "bl_world_info",
+      "bl_set_world"
+     ]
+    },
+    {
+     "rule": "Some settings change no pixel in EEVEE or Cycles: bl_set_light_influence square and show_cone, and bl_set_light_shadow color; a sun's cascade_* settings and shadow buffer_clip_start act only under EEVEE on Blender 3.6. They are stored anyway and listed in measuredNoEffect.",
+     "tools": [
+      "bl_set_light_influence",
+      "bl_set_light_shadow"
+     ]
+    },
+    {
+     "rule": "temperature (Kelvin) on bl_create_light and bl_set_light exists only where Blender's lights have it - not on 4.4 or earlier, yes on 5.0 - and is refused elsewhere; use linear RGB color there. It multiplies color, so keep color white unless you want a tint on top.",
+     "tools": [
+      "bl_create_light",
+      "bl_set_light"
+     ]
+    },
+    {
+     "rule": "In Cycles a lamp inside glass or any transmissive mesh lights surfaces outside it only through caustics, which render as noise the denoiser smears into crinkles; set the glass object's visible_shadow false with bl_set_object_visibility.",
+     "tools": [
+      "bl_set_object_visibility"
+     ]
+    }
+   ]
+  },
+  "blender_animation": {
+   "title": "Blender: Animation & Rigging",
+   "description": "Keyframes, actions, NLA, drivers, markers and the frame range; armatures and bones, shape keys, vertex groups and weights, and constraints; and sound on the timeline - speakers and sequencer sound strips, the scene's 3D audio, the audio mixdown, and keys baked from a sound's loudness.",
+   "backend": "blender",
+   "tools": [
+    "bl_add_bones",
+    "bl_add_constraint",
+    "bl_add_driver",
+    "bl_add_fcurve_modifier",
+    "bl_add_nla_strip",
+    "bl_add_shape_key",
+    "bl_add_sound",
+    "bl_assign_action",
+    "bl_bake_sound_keys",
+    "bl_bake_to_keyframes",
+    "bl_bind_modifier",
+    "bl_clean_keyframes",
+    "bl_copy_constraints",
+    "bl_copy_keyframes",
+    "bl_copy_pose",
+    "bl_create_action",
+    "bl_create_armature",
+    "bl_create_armature_from_skeleton",
+    "bl_delete_keyframe",
+    "bl_edit_fcurve",
+    "bl_evaluate_at_frame",
+    "bl_extract_audio",
+    "bl_extract_deform_skeleton",
+    "bl_fit_armature",
+    "bl_key_pose",
+    "bl_list_actions",
+    "bl_list_animation_data",
+    "bl_list_bones",
+    "bl_list_constraints",
+    "bl_list_keyframes",
+    "bl_list_markers",
+    "bl_list_shape_keys",
+    "bl_list_vertex_groups",
+    "bl_mirror_shape_key",
+    "bl_mixdown_audio",
+    "bl_move_keyframes",
+    "bl_normalize_audio",
+    "bl_remove_constraint",
+    "bl_remove_driver",
+    "bl_rename_bones",
+    "bl_set_action",
+    "bl_set_bone_pose",
+    "bl_set_bone_properties",
+    "bl_set_bone_rest",
+    "bl_set_constraint",
+    "bl_set_frame_range",
+    "bl_set_keyframe",
+    "bl_set_marker",
+    "bl_set_scene_audio",
+    "bl_set_shape_key",
+    "bl_set_vertex_weights",
+    "bl_transfer_weights",
+    "bl_vertex_groups_from_bones"
+   ],
+   "requires": [
+    "blender_core"
+   ],
+   "rules": [
+    {
+     "rule": "A pose bone starts in QUATERNION mode, where rotation_euler keys do nothing (see rotationModeNote from bl_set_keyframe). Key rotation_quaternion, or set an Euler mode first: rotation_mode in bl_set_bone_pose, rotationMode per bone in bl_create_armature. Switching keeps the pose.",
+     "tools": [
+      "bl_set_keyframe",
+      "bl_set_bone_pose",
+      "bl_create_armature"
+     ]
+    },
+    {
+     "rule": "Read where an object is from bl_evaluate_at_frame's top-level location, rotationEuler and scale (the world matrix). A data_paths entry such as 'location' is the object's own channel: keys and drivers move it, a parent, constraint or rigid body never does.",
+     "tools": [
+      "bl_evaluate_at_frame"
+     ]
+    },
+    {
+     "rule": "A bl_transform_object write to an animated channel reads back, then the animation restores its own value at the next frame change (animatedNote says so). To move an animated object, key the new value with bl_set_keyframe or edit its keys.",
+     "tools": [
+      "bl_transform_object",
+      "bl_set_keyframe"
+     ]
+    },
+    {
+     "rule": "The first shape key on a mesh is the Basis and moves nothing. bl_add_shape_key starts every key at value 0 unless you pass value (Blender 5.0+ alone would start it at 1), so an edited key shows only after bl_set_shape_key raises its value.",
+     "tools": [
+      "bl_add_shape_key",
+      "bl_set_shape_key"
+     ]
+    },
+    {
+     "rule": "An NLA strip below full influence with nothing beneath it blends toward 0, not toward the object's own value: at 0.25 a z keyed 0.6 to 2.6 plays 0.15 to 0.65. Key such motion as offsets from 0, or put a full-influence strip beneath; bl_add_nla_strip's influenceNote warns.",
+     "tools": [
+      "bl_add_nla_strip"
+     ]
+    },
+    {
+     "rule": "To key a Geometry Nodes input with bl_set_keyframe, use data_path modifiers[\"Mod\"][\"<identifier>\"] with the identifier from bl_list_group_nodes interface rows (Input_N on 3.6, Socket_N later). Before 5.2 a wrong identifier silently keys a new, unused property.",
+     "tools": [
+      "bl_set_keyframe",
+      "bl_list_group_nodes"
+     ]
+    },
+    {
+     "rule": "Shape-key animation lives on the mesh's Key datablock: bl_list_keyframes and bl_list_animation_data show it under shape_keys, but bl_move_keyframes, bl_edit_fcurve, bl_delete_keyframe and bl_add_fcurve_modifier look only at the object and its data and miss those curves.",
+     "tools": [
+      "bl_list_keyframes",
+      "bl_list_animation_data",
+      "bl_move_keyframes",
+      "bl_edit_fcurve",
+      "bl_delete_keyframe",
+      "bl_add_fcurve_modifier"
+     ]
+    },
+    {
+     "rule": "connect:true in bl_create_armature or bl_add_bones welds the bone's head onto its parent's tail and discards the head you gave. Leave it false for bones placed at an offset (sockets, IK targets) and check heads with bl_list_bones.",
+     "tools": [
+      "bl_create_armature",
+      "bl_add_bones",
+      "bl_list_bones"
+     ]
+    },
+    {
+     "rule": "A bone's local Y runs along the bone from head to tail, so rotating about Y only twists it; bend it about local X or Z (on a chain laid along +X, local X is the hinge). bl_set_bone_pose values are in that bone space.",
+     "tools": [
+      "bl_set_bone_pose"
+     ]
+    },
+    {
+     "rule": "An ELASTIC key at Blender's defaults reaches its target almost at once and then buzzes. Shape it per key with bl_edit_fcurve: period in frames (longer arrives later), amplitude for the swing, back for a BACK key's overshoot; each is inert on other interpolations.",
+     "tools": [
+      "bl_edit_fcurve"
+     ]
+    }
+   ]
+  },
+  "blender_rigging": {
+   "title": "Blender: Control Rigs",
+   "description": "Build a control rig: add a Rigify metarig or bone sample at a size, set rig types and parameters, bone collections and their UI rows, generate and regenerate with the refusals Rigify does not make, IK/FK snapping; FK and IK controls over an existing deform skeleton; the armature's display options; the rig's pose library - pose assets stored and applied at a blend or flipped. Bones, poses, weights and keys are blender_animation.",
+   "backend": "blender",
+   "tools": [
+    "bl_add_control_rig",
+    "bl_add_hook",
+    "bl_apply_pose_asset",
+    "bl_apply_shape_keys",
+    "bl_blend_weights",
+    "bl_build_body",
+    "bl_clear_envelope",
+    "bl_copy_animation",
+    "bl_create_lattice",
+    "bl_create_pose_asset",
+    "bl_deformation_stretch",
+    "bl_fit_mesh",
+    "bl_generate_rigify_rig",
+    "bl_normalize_weights",
+    "bl_paint_weights",
+    "bl_points_inside",
+    "bl_pose_coverage",
+    "bl_push_out_for_poses",
+    "bl_recipe_fit_outfit",
+    "bl_rigify_snap",
+    "bl_set_armature_properties",
+    "bl_set_bone_collections",
+    "bl_set_point_positions",
+    "bl_set_rigify_type",
+    "bl_transfer_shape_keys",
+    "bl_wrap_to_target"
+   ],
+   "requires": [
+    "blender_core"
+   ],
+   "rules": [
+    {
+     "rule": "bl_generate_rigify_rig: an elbow or knee bent under about 0.6 degrees gets an IK that does not bend - Rigify takes a near-straight chain's axis from the bone roll. dry_run reports each limb's bend; bend the joint slightly in the metarig rather than passing allow_straight_chains.",
+     "tools": [
+      "bl_generate_rigify_rig"
+     ]
+    },
+    {
+     "rule": "A regenerate replaces every bone and bone collection of the target rig, so an edit made on a generated rig is erased (erased names it, the backup keeps it). Make collection edits on the metarig with bl_set_bone_collections, then bl_generate_rigify_rig again.",
+     "tools": [
+      "bl_generate_rigify_rig",
+      "bl_set_bone_collections"
+     ]
+    },
+    {
+     "rule": "From Blender 4.2 a rig generates only when a bone collection other than Root, DEF, ORG and MCH has a UI row: give one with bl_set_bone_collections ui_row on the metarig (3.6 generates without). The Rigify tools enable the bundled add-on for the session themselves.",
+     "tools": [
+      "bl_set_bone_collections"
+     ]
+    }
+   ]
+  },
+  "blender_motion": {
+   "title": "Blender: Motion Editing",
+   "description": "Edit motion that is already keyed: motion paths of objects and bones with their points and spacing, a pose change spread over frames with a falloff, keys smoothed, thinned or blended, one thing's world transform matched to another's at frames, an action's slots split, merged or given to a second user, and an existing NLA strip edited; Grease Pencil drawing - objects, layers, strokes on frames, stroke and fill materials. Keys, actions, new NLA strips and drivers are blender_animation.",
+   "backend": "blender",
+   "tools": [
+    "bl_bake_grease_pencil",
+    "bl_create_grease_pencil",
+    "bl_draw_grease_pencil_strokes",
+    "bl_edit_action_slots",
+    "bl_edit_grease_pencil_strokes",
+    "bl_extract_root_motion",
+    "bl_filter_keys",
+    "bl_match_world_transform",
+    "bl_motion_paths",
+    "bl_retarget_action",
+    "bl_set_grease_pencil_effects",
+    "bl_set_grease_pencil_frames",
+    "bl_set_grease_pencil_layers",
+    "bl_set_grease_pencil_material",
+    "bl_set_keying_set",
+    "bl_set_nla_strip",
+    "bl_set_nla_track",
+    "bl_spread_pose",
+    "bl_trace_image_to_strokes",
+    "bl_transform_grease_pencil_points"
+   ],
+   "requires": [
+    "blender_core"
+   ],
+   "rules": [
+    {
+     "rule": "Read where an object is from bl_evaluate_at_frame's top-level location, rotationEuler and scale (the world matrix). A data_paths entry such as 'location' is the object's own channel: keys and drivers move it, a parent, constraint or rigid body never does.",
+     "tools": [
+      "bl_evaluate_at_frame"
+     ]
+    },
+    {
+     "rule": "A bone's local Y runs along the bone from head to tail, so rotating about Y only twists it; bend it about local X or Z (on a chain laid along +X, local X is the hinge). bl_set_bone_pose values are in that bone space.",
+     "tools": [
+      "bl_set_bone_pose"
+     ]
+    },
+    {
+     "rule": "A pose bone starts in QUATERNION mode, where rotation_euler keys do nothing (see rotationModeNote from bl_set_keyframe). Key rotation_quaternion, or set an Euler mode first: rotation_mode in bl_set_bone_pose, rotationMode per bone in bl_create_armature. Switching keeps the pose.",
+     "tools": [
+      "bl_set_keyframe",
+      "bl_set_bone_pose",
+      "bl_create_armature"
+     ]
+    }
+   ]
+  },
+  "blender_sculpt": {
+   "title": "Blender: Sculpting",
+   "description": "Sculpt a mesh: brush strokes along a path, whole-mesh filters (smooth, inflate, relax, sharpen, enhance details) and the cloth filter, the sculpt mask by rule and its extract or slice, face sets, remesh and Multires levels, symmetry checked, snapped or applied, and a vertex region smoothed; smooth organic forms as metaballs and NURBS surfaces.",
+   "backend": "blender",
+   "tools": [
+    "bl_cloth_filter",
+    "bl_create_metaball",
+    "bl_create_nurbs_surface",
+    "bl_groom_attach",
+    "bl_groom_stroke",
+    "bl_mask_extract",
+    "bl_mesh_filter",
+    "bl_remesh_mesh",
+    "bl_sculpt_mask",
+    "bl_sculpt_stroke",
+    "bl_set_face_sets",
+    "bl_smooth_vertices",
+    "bl_subdivide_multires",
+    "bl_symmetrize_mesh"
+   ],
+   "requires": [
+    "blender_core"
+   ],
+   "rules": [
+    {
+     "rule": "The sculpt mask protects what it covers: bl_mesh_filter leaves a vertex masked at 1 where it is unless use_mask=false. Read it with bl_sculpt_mask mode READ, and CLEAR it before a filter meant for the whole mesh. A mesh never masked reads 0 everywhere.",
+     "tools": [
+      "bl_mesh_filter",
+      "bl_sculpt_mask"
+     ]
+    },
+    {
+     "rule": "bl_mask_extract needs a mask first - bl_sculpt_mask FROM_VERTEX_GROUP, EXPAND or FROM_CAVITY. It runs Blender's own extract or slice under the build's name; the shell's thickness is its Solidify modifier's, which thickness sets.",
+     "tools": [
+      "bl_mask_extract",
+      "bl_sculpt_mask"
+     ]
+    },
+    {
+     "rule": "Run bl_symmetrize_mesh mode REPORT before a mirror: unmatched above 0 means mirrored weights, keys and bones will pick wrong partners. SNAP with a threshold fixes near pairs in place; SYMMETRIZE NEGATIVE_X copies the -X half onto +X and adds center vertices.",
+     "tools": [
+      "bl_symmetrize_mesh"
+     ]
+    }
+   ]
+  },
+  "blender_physics": {
+   "title": "Blender: Physics & Particles",
+   "description": "Rigid bodies and constraints, cloth, soft body, fluid, dynamic paint, force fields, baking, and particle systems.",
+   "backend": "blender",
+   "tools": [
+    "bl_add_accessory_physics",
+    "bl_add_cloth",
+    "bl_add_collision",
+    "bl_add_dynamic_paint",
+    "bl_add_fluid",
+    "bl_add_inner_layer",
+    "bl_add_particles",
+    "bl_add_rigid_body",
+    "bl_add_rigid_body_constraint",
+    "bl_add_soft_body",
+    "bl_attach_hood",
+    "bl_attach_sleeve",
+    "bl_bake_physics",
+    "bl_build_applique",
+    "bl_build_band",
+    "bl_build_collar",
+    "bl_build_rib",
+    "bl_build_sole",
+    "bl_collect_vdb_frames",
+    "bl_create_curves",
+    "bl_create_force_field",
+    "bl_displace_by_rule",
+    "bl_fracture_mesh",
+    "bl_gather_loop",
+    "bl_list_particles",
+    "bl_loft_garment",
+    "bl_measure_garment_ease",
+    "bl_measure_neckline",
+    "bl_physics_info",
+    "bl_quilt_surface",
+    "bl_retopo_panels",
+    "bl_set_particles",
+    "bl_set_physics_world",
+    "bl_step_simulation",
+    "bl_transfer_by_uv",
+    "bl_trim_to_outline"
+   ],
+   "requires": [
+    "blender_core"
+   ],
+   "rules": [
+    {
+     "rule": "An emitter from bl_add_particles defaults to render_type HALO, which renders nothing in EEVEE, Cycles or Workbench. Pass instance_object or instance_collection (either sets the render type) and check renderNote, or rendersNothing in bl_list_particles.",
+     "tools": [
+      "bl_add_particles",
+      "bl_list_particles"
+     ]
+    },
+    {
+     "rule": "bl_render_animation renders the saved .blend: bake with bl_bake_physics, then save. There an unbaked rigid or soft body stays frozen and unbaked cloth simulates only if the render starts at its cache start. Dynamic paint bakes only to disk beside a saved file, so save first.",
+     "tools": [
+      "bl_render_animation",
+      "bl_bake_physics"
+     ]
+    },
+    {
+     "rule": "bl_bake_physics keeps any existing bake: after adding or changing bodies, joints, force fields or settings pass rebake=true, or the old frames replay and new bodies never move. allBaked ignores the range asked for - read keptExistingBake and rangeNotHeld.",
+     "tools": [
+      "bl_bake_physics"
+     ]
+    },
+    {
+     "rule": "Rigid body bounce needs bounciness (bl_add_rigid_body) on both bodies - give the floor some too - and it weakens as fps x substeps rises past 240 steps/s and is gone from 480, which is 60 fps at the default 10 substeps. Lower substeps with bl_set_physics_world.",
+     "tools": [
+      "bl_add_rigid_body",
+      "bl_set_physics_world"
+     ]
+    },
+    {
+     "rule": "A GAS domain renders as a solid box in EEVEE and as nothing in Cycles until it has a volume material: bl_create_material, bl_set_material_volume with surface='disconnect', then bl_set_material_slots (bl_add_fluid's volumeNote lists the calls).",
+     "tools": [
+      "bl_create_material",
+      "bl_set_material_volume",
+      "bl_set_material_slots",
+      "bl_add_fluid"
+     ]
+    },
+    {
+     "rule": "In bl_add_particles and bl_set_particles, hair_length and normal_factor are one stored value (hair_length = 4 x normal_factor): send only one. normal_factor 0 on a HAIR system is zero-length hair, which renders nothing.",
+     "tools": [
+      "bl_add_particles",
+      "bl_set_particles"
+     ]
+    },
+    {
+     "rule": "A bl_add_rigid_body_constraint joint works along its own axes: HINGE turns about local Z (vertical when unrotated, like a door), SLIDER, PISTON and MOTOR along local X. location is the pivot and rotation is in radians; check axisWorld in the reply.",
+     "tools": [
+      "bl_add_rigid_body_constraint"
+     ]
+    },
+    {
+     "rule": "bl_add_soft_body leaves the goal on, pinning every vertex to where it started, so the body barely moves: pass use_goal=false for a free body. With goal_vertex_group each vertex's pin is its weight x goal_default, so weight-0 vertices move freely.",
+     "tools": [
+      "bl_add_soft_body"
+     ]
+    },
+    {
+     "rule": "Collection instancing skips members hidden from render and offsets each copy by the member's own location: keep a particle system's instance_collection objects renderable and at the world origin.",
+     "tools": []
+    },
+    {
+     "rule": "No undo steps are recorded while the file holds a fluid domain (an undo push after a flow object changes stops the domain simulating); bl_undo reaches only steps from before it. Save with bl_save_file before fluid changes you may want to take back.",
+     "tools": [
+      "bl_undo",
+      "bl_save_file"
+     ]
+    }
+   ]
+  },
+  "blender_render": {
+   "title": "Blender: Rendering & Output",
+   "description": "Render settings, stills and animations, render status, colour management, view layers, and comparing a render to a reference image.",
+   "backend": "blender",
+   "tools": [
+    "bl_add_strip",
+    "bl_build_tracking_scene",
+    "bl_compare_to_reference",
+    "bl_compose_atlas",
+    "bl_create_mask",
+    "bl_create_view_layer",
+    "bl_delete_view_layer",
+    "bl_edit_clip_tracks",
+    "bl_edit_strip",
+    "bl_list_clip",
+    "bl_list_strips",
+    "bl_list_view_layers",
+    "bl_load_clip",
+    "bl_orient_clip",
+    "bl_preview_garment",
+    "bl_render_animation",
+    "bl_render_info",
+    "bl_render_status",
+    "bl_render_still",
+    "bl_render_viewport",
+    "bl_set_clip",
+    "bl_set_color_management",
+    "bl_set_freestyle",
+    "bl_set_render_settings",
+    "bl_set_sequencer",
+    "bl_set_stereo",
+    "bl_set_view_layer",
+    "bl_solve_clip",
+    "bl_track_clip"
+   ],
+   "requires": [
+    "blender_core"
+   ],
+   "rules": [
+    {
+     "rule": "Look at your work before you judge it: a path in a reply shows you nothing. bl_render_still with return_image true shows the render as an image, about 800 tokens. mif_view_image shows any PNG on disk, such as a bl_render_animation frame or a run_python render.",
+     "tools": [
+      "bl_render_still",
+      "mif_view_image",
+      "bl_render_animation",
+      "run_python"
+     ]
+    },
+    {
+     "rule": "Pass bl_set_render_settings engine as 'EEVEE', 'CYCLES' or 'WORKBENCH': the alias resolves to this build's identifier. A literal from another version is refused - EEVEE is BLENDER_EEVEE_NEXT on 4.2-4.5 and BLENDER_EEVEE before 4.2 and from 5.0; never derive it from the version.",
+     "tools": [
+      "bl_set_render_settings"
+     ]
+    },
+    {
+     "rule": "bl_render_still writes its resolution_x, resolution_y, percentage, samples, file_path and frame into the scene, and they stay after the render - a small test still leaves the scene small. samples goes to the engine active at that moment (samplesOn); set the engine first.",
+     "tools": [
+      "bl_render_still"
+     ]
+    },
+    {
+     "rule": "Judge metal, chrome and glass in a Cycles render (bl_set_render_settings engine 'CYCLES'): at default settings EEVEE rendered a chrome part flat white and recessed faces near-black on a scene Cycles got right. Time one small bl_render_still before assuming Cycles is too slow.",
+     "tools": [
+      "bl_set_render_settings",
+      "bl_render_still"
+     ]
+    },
+    {
+     "rule": "bl_render_animation renders the SAVED .blend in a second Blender, not this session - bl_save_file after every change. Unbaked rigid and soft bodies render frozen and unbaked cloth restarts if the range begins after its cache start: bl_bake_physics, save, then render.",
+     "tools": [
+      "bl_render_animation",
+      "bl_save_file",
+      "bl_bake_physics"
+     ]
+    },
+    {
+     "rule": "Pass gpu true to bl_render_animation for Cycles on a GPU - otherwise it uses the saved file's device setting, CPU by default. gpu true tries OPTIX, CUDA, HIP, METAL, ONEAPI; if no frames appear and bl_render_status's gpuNote names OptiX, rerun with gpu_backend 'CUDA'.",
+     "tools": [
+      "bl_render_animation",
+      "bl_render_status"
+     ]
+    },
+    {
+     "rule": "bl_list_view_layers with_passes adds a ~60-entry pass map to every layer (~870 bytes each); on scenes with many layers pass limit. notRendering still names every layer whose use is off, whatever the limit.",
+     "tools": [
+      "bl_list_view_layers"
+     ]
+    },
+    {
+     "rule": "Colour management changes every pixel: the default view transform is Filmic on 3.6 and AgX from 4.2 (a bl_create_scene scene on 4.2 starts on Filmic), and AgX renders dark albedos about two stops lighter. Pin it with bl_set_color_management before judging colour.",
+     "tools": [
+      "bl_create_scene",
+      "bl_set_color_management"
+     ]
+    }
+   ]
+  },
+  "blender_io": {
+   "title": "Blender: Import, Export & Generation",
+   "description": "Moving assets in and out: scene and mesh import/export, the game-ready recipe, the Blender-to-Unreal mesh round trip, and generated assets (gen_*). mif_send_to_unreal hands a model made in Blender to Unreal as a checked static mesh, or a whole kit in one call.",
+   "backend": "blender",
+   "tools": [
+    "bl_bake_pivot_painter",
+    "bl_bake_texture_set",
+    "bl_bake_vertex_animation",
+    "bl_coplanar_overlaps",
+    "bl_create_volume",
+    "bl_export_actions",
+    "bl_export_camera",
+    "bl_export_groom",
+    "bl_export_material_textures",
+    "bl_export_mesh",
+    "bl_export_scene",
+    "bl_export_vertex_positions",
+    "bl_gen_asset",
+    "bl_gen_image",
+    "bl_gen_mesh",
+    "bl_gen_status",
+    "bl_gen_texture",
+    "bl_hair_to_cards",
+    "bl_heightmap_from_mesh",
+    "bl_import_mesh",
+    "bl_import_scene",
+    "bl_library_override",
+    "bl_list_asset_libraries",
+    "bl_list_libraries",
+    "bl_mark_asset",
+    "bl_material_from_maps",
+    "bl_mesh_from_heightmap",
+    "bl_recipe_game_ready",
+    "bl_set_asset_library",
+    "bl_set_collection_exporter",
+    "bl_set_custom_normals",
+    "bl_set_library",
+    "bl_transfer_mesh_data"
+   ],
+   "requires": [
+    "blender_core"
+   ],
+   "rules": [
+    {
+     "rule": "bl_import_mesh defaults to clear_scene=True, which deletes EVERY object in the .blend - every scene, not just the active one - right before it imports. Pass clear_scene=False to add to what is there; clearedObjects in the reply lists what was deleted.",
+     "tools": [
+      "bl_import_mesh"
+     ]
+    },
+    {
+     "rule": "bl_export_mesh bakes every enabled modifier into the FBX (use_mesh_modifiers is on by default), and any enabled modifier other than an exported rig's Armature drops the mesh's shape keys. bl_export_scene to glTF/GLB does the opposite: no modifiers unless apply_modifiers=True.",
+     "tools": [
+      "bl_export_mesh",
+      "bl_export_scene"
+     ]
+    },
+    {
+     "rule": "To export a rigged mesh, give bl_export_mesh the MESH and object_types=['MESH','ARMATURE'] - the rig is found through its Armature modifier. Without ARMATURE the mesh is written as a static mesh frozen in its current pose (deformerNotExportedWarning).",
+     "tools": [
+      "bl_export_mesh"
+     ]
+    },
+    {
+     "rule": "An FBX from bl_export_mesh lands in Unreal with Blender +Y as Unreal -Y (X and Z keep their sign) at 100 Unreal units per metre: Blender (x, y, z) m is Unreal (100x, -100y, 100z). Convert both ways when placing or checking actors against Blender coordinates.",
+     "tools": [
+      "bl_export_mesh"
+     ]
+    },
+    {
+     "rule": "Give every mesh a UV layer before exporting it for Unreal: with none, Unreal cannot build tangents and warns 'degenerate tangent bases'. bl_object_info lists uvLayers; bl_recipe_game_ready unwraps only when there is no layer (force_unwrap replaces one).",
+     "tools": [
+      "bl_object_info",
+      "bl_recipe_game_ready"
+     ]
+    },
+    {
+     "rule": "mif_mesh_roundtrip deletes every object in the connected Blender file (its import clears file-wide), even with dry_run=True. Its defaults suit a road tile - extrude_skirt on the Y boundary edges, preserve_x on, 15 uu - so pass edit, selector and preserve_x for anything else.",
+     "tools": [
+      "mif_mesh_roundtrip"
+     ]
+    },
+    {
+     "rule": "bl_gen_image, bl_gen_mesh, bl_gen_texture and bl_gen_asset block Blender for the whole ComfyUI job (minutes). In an interactive Blender a job longer than the add-on's job timeout (150 s default) errors while generation goes on: raise it, run one job at a time, don't retry blind.",
+     "tools": [
+      "bl_gen_image",
+      "bl_gen_mesh",
+      "bl_gen_texture",
+      "bl_gen_asset"
+     ]
+    },
+    {
+     "rule": "bl_gen_image appends a fixed product-shot suffix to every prompt (single object, plain background, whole object in frame): it makes reference images for mesh generation, not tiling textures or scenes. bl_gen_texture paints an existing mesh and needs the image it came from.",
+     "tools": [
+      "bl_gen_image",
+      "bl_gen_texture"
+     ]
+    },
+    {
+     "rule": "bl_gen_status, bl_gen_image, bl_gen_mesh, bl_gen_texture and bl_gen_asset reach ComfyUI at `host`, else MIF_COMFY_HOST from BLENDER's environment, else 127.0.0.1:8188 - the MCP server's environment is never read. Pass host on every call when ComfyUI is elsewhere.",
+     "tools": [
+      "bl_gen_status",
+      "bl_gen_image",
+      "bl_gen_mesh",
+      "bl_gen_texture",
+      "bl_gen_asset"
+     ]
+    },
+    {
+     "rule": "Before a session's first bl_gen_image, bl_gen_mesh, bl_gen_texture or bl_gen_asset, tell the person the license terms of the model it runs and that following them is their responsibility; bl_gen_status's license block has all three. MifBridge checks no location.",
+     "tools": [
+      "bl_gen_status",
+      "bl_gen_image",
+      "bl_gen_mesh",
+      "bl_gen_texture",
+      "bl_gen_asset"
+     ]
+    }
+   ]
+  }
+ },
+ "aliases": {
+  "blender": [
+   "blender_core",
+   "blender_modeling",
+   "blender_mesh_edit",
+   "blender_materials",
+   "blender_nodes",
+   "blender_lighting",
+   "blender_animation",
+   "blender_rigging",
+   "blender_motion",
+   "blender_sculpt",
+   "blender_physics",
+   "blender_render",
+   "blender_io"
+  ]
+ }
+}
