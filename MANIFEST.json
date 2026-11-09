@@ -1,7 +1,7 @@
 {
  "package": "mifblender-mcp",
  "version": "1.3.1",
- "sourceCommit": "64bb992b24be6ac7ad69fbd704d762308fd60a42",
+ "sourceCommit": "1880e108216512a431f817ec63d7b1d6dd189c1a",
  "sourceDirty": true,
  "tools": 428,
  "files": {
@@ -10,7 +10,7 @@
   ".github/workflows/publish.yml": "3ab9e98d161e1934ee86c66ab283994487d7d0108bc2537587717412823a7033",
   "CONTRIBUTING.md": "11f337ae7d48628c99ad069834706b2557e805902aacc763866a70bb4d5d738e",
   "LICENSE.txt": "3b98d5a0fd7669471a5f2b22006217278a1dcbe9910ba116e3320274d251c373",
-  "README.md": "85d9b1151610bda84db6bb265c872319673a595b63ff83ac30bf6282335f4ce5",
+  "README.md": "dc7acae0982703d04ccbf01c772d83563910879ce74491f625f0a05209a62de9",
   "RELEASE_NOTES.md": "11f97de3554df6ca3b5711b8782ffa2ff10c0cb4543097d56e0a1c2da07482db",
   "assets/LICENSE": "5b0ecb06eec83c11ee6d1063cb5c3a484defe7aac05bc7ee874df502e75d9c1a",
   "assets/crab_clay.jpg": "381d35b4af119a8545fad896fe8576c34ff86b0cc267bbfe7bdb38fe6cb95e25",

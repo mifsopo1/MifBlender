@@ -51,6 +51,15 @@ The crab walker: 515 pieces, an interior, a rig and a walk cycle, built with the
   <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.3.1/assets/crab_rig.jpg" alt="The crab walker's game rig in wireframe through one walk cycle" width="100%">
 </p>
 
+**What it cost: $58.35** for one long session that built the model, rig, walk, bakes, video and packaging, run by Claude Opus
+5.5 through Claude Code (prices below).
+
+| Part | Cost | Why |
+|---|---:|---|
+| Cache reads | $27.23 | 136.15M tokens. One long session rereads more each step as it grows. |
+| Cache writes | $22.62 | 4.52M tokens, all at the 5 minute rate. Saving each step, plus whole rewrites after a few waits that outlasted the 5 minute cache. |
+| Output | $8.50 | 424,813 tokens: the scripts, the tool calls and the reasoning. |
+
 ### From images to a model
 
 The creature was built from one six-view character sheet in eight staged sessions, from blockout to a rigged walk. Each
@@ -72,6 +81,20 @@ claws stay within 0.008 mm of the fingers.
 <p align="center">
   <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.3.1/assets/creature_views.jpg" alt="The finished creature from eight angles" width="100%">
 </p>
+
+**What it cost: $91.72** for eight staged sessions that built the model, paint, 77-bone rig and walk, run by Claude Opus 5.5
+through Claude Code.
+
+| Part | Cost | Why |
+|---|---:|---|
+| Output | $44.30 | 2.22M tokens: the model's own writing, meaning the scripts that built each part, the tool calls and its reasoning at high effort. The biggest share, because output is the most expensive token. |
+| Cache writes | $30.98 | 3.38M tokens at the 1 hour rate ($27.04) and 0.79M at the 5 minute rate ($3.94): saving each new step so the next one can reread it cheaply. The first six stages used the 1 hour rate and turned out not to need it; the last two used the cheaper 5 minute cache. |
+| Cache reads | $16.11 | 80.57M tokens: every step rereads the whole session so far, tools, notes and render images included. Millions of tokens, but at a tenth of the input price. |
+| Uncached input | $0.32 | |
+
+**Prices:** both builds ran on Claude Opus 5.5, through Claude Code. Costs are at API list price, from Claude Code's own price
+table: input $4, output $20, cache read $0.20, cache write $5 (5 minute) or $8 (1 hour), per million tokens. On a Claude
+subscription plan, the same work uses the plan's allowance instead of extra money.
 
 **What the build taught:**
 
