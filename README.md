@@ -33,6 +33,84 @@ Free for any use, including commercial work. No account. Everything runs on your
 
 ## See what it can do
 
+### Smash Cut: a game's models, from a game jam
+
+[Smash Cut](https://mifshowcase.store/smashcut) is a monster game made in four days for a game jam, with Claude Code
+agents as the build team. Every monster, vehicle, building and prop in it was built in Blender through MifBlender:
+2.15 million logged calls, and no 3D, image or texture generator. Most shapes were written as Python and placed in the
+scene with `create_mesh`; MifBlender then remeshed, unwrapped, shaded, baked, rigged, keyed, rendered and exported them.
+The monsters were modelled against concept sheets made with an AI image generator, used as reference only.
+
+Each strip below shows the final render, the wireframe and the clay view.
+
+| Pangoliath | Rust Bucket | Frost Titan |
+|:---:|:---:|:---:|
+| <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/jam/jam_pangoliath_roar.gif" alt="Pangoliath going from idle to a roar, rendered in Cycles"> | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/jam/jam_rustbucket_roar.gif" alt="The Rust Bucket mech going from idle to a roar, rendered in Cycles"> | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/jam/jam_frosttitan_roar.gif" alt="The Frost Titan going from idle to a roar, rendered in Cycles"> |
+
+The roars are one shared clip on one shared 35-bone skeleton, keyed pose by pose with `set_bone_pose` and `key_pose`,
+blended in from the idle on the NLA and rendered in Cycles with `render_animation`.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/jam/jam_pangoliath_strip.jpg" alt="Pangoliath in final, wireframe and clay views" width="100%">
+</p>
+
+**Pangoliath:** 248,728 triangles, 35 bones, 7 materials on one 4K baked texture set. The body is a distance-field shape,
+remeshed to quads with `remesh_mesh`. The plates, claws and their skin weights were placed in Python and built with
+`create_mesh`. The surfaces are node graphs baked to albedo, normal, ORM and emissive maps with `bake_texture_set`.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/jam/jam_rustbucket_strip.jpg" alt="The Rust Bucket mech in final, wireframe and clay views" width="100%">
+</p>
+
+**Rust Bucket:** 268,356 triangles, 35 bones, 13 materials on one 4K baked texture set. A scrap mech of rigid plates,
+drums and rams, each part skinned whole to its bone. The chipped paint, rust and grime are node graphs baked to texture.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/jam/jam_frosttitan_strip.jpg" alt="The Frost Titan in final, wireframe and clay views" width="100%">
+</p>
+
+**Frost Titan:** 244,497 triangles, 35 bones, 7 materials on one 4K baked texture set. Built the same way as Pangoliath:
+frozen fur clumps, icicles, ice armour and crystal horns placed on the body surface and built with `create_mesh`.
+
+#### Vehicles, buildings and a tree
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/jam/jam_tank_strip.jpg" alt="A fictional battle tank in final, wireframe and clay views" width="100%">
+</p>
+
+**A fictional tank:** 10,500 triangles, 4 materials, a turret and barrel on named sockets, a breakable version and a
+wreck. The camouflage, chipped edges, rain runs and mud are one 4K bake.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/jam/jam_taxi_strip.jpg" alt="A brand-free taxi in final, wireframe and clay views" width="100%">
+</p>
+
+**A brand-free taxi:** 13,900 triangles, 6 materials. A body lofted through smooth profile curves with real wheel arches,
+three baked paint variants and a burnt-out wreck.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/jam/jam_donutshop_strip.jpg" alt="A donut shop with a giant donut on the roof, in final, wireframe and clay views" width="100%">
+</p>
+
+**A donut shop:** 18,024 triangles in 86 breakable pieces. The 8 m sprinkled donut on the roof is its own rolling prop.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/jam/jam_banktower_strip.jpg" alt="A 160 m art deco bank tower in final, wireframe and clay views" width="100%">
+</p>
+
+**A bank tower:** 160 m tall, 119,044 triangles in 1,863 separate pieces so it can come down piece by piece: a stone
+podium with a colonnade, stone piers between glass bays, two setbacks and a stepped crown.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/jam/jam_streettree_strip.jpg" alt="A London plane street tree in final, wireframe and clay views" width="100%">
+</p>
+
+**A street tree:** a London plane grown with MifBlender's own `build_tree`, 30,199 triangles with three lower LODs down to
+1,840, bark and leaf cards, and wind weights in the vertex colours. The bark is a node graph baked to maps, and the leaf
+cards are drawn from each species' leaf outline.
+
+### The crab walker
+
 <p align="center">
   <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.3.1/assets/crab_walk.gif" alt="The crab walker's walk cycle" width="100%">
 </p>
