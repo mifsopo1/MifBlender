@@ -188,9 +188,10 @@ def before_write(endpoint):
         _STATE["skipped"] = "the base undo step could not be pushed: %s" % exc
 
 
-def after_write(endpoint, label=None, result=None):
+def after_write(endpoint, label=None, result=None, refused=False):
     """Called by server.py after a call that can change the scene - whether it succeeded or refused. `result` is the
-    op's response when it succeeded, None when it refused or raised.
+    op's response when it succeeded, None when it refused or raised; `refused` is true for a MifOpError refusal, which
+    the op's contract says changed nothing (a raw exception is not one).
 
     Returns (pushed, why not): whether an undo step now holds this call, and the reason when none does - what a batch's
     atomicNote says, since whether undo can take a batch back depends on it."""
@@ -209,6 +210,11 @@ def after_write(endpoint, label=None, result=None):
                 == os.path.normcase(str(result["filepath"]))):
             _STATE["writes"] = 0
         return False, "a save changes nothing in the scene"
+    # A REFUSED FILE WRITE CHANGED NOTHING (FOUND 2026-11-09): a factory scene after only reads and one refused export
+    # counted one write, and open_file then refused for unsaved work that did not exist. An op whose effect is a file
+    # on disk that refused wrote neither the file nor the scene.
+    if refused and endpoint in EXTERNAL_EFFECTS:
+        return False, "%s refused and changed nothing" % endpoint
     _STATE["writes"] += 1
     on, why = recording()
     if not on:

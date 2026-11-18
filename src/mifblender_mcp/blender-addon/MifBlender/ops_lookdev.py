@@ -28,7 +28,9 @@ _EDGE_TYPES = {"SILHOUETTE": "select_silhouette", "BORDER": "select_border", "CR
                "RIDGE_VALLEY": "select_ridge_valley", "SUGGESTIVE_CONTOUR": "select_suggestive_contour",
                "MATERIAL_BOUNDARY": "select_material_boundary", "CONTOUR": "select_contour",
                "EXTERNAL_CONTOUR": "select_external_contour", "EDGE_MARK": "select_edge_mark"}
-_LS_KEYS = ("name", "edgeTypes", "collection", "color", "thickness", "alpha", "visibility")
+_LS_KEYS = ("name", "edgeTypes", "collection", "color", "thickness", "alpha", "visibility", "excludeCollection",
+            "edgeTypeNegation", "edgeTypeCombination", "faceMarks")
+_FACEMARK_KEYS = ("negation", "condition")
 
 
 def _lineset_row(ls):
@@ -36,6 +38,10 @@ def _lineset_row(ls):
     return {"name": ls.name, "show": bool(ls.show_render),
             "edgeTypes": sorted(k for k, a in _EDGE_TYPES.items() if getattr(ls, a, False)),
             "collection": ls.collection.name if ls.select_by_collection and ls.collection else None,
+            "collectionNegation": ls.collection_negation if ls.select_by_collection else None,
+            "edgeTypeNegation": ls.edge_type_negation, "edgeTypeCombination": ls.edge_type_combination,
+            "faceMarks": ({"negation": ls.face_mark_negation, "condition": ls.face_mark_condition}
+                          if ls.select_by_face_marks else None),
             "visibility": ls.visibility,
             "color": [round(c, 6) for c in st.color] if st else None,
             "thickness": round(st.thickness, 6) if st else None, "alpha": round(st.alpha, 6) if st else None}
@@ -110,7 +116,9 @@ def op_set_freestyle(params):
       creaseAngle (float)      degrees - an edge sharper than this is a CREASE
       lineSets (list)          [{name, edgeTypes [SILHOUETTE | BORDER | CREASE | RIDGE_VALLEY | SUGGESTIVE_CONTOUR |
                                MATERIAL_BOUNDARY | CONTOUR | EXTERNAL_CONTOUR | EDGE_MARK], collection, color [r,g,b],
-                               thickness, alpha, visibility VISIBLE | HIDDEN | RANGE}] - a line set of that name is
+                               thickness, alpha, visibility VISIBLE | HIDDEN | RANGE, excludeCollection (ink all but
+                               it; not with collection), edgeTypeNegation INCLUSIVE | EXCLUSIVE, edgeTypeCombination OR |
+                               AND, faceMarks true | {negation, condition ONE | BOTH}}] - a line set of that name is
                                edited, a new one made
       removeLineSets (list)    names
       edgeMarks (dict | list)  {object, edges [indices] | sharp: true | seams: true, clear}
@@ -139,8 +147,12 @@ def op_set_freestyle(params):
             et = s.get("edgeTypes")
             if et is not None and (not isinstance(et, list) or any(str(x).upper() not in _EDGE_TYPES for x in et)):
                 raise MifOpError("lineSets[%d].edgeTypes is a list of %s. %s" % (i, ", ".join(_EDGE_TYPES), tail))
-            if s.get("collection") is not None and bpy.data.collections.get(s["collection"]) is None:
-                raise MifOpError("no collection named '%s'. %s" % (s["collection"], tail))
+            if s.get("collection") is not None and s.get("excludeCollection") is not None:
+                raise MifOpError("lineSets[%d] takes collection (ink only it) OR excludeCollection (ink all but it) - a "
+                                 "line set selects by one collection. %s" % (i, tail))
+            for ck in ("collection", "excludeCollection"):
+                if s.get(ck) is not None and bpy.data.collections.get(s[ck]) is None:
+                    raise MifOpError("no collection named '%s'. %s" % (s[ck], tail))
     rm = params.get("removeLineSets")
     if rm is not None:
         if not isinstance(rm, list) or any(not isinstance(n, str) for n in rm):
@@ -172,6 +184,23 @@ def op_set_freestyle(params):
         for k in ("thickness", "alpha"):
             if s.get(k) is not None:
                 row[k] = finite_float(s[k], "%s.%s" % (where, k))
+        # THE OTHER SELECTIONS A LINE SET OFFERS (FOUND 2026-11-10: 19 detail meshes could not be left un-inked except by
+        # building a collection of the 67 that should be). Each value is checked against this build's RNA.
+        for key, prop in (("edgeTypeNegation", "edge_type_negation"), ("edgeTypeCombination", "edge_type_combination")):
+            if s.get(key) is not None:
+                row[key] = _fs_enum(bpy.types.FreestyleLineSet, prop, s[key], "%s.%s" % (where, key), tail)
+        fm = s.get("faceMarks")
+        if fm is not None:
+            if fm is True:
+                fm = {}
+            if not isinstance(fm, dict) or set(fm) - set(_FACEMARK_KEYS):
+                raise MifOpError("%s.faceMarks is true or {negation INCLUSIVE | EXCLUSIVE, condition ONE | BOTH}, got "
+                                 "%r. %s" % (where, s["faceMarks"], tail))
+            row["faceMarks"] = {
+                "negation": _fs_enum(bpy.types.FreestyleLineSet, "face_mark_negation", fm.get("negation", "INCLUSIVE"),
+                                     where + ".faceMarks.negation", tail),
+                "condition": _fs_enum(bpy.types.FreestyleLineSet, "face_mark_condition", fm.get("condition", "ONE"),
+                                      where + ".faceMarks.condition", tail)}
         plans.append(row)
     mark_plans = [_mark_edges_plan(m, tail) for m in (marks if isinstance(marks, list) else [marks])]         if marks is not None else None
     if on is not None:
@@ -195,6 +224,19 @@ def op_set_freestyle(params):
         if s.get("collection") is not None:
             ls.select_by_collection = True
             ls.collection = bpy.data.collections[s["collection"]]
+            ls.collection_negation = "INCLUSIVE"
+        if s.get("excludeCollection") is not None:
+            ls.select_by_collection = True
+            ls.collection = bpy.data.collections[s["excludeCollection"]]
+            ls.collection_negation = "EXCLUSIVE"
+        if "edgeTypeNegation" in row:
+            ls.edge_type_negation = row["edgeTypeNegation"]
+        if "edgeTypeCombination" in row:
+            ls.edge_type_combination = row["edgeTypeCombination"]
+        if "faceMarks" in row:
+            ls.select_by_face_marks = True
+            ls.face_mark_negation = row["faceMarks"]["negation"]
+            ls.face_mark_condition = row["faceMarks"]["condition"]
         if "visibility" in row:
             ls.select_by_visibility = True
             ls.visibility = row["visibility"]
@@ -455,10 +497,18 @@ def op_render_viewport(params):
     saved = {"engine": r.engine, "camera": sc.camera, "x": r.resolution_x, "y": r.resolution_y,
              "pct": r.resolution_percentage, "fp": r.filepath, "fmt": r.image_settings.file_format,
              "frame": sc.frame_current}
-    win = bpy.context.window
-    view3d = None
-    if not bpy.app.background and win is not None:
-        view3d = next((a for a in win.screen.areas if a.type == "VIEW_3D"), None)
+    # THE WINDOW IS LOOKED UP, NOT READ OFF THE CONTEXT (1.4, FOUND 2026-11-11). Ops run from the server's drain timer,
+    # where bpy.context.window and screen are None, so a live GUI session always took the Workbench route: no overlays,
+    # no image empties. The window manager's windows are searched for a 3D View, the active window first.
+    win, view3d = None, None
+    if not bpy.app.background:
+        wm = bpy.context.window_manager
+        wins = [w for w in ([bpy.context.window] + list(wm.windows if wm is not None else [])) if w is not None]
+        for w in wins:
+            area = next((a for a in (w.screen.areas if w.screen is not None else []) if a.type == "VIEW_3D"), None)
+            if area is not None:
+                win, view3d = w, area
+                break
     route = "viewport" if view3d is not None else "workbench"
     t0 = time.time()
     written = []
@@ -491,7 +541,7 @@ def op_render_viewport(params):
                 space.overlay.show_overlays = take_bool(params, "overlays", default=False)
                 region = next(rg for rg in view3d.regions if rg.type == "WINDOW")
                 try:
-                    with bpy.context.temp_override(window=win, area=view3d, region=region):
+                    with bpy.context.temp_override(window=win, screen=win.screen, area=view3d, region=region):
                         bpy.ops.render.opengl(write_still=True, view_context=False)
                 finally:
                     space.overlay.show_overlays = keep
@@ -513,7 +563,10 @@ def op_render_viewport(params):
         sc.frame_set(saved["frame"])
     secs = time.time() - t0
     out = {"route": route, "routeNote": ("Viewport Render in this session's 3D View" if route == "viewport" else
-                                         "headless: a Workbench render with solid shading stands in for the viewport"),
+                                         "headless: a Workbench render with solid shading stands in for the viewport"
+                                         if bpy.app.background else
+                                         "no window of this session shows a 3D View: a Workbench render with solid "
+                                         "shading stands in for the viewport. Open a 3D View for the viewport route"),
            "frames": len(frames), "framesWritten": len(written), "files": written[:20], "camera": cam.name,
            "seconds": round(secs, 3), "secondsPerFrame": round(secs / max(len(frames), 1), 4)}
     if route != "viewport" and params.get("overlays"):

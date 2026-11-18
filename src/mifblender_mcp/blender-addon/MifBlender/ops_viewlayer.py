@@ -200,6 +200,10 @@ def _extras_wanted(vl, params):
     if "materialOverride" in params:
         out["overrideGiven"] = True
         name = params.get("materialOverride")
+        # AN EMPTY STRING CLEARS IT TOO (2026-11-09): the MCP wrapper drops a None parameter before it is sent, so the
+        # null this documents never reached the add-on from a tool call, and a clay override could not be taken off.
+        if name == "":
+            name = None
         if name is not None:
             if not isinstance(name, str):
                 raise MifOpError("materialOverride takes a material name, or null to clear it; got %r. NOTHING was "
@@ -308,7 +312,7 @@ def op_set_view_layer(params):
       cryptomatteDepth (int)      Cryptomatte levels, 2-16 (Blender's range)
       lightgroups (list[str])     light groups to have on the layer; existing names are left as they are
       aovs (list)                 [{name, type VALUE | COLOR}] - made when missing, retyped when different
-      materialOverride (str)      a material every object on the layer renders with; null clears it
+      materialOverride (str)      a material every object on the layer renders with; null or "" clears it
     """
     reject_unknown(params, _SET_KEYS, "set_view_layer")
     sc = bpy.context.scene

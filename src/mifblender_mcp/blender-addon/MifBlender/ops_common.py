@@ -911,6 +911,40 @@ def axis_index(name, param="axis"):
 # ID naming
 # ---------------------------------------------------------------------------
 
+_OBJECT_DATA_COLLECTIONS = ("meshes", "curves", "lights", "cameras", "armatures", "lattices", "metaballs", "lightprobes",
+                            "grease_pencils", "grease_pencils_v3", "hair_curves", "pointclouds", "volumes", "speakers")
+
+
+def data_name_report(data, wanted):
+    """{dataName, dataNameWasSuffixed, dataNameHeldBy, dataNameNote} for an object's data made under `wanted`.
+
+    A NEW OBJECT TAKES THE NAME IT ASKED FOR (FOUND 2026-11-09): every maker named the object after its data, and
+    data that a delete left behind still holds the name, so bl_delete_object(Cam_x) then bl_create_camera(Cam_x) came
+    back 'Cam_x.002' under ok, and the next call by the asked name failed. The object now asks for the name itself;
+    the data can still be suffixed, and this says by what, and how to free it."""
+    if data is None:
+        return {}
+    out = {"dataName": data.name, "dataNameWasSuffixed": data.name != wanted}
+    if data.name == wanted:
+        return out
+    holder = None
+    for attr in _OBJECT_DATA_COLLECTIONS:
+        coll = getattr(bpy.data, attr, None)
+        if coll is not None and data.name in coll and coll[data.name] == data:
+            holder = coll.get(wanted)
+            break
+    if holder is not None:
+        orphan = holder.users == 0 and not holder.use_fake_user
+        out["dataNameHeldBy"] = {"name": holder.name, "users": holder.users, "fakeUser": bool(holder.use_fake_user),
+                                 "orphan": orphan}
+        out["dataNameNote"] = (
+            "the data name '%s' is held by %s, so this data is '%s'; the object has its own name. %s"
+            % (wanted, "an orphan left by an earlier delete (no users)" if orphan else "data in use (%d user%s)"
+               % (holder.users, "" if holder.users == 1 else "s"), data.name,
+               "bl_purge_orphans, or bl_delete_object with purge_orphans, frees it." if orphan else ""))
+    return out
+
+
 def assign_id_name(idblock, wanted, collection):
     """Name `idblock` `wanted`, taking a suffix if it is taken - THE SAME WAY ON EVERY BUILD.
 
@@ -1835,6 +1869,9 @@ def object_info(obj, with_counts=True, children=None):
         # From the caller's children_by_parent() map when it lists many objects; one scan of the file otherwise.
         "children": (list(children.get(obj.name, ())) if children is not None
                      else sorted(c.name for c in obj.children)),
+        # THE COLLECTIONS THE OBJECT IS LINKED IN (FOUND 2026-11-10: nothing reported them, so mapping objects to
+        # collections needed raw Python) - the scene's root collection by its own name.
+        "collections": sorted(c.name for c in obj.users_collection),
     }
     # THE ROTATION A NON-EULER MODE USES, only in that mode - [w, x, y, z], or [angle, x, y, z] in radians.
     if obj.rotation_mode == "QUATERNION":

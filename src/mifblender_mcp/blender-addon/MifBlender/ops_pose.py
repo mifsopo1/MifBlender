@@ -229,9 +229,14 @@ def _interp_ids():
     return [i.identifier for i in bpy.types.Keyframe.bl_rna.properties["interpolation"].enum_items]
 
 
-def key_bone_channels(pb, frame, paths, interp=None):
+def _easing_ids():
+    return [i.identifier for i in bpy.types.Keyframe.bl_rna.properties["easing"].enum_items]
+
+
+def key_bone_channels(pb, frame, paths, interp=None, easing=None, seen=None):
     """keyframe_insert each path of a pose bone at frame (the same call on 3.6 to 5.2), in the bone's group; then the
-    keys at that frame are counted off the curves and given `interp`. Returns the key count."""
+    keys at that frame are counted off the curves and given `interp` and `easing`. With `seen` (a dict), each key's
+    interpolation and easing AS READ BACK off the keyframe point are counted into it. Returns the key count."""
     for path in paths:
         pb.keyframe_insert(path, frame=frame, group=pb.name)
     from .ops_anim import _fcurves  # noqa: PLC0415 - reads 5.x slotted actions too
@@ -245,6 +250,11 @@ def key_bone_channels(pb, frame, paths, interp=None):
             if abs(kp.co[0] - frame) < 1e-4:
                 if interp:
                     kp.interpolation = interp
+                if easing:
+                    kp.easing = easing
+                if seen is not None:
+                    k = "%s/%s" % (kp.interpolation, kp.easing)
+                    seen[k] = seen.get(k, 0) + 1
                 n += 1
     return n
 
@@ -346,7 +356,7 @@ def op_set_armature_properties(params):
 # --------------------------------------------------------------------------------------------- key a pose
 
 _KEYPOSE_KEYS = {"object", "name", "frame", "bones", "namePrefix", "all", "channels", "customProperties",
-                 "interpolation", "reset"}
+                 "interpolation", "easing", "reset"}
 _CHANNELS = ("location", "rotation", "scale")
 
 
@@ -387,6 +397,19 @@ def op_key_pose(params):
         if interp.upper() not in ids:
             raise MifOpError("interpolation must be one of %s, got %r. NOTHING was keyed." % (", ".join(ids), interp))
         interp = interp.upper()
+    # EASING PER KEY (FOUND 2026-11-11): weighty motion needed a second pass over the F-curves to ease each key in or
+    # out. easing is the keyframe's own enum (AUTO, EASE_IN, EASE_OUT, EASE_IN_OUT); Blender reads it on the eased
+    # interpolations (SINE ... ELASTIC), not on BEZIER, so it is refused alone on a BEZIER key.
+    easing = take(params, "easing", default=None, kind=str)
+    if easing is not None:
+        ids = _easing_ids()
+        if easing.upper() not in ids:
+            raise MifOpError("easing must be one of %s, got %r. NOTHING was keyed." % (", ".join(ids), easing))
+        easing = easing.upper()
+        if interp in (None, "BEZIER", "LINEAR", "CONSTANT"):
+            raise MifOpError("easing shapes the eased interpolations (SINE, QUAD, CUBIC, QUART, QUINT, EXPO, CIRC, "
+                             "BACK, BOUNCE, ELASTIC); Blender ignores it on %s - pass interpolation with it. NOTHING was "
+                             "keyed." % (interp or "the default BEZIER"))
     reset = take_bool(params, "reset", default=False)
     plan = []
     missing_props = []
@@ -410,6 +433,7 @@ def op_key_pose(params):
             pb.rotation_axis_angle = (0.0, 0.0, 1.0, 0.0)
             pb.scale = (1.0, 1.0, 1.0)
     rows, total = [], 0
+    seen = {}
     for pb, props in plan:
         paths = []
         if "location" in channels:
@@ -419,7 +443,7 @@ def op_key_pose(params):
         if "scale" in channels:
             paths.append("scale")
         paths.extend('["%s"]' % p for p in props)
-        n = key_bone_channels(pb, frame, paths, interp)
+        n = key_bone_channels(pb, frame, paths, interp, easing, seen)
         total += n
         rows.append({"bone": pb.name, "rotationMode": pb.rotation_mode, "keys": n,
                      "customProperties": props or None})
@@ -441,7 +465,9 @@ def op_key_pose(params):
             driven.append({"bone": pb.name, "constraints": [c.type for c in pb.constraints if not c.mute],
                            "differsUnits": round(d, 6), "differsDegrees": round(min(ang, 360 - ang), 4)})
     out = {"object": obj.name, "frame": frame, "bonesKeyed": len(rows), "keysWritten": total,
-           "channels": channels, "reset": reset, "interpolation": interp, "bones": rows[:200]}
+           "channels": channels, "reset": reset, "interpolation": interp, "easing": easing,
+           # READ BACK OFF THE KEYFRAME POINTS: how many of this frame's keys carry each interpolation/easing pair
+           "keysByInterpolation": seen, "bones": rows[:200]}
     if missing_props:
         out["customPropertiesMissing"] = missing_props[:50]
     if driven:

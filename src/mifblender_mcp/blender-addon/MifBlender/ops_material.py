@@ -1290,7 +1290,7 @@ def op_set_material_properties(params):
     which spelling this Blender used.
 
     `rename` gives the material a new name, with or without values, and a material with no
-    Principled BSDF can be renamed. NO OP RENAMED A MATERIAL: benchmark round ten's agents searched
+    Principled BSDF can be renamed. NO OP RENAMED A MATERIAL: Benchmark round ten's agents searched
     "rename material" 9 times in 15 runs (A3, A5, A8) to give build_rock's, build_plant's and
     build_tree's materials the slot names their task asked for, and each made a new material
     instead. A name another material holds is REFUSED, never left to Blender - its .001 suffix
@@ -1540,11 +1540,19 @@ _BAKE_TYPES = {
 
 
 def _pixel_signature(image):
-    """(min, max, mean) over the raw float buffer - the cheapest honest 'did anything change'."""
-    px = image.pixels[:]
-    if not px:
+    """(min, max, mean) over the raw float buffer - the cheapest honest 'did anything change'.
+
+    Read with foreach_get into a numpy array. It was image.pixels[:], a Python list of every channel (16.7 million floats
+    for a 2048 image) walked three times in Python: 0.91 s a call against 0.028 s this way (measured 2026-11-09, 5.2, the
+    same three numbers on a magenta fill and on a random buffer). A bake takes two or more of these, so on a build of many
+    pieces it was a fifth of the time. The mean adds up in float64, as Python's sum did."""
+    import numpy as np   # noqa: PLC0415 - Blender ships numpy
+    n = len(image.pixels)
+    if not n:
         return (0.0, 0.0, 0.0)
-    return (round(min(px), 6), round(max(px), 6), round(sum(px) / len(px), 6))
+    px = np.empty(n, dtype=np.float32)
+    image.pixels.foreach_get(px)
+    return (round(float(px.min()), 6), round(float(px.max()), 6), round(float(px.mean(dtype=np.float64)), 6))
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -4564,6 +4572,39 @@ def _uv_map_note(mat, uv_map):
 _BUMP_DISTANCE_WHEN_UNSET = 1.0
 
 
+_CHAIN_KEEP_TYPES = {"OUTPUT_MATERIAL", "OUTPUT_WORLD", "OUTPUT_LIGHT", "OUTPUT_AOV", "GROUP_INPUT", "GROUP_OUTPUT",
+                     "FRAME", "REROUTE"}
+
+
+def _remove_orphaned_chain(tree, start_name, keep=()):
+    """Remove node `start_name` if it drives nothing now, and every node upstream whose outputs fed only removed nodes.
+    Output, group I/O and frame nodes, and the nodes in `keep`, are never removed. Returns the removed names, sorted."""
+    if not start_name:
+        return []
+    start = tree.nodes.get(start_name)
+    keep_names = {n.name for n in keep}
+    if start is None or start.name in keep_names or start.type in _CHAIN_KEEP_TYPES \
+            or any(s.is_linked for s in start.outputs):
+        return []
+    doomed = {start.name}
+    frontier = [start]
+    while frontier:
+        node = frontier.pop()
+        for sock in node.inputs:
+            for link in sock.links:
+                up = link.from_node
+                if up.name in doomed or up.name in keep_names or up.type in _CHAIN_KEEP_TYPES:
+                    continue
+                if all(l.to_node.name in doomed for out in up.outputs for l in out.links):
+                    doomed.add(up.name)
+                    frontier.append(up)
+    for name in doomed:
+        node = tree.nodes.get(name)
+        if node is not None:
+            tree.nodes.remove(node)
+    return sorted(doomed)
+
+
 def op_add_procedural_texture(params):
     """Build a procedural pattern into a material and wire it somewhere that reads it.
 
@@ -4587,7 +4628,10 @@ def op_add_procedural_texture(params):
       fromSocket (str)                  which texture output to take. Chosen from the destination
                                         when omitted - see _pick_output
       replace (bool)                    replace whatever already drives the destination. Default
-                                        true; false refuses rather than stacking
+                                        true; false refuses rather than stacking. The replaced
+                                        chain is removed with its link - the old driver and every
+                                        node upstream that fed nothing else (replacedNodesRemoved);
+                                        a node still wired elsewhere stays
 
       space (str)                       Generated | Object | UV | Normal | Camera | Window |
                                         Reflect - the Texture Coordinate output to drive it from
@@ -4980,6 +5024,13 @@ def op_add_procedural_texture(params):
                         "input is now driven by nothing." % restore[0]) if restore else ""))
         else:
             replaced = None
+            restore = None
+
+        # THE OLD CHAIN GOES WITH ITS LINK (FOUND 2026-11-10): replace removed only the link into the socket, so a
+        # script re-running this each round left the previous texture, mapping and coordinate nodes floating - twenty of
+        # them on one material. The node that drove the socket is removed when it now drives nothing, and so is every
+        # node upstream of it whose outputs fed only nodes being removed. A node still wired elsewhere stays.
+        removed_nodes = _remove_orphaned_chain(tree, restore[0] if restore else None, keep=made)
 
         chain = [n.name for n in (coord_node, mapping_node, tex, ramp_node, relief_node)
                  if n is not None]
@@ -5018,6 +5069,8 @@ def op_add_procedural_texture(params):
             "fromSocket": source_out.name if source_out is not None else None,
             "fromSocketNote": from_note,
             "replacedLinkFrom": replaced,
+            # the old chain removed with its link: the nodes that drove the replaced socket and fed nothing else
+            "replacedNodesRemoved": removed_nodes if replaced else None,
             # MEASURED, not assumed - see above. False here with a target set would mean the op
             # refused, so this is true whenever there is a target at all.
             "linked": bool(target is not None and target.is_linked),

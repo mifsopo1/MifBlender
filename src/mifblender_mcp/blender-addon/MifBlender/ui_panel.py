@@ -188,6 +188,8 @@ class MIFBLENDER_OT_check_fix(Operator):
             context.preferences.active_section = "ADDONS"
         elif self.action == "folder":
             bpy.ops.wm.path_open(filepath=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        elif self.action == "save_prefs" and pkg is not None:
+            pkg.persist_preferences("panel", force=True)
         elif self.action == "journal":
             path = U.journal_path()
             if path:
@@ -198,7 +200,8 @@ class MIFBLENDER_OT_check_fix(Operator):
 
 
 _FIX_LABEL = {"start": ("Start", "PLAY"), "prefs": ("Prefs", "PREFERENCES"), "addons": ("Add-ons", "PLUGIN"),
-              "folder": ("Folder", "FILE_FOLDER"), "journal": ("Open", "FILE_TEXT")}
+              "folder": ("Folder", "FILE_FOLDER"), "journal": ("Open", "FILE_TEXT"),
+              "save_prefs": ("Save", "FILE_TICK")}
 
 
 def _fix_button(layout, action, big=False):
@@ -510,7 +513,10 @@ class VIEW3D_PT_mifblender(Panel):
             col = body.column(align=True)
             blend = bpy.data.filepath
             _kv(col, "File", os.path.basename(blend) if blend else "unsaved")
-            _kv(col, "Saved", "no - unsaved changes" if bpy.data.is_dirty else "yes", alert=bpy.data.is_dirty)
+            # the bridge's writes too: on 5.2 Blender's flag misses them (ops_file._is_dirty)
+            from .ops_file import _is_dirty   # noqa: PLC0415
+            unsaved = _is_dirty()
+            _kv(col, "Saved", "no - unsaved changes" if unsaved else "yes", alert=unsaved)
             try:
                 from . import ops_undo
                 _kv(col, "Bridge writes", "%d since load/save" % ops_undo.bridge_writes())

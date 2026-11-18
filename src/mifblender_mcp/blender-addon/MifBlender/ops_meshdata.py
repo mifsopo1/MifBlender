@@ -15,8 +15,8 @@ import math
 
 import bpy
 
-from .ops_common import (MifOpError, finite_floats, finite_int, get_object, reject_unknown, require_editable, take,
-                         take_bool, take_float, take_int)
+from .ops_common import (MifOpError, file_before, finite_floats, finite_int, get_object, reject_unknown,
+                         replaced_fields, require_editable, shared_data_note, take, take_bool, take_float, take_int)
 
 
 def _vec3(params, key, tail, required=False, default=None):
@@ -1065,7 +1065,401 @@ def op_spin_mesh(params):
             "vertices": n1[0], "faces": n1[2]}
 
 
+# --------------------------------------------------------------------------------------------- read_mesh_data
+# THE GAP (filed 2026-11-09, built 2026-11-15). No typed call handed a mesh's vertices and faces to an outside script:
+# export_mesh writes FBX and export_vertex_positions has no faces and uses Unreal's frame, so with run_python off a build
+# parsed binary FBX 7400 for Vertices and PolygonVertexIndex just to stitch to its own mesh. read_mesh_data writes the
+# mesh to a file in one documented shape, and create_mesh (file) and set_mesh_vertices (file) read the same shape back.
+#
+# THE FILE. JSON: {"format": MESH_FILE_FORMAT, "object", "space", "vertexCount", "faceCount", "vertices": [[x, y, z]],
+# "faces": [[i, j, k, ...]], optional "edges" (loose edges [[a, b]]), "uvs" {layer: [[[u, v], ...] per face]},
+# "materialIndices"}. NPZ (numpy.savez, no pickle): "vertices" float64 (N, 3), "faceSizes" int32 (F,), "faceIndices"
+# int32 (sum of faceSizes,), optional "edges" int32 (E, 2), "uv:<layer>" float64 (sum of faceSizes, 2) one per corner in
+# face order, "materialIndices" int32 (F,), and "meta" a JSON string holding the JSON form's scalar fields.
+
+MESH_FILE_FORMAT = "mifbridge.mesh/1"
+_RM_KEYS = ("object", "file", "space", "evaluated", "shapeKey", "uvs", "materialIndices", "looseEdges", "overwrite")
+_RM_SPACES = ("LOCAL", "WORLD")
+
+
+def _out_path(raw, tail):
+    import os
+    from .ops_common import abs_output_path, check_output_path
+    path = abs_output_path(raw)
+    check_output_path(raw, path, "written")
+    parent = os.path.dirname(path)
+    if parent and not os.path.isdir(parent):
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as exc:
+            raise MifOpError("cannot create the folder %s: %s. %s" % (parent, exc, tail))
+    return path
+
+
+def load_mesh_file(raw, tail):
+    """A mesh file read_mesh_data wrote (or any file in its shape), as plain lists: {vertices, faces, edges, uvs,
+    materialIndices, space, object, format, path}. Refuses a missing file, an unknown extension and a body that is not
+    the shape, by sentence - shared by create_mesh's file and set_mesh_vertices' file."""
+    import json
+    import os
+    path = os.path.abspath(bpy.path.abspath(str(raw)))
+    if not os.path.isfile(path):
+        raise MifOpError("file '%s' does not exist. %s" % (path, tail))
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".json":
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                body = json.load(fh)
+        except (OSError, ValueError) as exc:
+            raise MifOpError("file '%s' is not readable JSON: %s. %s" % (path, str(exc)[:160], tail))
+        if not isinstance(body, dict) or not isinstance(body.get("vertices"), list):
+            raise MifOpError("file '%s' has no 'vertices' list - it is not the shape read_mesh_data writes (%s). %s"
+                             % (path, MESH_FILE_FORMAT, tail))
+        out = {"vertices": body["vertices"], "faces": body.get("faces") or [], "edges": body.get("edges") or [],
+               "uvs": body.get("uvs") or {}, "materialIndices": body.get("materialIndices"),
+               "space": str(body.get("space") or "LOCAL").upper(), "object": body.get("object"),
+               "format": body.get("format")}
+    elif ext == ".npz":
+        import numpy as np                                   # noqa: PLC0415 - Blender bundles numpy on every build
+        try:
+            with np.load(path, allow_pickle=False) as z:
+                names = set(z.files)
+                if "vertices" not in names:
+                    raise MifOpError("file '%s' has no 'vertices' array - it is not the shape read_mesh_data writes "
+                                     "(%s). %s" % (path, MESH_FILE_FORMAT, tail))
+                verts = z["vertices"]
+                if verts.ndim != 2 or verts.shape[1] != 3:
+                    raise MifOpError("file '%s': 'vertices' is shaped %s, not (N, 3). %s" % (path, verts.shape, tail))
+                sizes = z["faceSizes"] if "faceSizes" in names else np.zeros(0, dtype=np.int32)
+                flat = z["faceIndices"] if "faceIndices" in names else np.zeros(0, dtype=np.int32)
+                if int(sizes.sum()) != len(flat):
+                    raise MifOpError("file '%s': faceSizes adds to %d corners and faceIndices has %d. %s"
+                                     % (path, int(sizes.sum()), len(flat), tail))
+                starts = np.concatenate([[0], np.cumsum(sizes)[:-1]]).astype(np.int64) if len(sizes) else []
+                flat_l = flat.tolist()
+                faces = [flat_l[s:s + n] for s, n in zip([int(s) for s in starts], sizes.tolist())]
+                uvs = {}
+                for nm in sorted(names):
+                    if nm.startswith("uv:"):
+                        arr = z[nm].tolist()
+                        uvs[nm[3:]] = [arr[s:s + n] for s, n in zip([int(s) for s in starts], sizes.tolist())]
+                meta = {}
+                if "meta" in names:
+                    try:
+                        meta = json.loads(str(z["meta"]))
+                    except ValueError:
+                        meta = {}
+                out = {"vertices": verts.tolist(), "faces": faces,
+                       "edges": z["edges"].tolist() if "edges" in names else [],
+                       "uvs": uvs, "materialIndices": z["materialIndices"].tolist() if "materialIndices" in names
+                       else None, "space": str(meta.get("space") or "LOCAL").upper(), "object": meta.get("object"),
+                       "format": meta.get("format")}
+        except MifOpError:
+            raise
+        except Exception as exc:                                    # noqa: BLE001 - a bad archive is a sentence
+            raise MifOpError("file '%s' is not a readable .npz: %s: %s. %s"
+                             % (path, type(exc).__name__, str(exc)[:160], tail))
+    else:
+        raise MifOpError("file '%s' must be .json or .npz (the two shapes read_mesh_data writes). %s" % (path, tail))
+    out["path"] = path
+    if out["space"] not in _RM_SPACES:
+        raise MifOpError("file '%s' says space %r; it is LOCAL or WORLD. %s" % (path, out["space"], tail))
+    return out
+
+
+def op_read_mesh_data(params):
+    """A mesh's vertices and faces written to a file an outside script reads - and create_mesh / set_mesh_vertices
+    read back.
+
+    params:
+      object (str, required)   a MESH in object mode
+      file (str, required)     a .json or .npz path (the format follows the extension); replaced by default, and said
+      space (str)              LOCAL (default: the object's own frame, what create_mesh takes) or WORLD
+      evaluated (bool)         default false: the base mesh. true: the mesh after modifiers and shape keys
+      shapeKey (str)           that shape key's positions instead of the base mesh's (not with evaluated)
+      uvs (bool | [names])     write UV layers, one [u, v] per face corner (true: every layer). Default false
+      materialIndices (bool)   write each face's material slot. Default false
+      looseEdges (bool)        write the edges no face uses. Default true
+      overwrite (bool)         default true; false refuses an existing file
+
+    The reply's counts are READ BACK OFF THE WRITTEN FILE, not off the mesh: vertexCount, faceCount, cornerCount.
+    """
+    import json
+    import os
+    reject_unknown(params, _RM_KEYS, "read_mesh_data")
+    tail = "NOTHING was written."
+    obj = get_object(take(params, "object", "name", required=True, kind=str), want_mesh=True)
+    raw = take(params, "file", "filepath", "path", required=True, kind=str)
+    ext = os.path.splitext(str(raw))[1].lower()
+    if ext not in (".json", ".npz"):
+        raise MifOpError("file must end .json or .npz (the format follows the extension), got %r. %s" % (raw, tail))
+    space = str(take(params, "space", default="LOCAL", kind=str)).upper()
+    if space not in _RM_SPACES:
+        raise MifOpError("space is LOCAL or WORLD, got %r. %s" % (params.get("space"), tail))
+    evaluated = take_bool(params, "evaluated", default=False)
+    key_name = take(params, "shapeKey", "shape_key", default=None, kind=str)
+    if evaluated and key_name is not None:
+        raise MifOpError("shapeKey reads one key off the base mesh and evaluated reads the mesh after every key and "
+                         "modifier - pass one. %s" % tail)
+    want_uvs = params.get("uvs", False)
+    if want_uvs is not None and not isinstance(want_uvs, (bool, list)):
+        raise MifOpError("uvs is true, false or a list of layer names, got %r. %s" % (want_uvs, tail))
+    want_mi = take_bool(params, "materialIndices", default=False)
+    want_loose = take_bool(params, "looseEdges", default=True)
+    overwrite = take_bool(params, "overwrite", default=True)
+    key_block = None
+    if key_name is not None:
+        kb = getattr(getattr(obj.data, "shape_keys", None), "key_blocks", None)
+        key_block = kb.get(key_name) if kb is not None else None
+        if key_block is None:
+            raise MifOpError("'%s' has no shape key %r (it has %s). %s"
+                             % (obj.name, key_name, ", ".join(k.name for k in kb) if kb else "none", tail))
+    path = _out_path(raw, tail)
+    if os.path.exists(path) and not overwrite:
+        raise MifOpError("%s already exists and overwrite is false. %s" % (path, tail))
+
+    import numpy as np                                       # noqa: PLC0415 - after every refusal
+    eval_obj = None
+    if evaluated:
+        dg = bpy.context.evaluated_depsgraph_get()
+        eval_obj = obj.evaluated_get(dg)
+        mesh = eval_obj.to_mesh()
+    else:
+        mesh = obj.data
+    try:
+        layer_names = [u.name for u in mesh.uv_layers]
+        if want_uvs is True:
+            uv_layers = layer_names
+        elif isinstance(want_uvs, list):
+            missing = [n for n in want_uvs if n not in layer_names]
+            if missing:
+                raise MifOpError("'%s' has no UV layer %s (it has %s). %s"
+                                 % (obj.name, missing, ", ".join(layer_names) or "none", tail))
+            uv_layers = list(want_uvs)
+        else:
+            uv_layers = []
+        nv, nf, nl = len(mesh.vertices), len(mesh.polygons), len(mesh.loops)
+        co = np.empty(nv * 3, dtype=np.float64)
+        if key_block is not None:
+            key_block.data.foreach_get("co", co)
+        else:
+            mesh.vertices.foreach_get("co", co)
+        co = co.reshape(nv, 3)
+        if space == "WORLD":
+            m = np.array(obj.matrix_world, dtype=np.float64)
+            co = co @ m[:3, :3].T + m[:3, 3]
+        if not np.isfinite(co).all():
+            bad = int(np.argwhere(~np.isfinite(co).all(axis=1))[0][0])
+            raise MifOpError("vertex %d of '%s' is not a finite position. %s" % (bad, obj.name, tail))
+        sizes = np.empty(nf, dtype=np.int32)
+        mesh.polygons.foreach_get("loop_total", sizes)
+        flat = np.empty(nl, dtype=np.int32)
+        mesh.loops.foreach_get("vertex_index", flat)
+        # loops are stored face after face in loop_start order, which foreach_get on polygons does not promise to be
+        # the polygon order - so the corners are taken face by face through loop_start
+        starts = np.empty(nf, dtype=np.int32)
+        mesh.polygons.foreach_get("loop_start", starts)
+        order = None
+        if nf and not (np.all(starts == np.concatenate([[0], np.cumsum(sizes)[:-1]]))):
+            order = np.concatenate([np.arange(s, s + n) for s, n in zip(starts, sizes)])
+            flat = flat[order]
+        loose = []
+        if want_loose and len(mesh.edges):
+            ev = np.empty(len(mesh.edges) * 2, dtype=np.int32)
+            mesh.edges.foreach_get("vertices", ev)
+            is_loose = np.empty(len(mesh.edges), dtype=bool)
+            mesh.edges.foreach_get("is_loose", is_loose)
+            loose = ev.reshape(-1, 2)[is_loose]
+        uv_arrays = {}
+        for name in uv_layers:
+            buf = np.empty(nl * 2, dtype=np.float64)
+            mesh.uv_layers[name].data.foreach_get("uv", buf)
+            buf = buf.reshape(nl, 2)
+            uv_arrays[name] = buf[order] if order is not None else buf
+        mi = None
+        if want_mi:
+            mi = np.empty(nf, dtype=np.int32)
+            mesh.polygons.foreach_get("material_index", mi)
+    finally:
+        if eval_obj is not None:
+            eval_obj.to_mesh_clear()
+
+    meta = {"format": MESH_FILE_FORMAT, "object": obj.name, "space": space, "evaluated": evaluated,
+            "shapeKey": key_block.name if key_block is not None else None, "units": "meters",
+            "vertexCount": nv, "faceCount": nf}
+    before = file_before(path)
+    if ext == ".json":
+        cuts = np.cumsum(sizes)[:-1] if nf else []
+        faces = [f.tolist() for f in np.split(flat, cuts)] if nf else []
+        body = dict(meta, vertices=np.round(co, 7).tolist(), faces=faces)
+        if want_loose:
+            body["edges"] = loose.tolist() if len(loose) else []
+        if uv_arrays:
+            body["uvs"] = {n: [f.tolist() for f in np.split(np.round(a, 7), cuts)] if nf else []
+                           for n, a in uv_arrays.items()}
+        if mi is not None:
+            body["materialIndices"] = mi.tolist()
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(body, fh, separators=(",", ":"))
+    else:
+        arrays = {"vertices": co, "faceSizes": sizes, "faceIndices": flat, "meta": np.array(json.dumps(meta))}
+        if want_loose:
+            arrays["edges"] = np.asarray(loose, dtype=np.int32).reshape(-1, 2)
+        for n, a in uv_arrays.items():
+            arrays["uv:" + n] = a
+        if mi is not None:
+            arrays["materialIndices"] = mi
+        # np.savez appends .npz to a path without it; the path here always ends .npz, so it writes exactly `path`
+        with open(path, "wb") as fh:
+            np.savez(fh, **arrays)
+    back = load_mesh_file(path, "The file was written but could not be read back.")
+    corners = sum(len(f) for f in back["faces"])
+    out = {"object": obj.name, "file": path, "format": ext[1:], "fileFormat": MESH_FILE_FORMAT, "space": space,
+           "evaluated": evaluated, "shapeKey": meta["shapeKey"], "vertexCount": len(back["vertices"]),
+           "faceCount": len(back["faces"]), "cornerCount": corners, "looseEdgeCount": len(back["edges"]),
+           "uvLayers": sorted(back["uvs"]), "materialIndices": back["materialIndices"] is not None,
+           "bytes": os.path.getsize(path), "countsFrom": "read back off the written file",
+           "matchesMesh": len(back["vertices"]) == nv and len(back["faces"]) == nf and corners == nl}
+    if nv:
+        out["bounds"] = {"min": [round(float(v), 6) for v in co.min(axis=0)],
+                         "max": [round(float(v), 6) for v in co.max(axis=0)]}
+    if not evaluated and key_block is None:
+        warn = []
+        keys = getattr(obj.data, "shape_keys", None)
+        if keys is not None and len(keys.key_blocks) > 1:
+            warn.append("'%s' has %d shape keys: these are the base mesh's positions - pass shapeKey for one key or "
+                        "evaluated for the mesh as it draws." % (obj.name, len(keys.key_blocks)))
+        shaping = [m.name for m in obj.modifiers if m.show_viewport]
+        if shaping:
+            warn.append("modifiers %s are not applied - pass evaluated:true for the mesh after them." % shaping)
+        if warn:
+            out["warnings"] = warn
+    out.update(replaced_fields(before))
+    return out
+
+
+# --------------------------------------------------------------------------------------------- set_mesh_vertices
+_SV_KEYS = ("object", "vertices", "file", "space", "shapeKey", "tolerance", "dryRun")
+
+
+def op_set_mesh_vertices(params):
+    """Write every vertex of a mesh by array, in place - the object, its modifiers, groups, UVs and links kept.
+
+    params:
+      object (str, required)   a MESH in object mode
+      vertices [[x, y, z]]     one position per vertex, in vertex order; or
+      file (str)               a .json / .npz in read_mesh_data's shape (its space and its faces are checked)
+      space (str)              LOCAL (default) or WORLD - the frame `vertices` are in; a file says its own
+      shapeKey (str)           write that shape key's positions instead of the base mesh's. Required on a mesh with
+                               shape keys: under a Basis, base positions change nothing that draws
+      tolerance (float)        a vertex counts as moved past this distance (default 1e-6 m)
+      dryRun (bool)            measure what would move, write nothing
+
+    A count that is not the mesh's is refused; so is a file whose faces are not the mesh's faces (another topology).
+    The reply measures how many vertices moved and by how far, in the object's local units.
+    """
+    reject_unknown(params, _SV_KEYS, "set_mesh_vertices")
+    tail = "NOTHING was changed."
+    obj = get_object(take(params, "object", "name", required=True, kind=str), want_mesh=True)
+    require_editable(obj, "changed")
+    mesh = obj.data
+    given = [k for k in ("vertices", "file") if params.get(k) is not None]
+    if len(given) != 1:
+        raise MifOpError("pass vertices (a list) or file (read_mesh_data's .json / .npz), one of them. %s" % tail)
+    tol = take_float(params, "tolerance", default=1e-6)
+    if tol < 0:
+        raise MifOpError("tolerance is a distance, 0 or more. %s" % tail)
+    dry = take_bool(params, "dryRun", default=False)
+    import numpy as np                                       # noqa: PLC0415
+    nv = len(mesh.vertices)
+    from_file = None
+    if params.get("file") is not None:
+        if params.get("space") is not None:
+            raise MifOpError("a file says its own space; space goes with vertices. %s" % tail)
+        from_file = load_mesh_file(take(params, "file", kind=str), tail)
+        rows = from_file["vertices"]
+        space = from_file["space"]
+    else:
+        rows = params.get("vertices")
+        space = str(take(params, "space", default="LOCAL", kind=str)).upper()
+        if space not in _RM_SPACES:
+            raise MifOpError("space is LOCAL or WORLD, got %r. %s" % (params.get("space"), tail))
+    if not isinstance(rows, list):
+        raise MifOpError("vertices must be a list of [x, y, z]. %s" % tail)
+    if len(rows) != nv:
+        raise MifOpError("'%s' has %d vertices and %d positions were given - one per vertex, in vertex order "
+                         "(read_mesh_data writes them in that order). %s" % (obj.name, nv, len(rows), tail))
+    try:
+        new = np.array(rows, dtype=np.float64)
+    except (TypeError, ValueError):
+        raise MifOpError("vertices must be a list of [x, y, z] numbers. %s" % tail)
+    if new.shape != (nv, 3):
+        raise MifOpError("vertices must be [x, y, z] rows, got an array shaped %s. %s" % (new.shape, tail))
+    if not np.isfinite(new).all():
+        bad = int(np.argwhere(~np.isfinite(new).all(axis=1))[0][0])
+        raise MifOpError("vertices[%d] is not finite: %s. %s" % (bad, rows[bad], tail))
+    if from_file is not None and from_file["faces"]:
+        sizes = np.empty(len(mesh.polygons), dtype=np.int32)
+        mesh.polygons.foreach_get("loop_total", sizes)
+        same = len(from_file["faces"]) == len(mesh.polygons) and [len(f) for f in from_file["faces"]] == sizes.tolist()
+        if same:
+            flat = np.empty(len(mesh.loops), dtype=np.int32)
+            mesh.loops.foreach_get("vertex_index", flat)
+            starts = np.empty(len(mesh.polygons), dtype=np.int32)
+            mesh.polygons.foreach_get("loop_start", starts)
+            mine = [flat[s:s + n].tolist() for s, n in zip(starts.tolist(), sizes.tolist())]
+            same = mine == from_file["faces"]
+        if not same:
+            raise MifOpError("file '%s' holds another topology than '%s' (%d faces against %d, or the corners differ) "
+                             "- its positions would land on the wrong vertices. create_mesh replaceData rebuilds the "
+                             "mesh from it instead. %s" % (from_file["path"], obj.name, len(from_file["faces"]),
+                                                          len(mesh.polygons), tail))
+    if space == "WORLD":
+        m = np.array(obj.matrix_world.inverted_safe(), dtype=np.float64)
+        new = new @ m[:3, :3].T + m[:3, 3]
+    keys = getattr(mesh, "shape_keys", None)
+    key_name = take(params, "shapeKey", "shape_key", default=None, kind=str)
+    target = mesh.vertices
+    if key_name is not None:
+        kb = keys.key_blocks.get(key_name) if keys is not None else None
+        if kb is None:
+            raise MifOpError("'%s' has no shape key %r (it has %s); add_shape_key makes one. %s"
+                             % (obj.name, key_name, ", ".join(k.name for k in keys.key_blocks) if keys else "none",
+                                tail))
+        target = kb.data
+    elif keys is not None and len(keys.key_blocks):
+        raise MifOpError("'%s' has shape keys (%s): its Basis holds the rest shape, so base positions written under it "
+                         "change nothing that draws. Pass shapeKey - '%s' for the rest shape. %s"
+                         % (obj.name, ", ".join(k.name for k in keys.key_blocks), keys.key_blocks[0].name, tail))
+    old = np.empty(nv * 3, dtype=np.float64)
+    target.foreach_get("co", old)
+    old = old.reshape(nv, 3)
+    dist = np.linalg.norm(new - old, axis=1) if nv else np.zeros(0)
+    moved = dist > tol
+    out = {"object": obj.name, "vertexCount": nv, "space": space, "shapeKey": key_name,
+           "moved": int(moved.sum()), "unmoved": int(nv - moved.sum()), "tolerance": tol,
+           "maxDistance": round(float(dist.max()), 7) if nv else 0.0,
+           "meanDistanceMoved": round(float(dist[moved].mean()), 7) if moved.any() else 0.0,
+           "farthestVertex": int(dist.argmax()) if nv and moved.any() else None,
+           "units": "the object's local units (meters at scale 1)", "dryRun": dry}
+    if from_file is not None:
+        out["file"] = from_file["path"]
+    if not dry:
+        target.foreach_set("co", new.astype(np.float32).ravel())
+        mesh.update()
+        back = np.empty(nv * 3, dtype=np.float64)
+        target.foreach_get("co", back)
+        out["readBackMaxError"] = round(float(np.abs(back.reshape(nv, 3) - new).max()), 7) if nv else 0.0
+        out["written"] = True
+        out.update(shared_data_note(obj))
+    else:
+        out["written"] = False
+    return out
+
+
 OPS = {
+    "read_mesh_data": op_read_mesh_data,
+    "set_mesh_vertices": op_set_mesh_vertices,
     "set_custom_normals": op_set_custom_normals,
     "transfer_mesh_data": op_transfer_mesh_data,
     "transfer_shape_keys": op_transfer_shape_keys,

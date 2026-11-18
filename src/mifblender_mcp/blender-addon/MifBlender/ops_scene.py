@@ -66,6 +66,10 @@ def op_ping(params):
         "changeCap": _cap.change_cap(),
         "ops": _server.op_names(),
     }
+    # HOW THIS LISTENER AUTHENTICATES (1.4, token_store.py), never the token: per-install, custom, none, argument or the
+    # headless default
+    from . import _server as _live
+    out["tokenSource"] = getattr(_live, "token_source", None) if _live is not None else None
     # the ops separate add-ons registered (extensions.py): the api version, and each provider's ops - which are in
     # "ops" above too, dispatched like any built-in
     from . import extensions as _ext
@@ -154,10 +158,29 @@ def op_call_log(params):
 # ---------------------------------------------------------------------------
 
 def op_list_objects(params):
-    """Every object in the file, filtered by type, a name pattern (a glob when it holds * ? or [, else a substring) and
-    near {point, radius}; detail adds object_info's full record per object."""
-    reject_unknown(params, {"type", "objectType", "pattern", "detail", "limit", "nameExcludes", "near"}, "list_objects")
+    """Every object in the file, filtered by type, a name pattern (a glob when it holds * ? or [, else a substring),
+    collection (with recursive, default true: its child collections too) and near {point, radius}; each row names its
+    parent, and detail adds object_info's full record per object (its collections among them)."""
+    reject_unknown(params, {"type", "objectType", "pattern", "detail", "limit", "nameExcludes", "near", "collection",
+                            "recursive"}, "list_objects")
     near = _near_filter(params.get("near"))
+    # A COLLECTION FILTER (FOUND 2026-11-10): no key filtered by collection, so mapping objects to collections needed
+    # raw Python. collection names one; recursive (default true) takes its child collections' objects too.
+    coll_name = take(params, "collection", default=None, kind=str)
+    if params.get("recursive") is not None and coll_name is None:
+        raise MifOpError("recursive goes with collection - it says whether a collection's child collections count.")
+    recursive = take_bool(params, "recursive", default=True)
+    in_coll = None
+    if coll_name is not None:
+        coll = bpy.data.collections.get(coll_name)
+        scene_root = bpy.context.scene.collection if bpy.context.scene else None
+        if coll is None and scene_root is not None and coll_name in (scene_root.name, "Scene Collection"):
+            coll = scene_root
+        if coll is None:
+            names = sorted(c.name for c in bpy.data.collections)
+            raise MifOpError("no collection named '%s'. This file has: %s%s." % (
+                coll_name, ", ".join(names[:25]) or "(none)", " ..." if len(names) > 25 else ""))
+        in_coll = {o.name for o in (coll.all_objects if recursive else coll.objects)}
     want_type = take(params, "type", "objectType")
     pattern = take(params, "pattern")
     detail = take_bool(params, "detail", default=False)
@@ -200,6 +223,8 @@ def op_list_objects(params):
             continue
         if pattern and not matches(obj.name):
             continue
+        if in_coll is not None and obj.name not in in_coll:
+            continue
         dist = _near_distance(obj, near) if near else None
         if near and dist > near["radius"]:
             continue
@@ -208,8 +233,11 @@ def op_list_objects(params):
             if near:
                 rows[-1]["distance"] = round(dist, 6)
             continue
+        # THE PARENT IN EVERY ROW (FOUND 2026-11-10): a tidy could not be proved from this listing - k.get('parent') was
+        # None for every row and read as "nothing parented" - while object_info had it all along.
         row = {"name": obj.name, "type": obj.type,
-               "inViewLayer": obj.name in in_view_layer}
+               "inViewLayer": obj.name in in_view_layer,
+               "parent": obj.parent.name if obj.parent is not None else None}
         if near:
             row["distance"] = round(dist, 6)
         if obj.type == "MESH":
@@ -235,6 +263,8 @@ def op_list_objects(params):
     rows, extra = limit_rows(rows, params, "object(s)")
     return dict({"count": matched, "objects": rows,
                  "filteredBy": {"type": want_type, "pattern": pattern,
+                                "collection": coll_name,
+                                "recursive": recursive if coll_name is not None else None,
                                 "patternMode": ("glob" if glob_mode else "substring") if pattern else None,
                                 "nameExcludes": params.get("nameExcludes"),
                                 "near": dict(near, point=list(near["point"])) if near else None}}, **extra)
@@ -795,9 +825,25 @@ def op_delete_object(params):
         raise MifOpError("'objects' must be a list of object names")
 
     targets = [get_object(n) for n in names]
+    # THE DATA A DELETE LEAVES HOLDS ITS NAME (FOUND 2026-11-09): delete_object(Cam_x) answered orphansKept 0, and the
+    # camera data it left behind, with no user, still held 'Cam_x', so the rebuild's data came back 'Cam_x.001'. Read
+    # before the delete, while the objects still say what their data is; reported only when not purged.
+    held = [] if purge else [o.data for o in targets if o.data is not None]
     removed, purge_result, freed, not_freed, joints = _delete(targets, purge, scope="object_data")
     purged, purged_names, kept = purge_result if purge else (0, [], [])
-    return {"removed": removed, "removedCount": len(removed), "orphansPurged": purged,
+    left = []
+    for d in held:
+        try:
+            if d.users == 0 and not d.use_fake_user and d.name not in left:
+                left.append(d.name)
+        except ReferenceError:
+            continue
+    return {"removed": removed, "removedCount": len(removed),
+            "dataLeft": left[:50] or None,
+            "dataLeftNote": ("the object data %s now has no user and still holds its name until it is purged, so a new "
+                             "object's data of that name is suffixed (the object itself gets the name). purgeOrphans:"
+                             "true frees it." % ", ".join("'%s'" % n for n in left[:10])) if left else None,
+            "orphansPurged": purged,
             "orphansPurgedNames": purged_names[:50] or None,
             "orphansKept": len(kept), "orphansKeptNames": kept[:50] or None,
             "orphanPurgeNote": _object_data_purge_note(purged_names, kept) if purge else None,
@@ -902,7 +948,7 @@ def op_run_python(params):
     return response
 
 
-# CALLS THAT STOP THE ADD-ON RUNNING THEM. benchmark round ten (X2, 2026-10-01): an agent began with
+# CALLS THAT STOP THE ADD-ON RUNNING THEM. Benchmark round ten (X2, 2026-10-01): an agent began with
 # bpy.ops.wm.read_factory_settings(use_empty=True); the factory reset disabled every add-on, unregister() stopped the
 # server, the background Blender quit, and the run was recorded crashed. Measured on 5.2.1 through run_python:
 # read_factory_settings and read_factory_userpref both print "[MifBlender] stopped" and the port closes;

@@ -127,8 +127,9 @@ def op_file_info(params):
         # BLENDER'S FLAG OR THE BRIDGE'S COUNT - either says unsaved work exists. Reported: isDirty read false
         # after verified writes, because on 5.2 no data-API or Python-operator write sets bpy.data.is_dirty (measured -
         # see ops_undo.bridge_writes). Both halves are reported so a caller can see which one spoke.
-        "isDirty": bool(bpy.data.is_dirty) or ops_undo.bridge_writes() > 0,
+        "isDirty": _is_dirty(),
         "isDirtyNative": bool(bpy.data.is_dirty),
+        "isDirtyNativeTrusted": not bpy.app.background,
         "bridgeWritesSinceSave": ops_undo.bridge_writes(),
         "fileExists": bool(path) and os.path.isfile(path),
         "fileBytes": os.path.getsize(path) if path and os.path.isfile(path) else -1,
@@ -142,7 +143,16 @@ def op_file_info(params):
 
 
 _APPEND_KEYS = {"filepath", "path", "objects", "collections", "materials", "nodeGroups",
-                "actions", "worlds", "fonts", "link", "activeCollection", "listOnly", "instanceEmpty"}
+                "actions", "worlds", "fonts", "link", "activeCollection", "listOnly", "instanceEmpty", "reuseData"}
+
+# REUSE AND SUFFIX REPORTING (2026-11-09). Appending objects one call at a time gave every material they share a
+# .NNN copy per call, and the reply named none: `renamed` covers only the names asked for, never the data that came
+# with them. _REUSE_KINDS are the kinds reuseData may fold back onto the same-named datablock already here - shared
+# look data, which two objects mean to share. Meshes, actions and the rest are each object's own, so a same name
+# there is a coincidence, not a share. _SUFFIX_KINDS are the kinds the reply's `suffixed` scans.
+_REUSE_KINDS = ("materials", "node_groups", "images", "textures")
+_SUFFIX_KINDS = ("objects", "collections", "meshes", "curves", "armatures", "cameras", "lights", "materials",
+                 "node_groups", "images", "textures", "actions", "worlds", "fonts")
 
 # WHAT CAN BE PULLED IN, and the bpy.data collection each name maps to. Deliberately NOT every
 # collection Blender has: these six are the ones an asset file is built out of, and each one is
@@ -210,6 +220,12 @@ def op_append_from_file(params):
                                    survives the source file moving
       activeCollection (str)       where objects land; defaults to the scene collection
       listOnly (bool)              report what the file holds and import NOTHING
+      reuseData (bool | list)      (2026-11-09) fold a copy that came in suffixed (M_Metal.001) back onto the
+                                   same-named datablock already here - its users remapped, the copy removed - for
+                                   materials, node groups, images and textures (true), or the kinds listed. Off by
+                                   default: a same name is not always the same material. Refused with link. The
+                                   reply's `suffixed` names every datablock left with a suffix, asked for or not,
+                                   and `reused` what was folded
       instanceEmpty (bool)         collections land as an EMPTY instancing each one (instance_type COLLECTION) -
                                    Blender's own File > Link default - instead of as a child collection. Added
                                    2026-10-06 with the library overrides: an instanced collection is what
@@ -250,6 +266,27 @@ def op_append_from_file(params):
     link = True if packed else take_bool(params, "link", default=False)
     list_only = take_bool(params, "listOnly", default=False)
     instance_empty = take_bool(params, "instanceEmpty", default=False)
+    reuse_raw = params.get("reuseData")
+    if reuse_raw is None or reuse_raw is False:
+        reuse = ()
+    elif reuse_raw is True:
+        reuse = _REUSE_KINDS
+    elif isinstance(reuse_raw, list) and reuse_raw and all(isinstance(k, str) for k in reuse_raw):
+        spell = {"nodeGroups": "node_groups"}
+        reuse = tuple(spell.get(k, k) for k in reuse_raw)
+        bad = [k for k in reuse if k not in _REUSE_KINDS]
+        if bad:
+            raise MifOpError("reuseData cannot reuse %s - it folds shared look data onto the same-named datablock "
+                             "already here: %s (true takes all four). A mesh or an action is one object's own, so a "
+                             "same name there is not a share. NOTHING was imported."
+                             % (", ".join(bad), ", ".join(_REUSE_KINDS)))
+    else:
+        raise MifOpError("reuseData is true, or a list of kinds from %s; got %r. NOTHING was imported."
+                         % (", ".join(_REUSE_KINDS), reuse_raw))
+    if reuse and (link or list_only):
+        raise MifOpError("reuseData folds appended copies onto data already here; %s. NOTHING was imported."
+                         % ("linked data is not copied, so there is no copy to fold" if link
+                            else "listOnly imports nothing"))
     if instance_empty and (list_only or not params.get("collections")):
         raise MifOpError("instanceEmpty places collections as instancing empties - it needs collections, and does "
                          "nothing with listOnly. NOTHING was imported.")
@@ -270,10 +307,13 @@ def op_append_from_file(params):
     # WHAT THE FILE HOLDS, read first in every case. The refusal below needs it, and listOnly is
     # this same read with the import skipped - one path, so the two cannot disagree.
     available = {}
+    in_file = {}
     try:
         with bpy.data.libraries.load(path, link=link) as (src, _dst):
             for _key, attr in _APPEND_KINDS:
                 available[attr] = sorted(getattr(src, attr, []) or [])
+            for attr in _SUFFIX_KINDS:
+                in_file[attr] = set(getattr(src, attr, []) or [])
     except Exception as exc:                                       # noqa: BLE001
         raise MifOpError("could not read '%s' as a Blender file (%s). NOTHING was imported."
                          % (path, exc))
@@ -330,6 +370,7 @@ def op_append_from_file(params):
                          "has: %s. NOTHING was imported." % (coll_asked, ", ".join(have) if have else "(none)"))
 
     before = {attr: {d.name for d in getattr(bpy.data, attr)} for _k, attr in _APPEND_KINDS}
+    before_all = {attr: {d.name for d in getattr(bpy.data, attr)} for attr in _SUFFIX_KINDS}
     # SNAPSHOT THE ASKED-FOR NAMES BEFORE THE LOAD, because the loader MUTATES the lists it is
     # handed. Assigning `wanted["objects"]` straight to `dst.objects` gives Blender that list
     # object, and it comes back EMPTIED - so the `renamed` calculation below compared the imported
@@ -340,6 +381,29 @@ def op_append_from_file(params):
     with bpy.data.libraries.load(path, link=link, **({"pack": True} if packed else {})) as (src, dst):
         for attr, names in wanted.items():
             setattr(dst, attr, list(names))
+
+    # REUSE, then the SUFFIX REPORT. A new datablock is a suffixed copy when its name is not one the file holds and
+    # stripping a .NNN gives a name that was here before the call. reuseData remaps a copy's users onto that one and
+    # removes the copy - only a local one: a linked datablock of the same name is somebody else's file.
+    reused = []
+    for attr in reuse:
+        coll = getattr(bpy.data, attr)
+        for name in sorted({d.name for d in coll} - before_all[attr]):
+            base = _suffix_base(name, in_file[attr], before_all[attr])
+            if base is None:
+                continue
+            new, old = coll.get(name), coll.get(base)
+            if new is None or old is None or old.library is not None or type(new) is not type(old):
+                continue
+            new.user_remap(old)
+            coll.remove(new)
+            reused.append({"kind": attr, "kept": base, "removed": name})
+    suffixed = {}
+    for attr in _SUFFIX_KINDS:
+        got = [n for n in sorted({d.name for d in getattr(bpy.data, attr)} - before_all[attr])
+               if _suffix_base(n, in_file[attr], before_all[attr]) is not None]
+        if got:
+            suffixed[attr] = got
 
     imported = {}
     for _key, attr in _APPEND_KINDS:
@@ -393,7 +457,16 @@ def op_append_from_file(params):
         "placedInCollection": target.name,
         "placed": placed,
         "renamed": sorted(n for names in imported.values() for n in names if n not in asked),
+        "suffixed": suffixed,
     }
+    if reuse:
+        out["reused"] = reused
+    if suffixed:
+        out["suffixedNote"] = ("these came in with a .NNN suffix because the name was taken here: an object appended "
+                               "on its own brings a copy of every material it shares with one already appended. "
+                               "Append the objects in one call, or pass reuseData:true to keep the data already "
+                               "here%s." % ("" if not reuse else " (materials, node groups, images and textures are "
+                                            "the kinds it folds)"))
     if instance_empty:
         out["instancers"] = instancers
     out["linkNote"] = (
@@ -408,6 +481,15 @@ def op_append_from_file(params):
         out["renameNote"] = ("Blender appended a numeric suffix because those names were already "
                              "taken here. The names above are what you actually have.")
     return out
+
+
+def _suffix_base(name, in_file, before):
+    """The name a .NNN copy was suffixed from, or None: name is not one the source file holds, and without its
+    numeric suffix it is a name that was here before the call."""
+    head, dot, tail = name.rpartition(".")
+    if not dot or not tail.isdigit() or len(tail) < 3 or name in in_file:
+        return None
+    return head if head in before else None
 
 
 def op_save_file(params):
@@ -456,7 +538,8 @@ def op_save_file(params):
 
     # COUNTED BEFORE THE WRITE, because afterwards they are gone and uncountable. See _orphans.
     orphans, orphan_total = _orphans()
-    dirty_before = bool(bpy.data.is_dirty)
+    dirty_before = _is_dirty()
+    dirty_before_native = bool(bpy.data.is_dirty)
     was_filepath = bpy.data.filepath or ""
     repoint = take_bool(params, "repointSession", default=False)
 
@@ -512,8 +595,14 @@ def op_save_file(params):
         "repointedSession": repoint,
         "sessionFilepath": bpy.data.filepath or "",
         "sessionFilepathUnchanged": (bpy.data.filepath or "") == was_filepath,
+        # THE BRIDGE'S COUNT, AS file_info's isDirty (FOUND 2026-11-09): Blender's flag stays true after a save in a
+        # background session. A save to the session's own file clears the count (ops_undo.after_write, just after this
+        # returns); a copy leaves the session's unsaved work unsaved.
         "dirtyBefore": dirty_before,
-        "dirtyAfter": bool(bpy.data.is_dirty),
+        "dirtyAfter": (bool(bpy.data.is_dirty) and not bpy.app.background) or (
+            ops_undo.bridge_writes() > 0 and os.path.normcase(bpy.data.filepath or "") != os.path.normcase(path)),
+        "dirtyBeforeNative": dirty_before_native,
+        "dirtyAfterNative": bool(bpy.data.is_dirty),
         # THE PART BLENDER NEVER TELLS YOU. These no longer exist in the saved file.
         "purgedOrphans": orphan_total,
         "purgedOrphansByType": orphans,
@@ -524,6 +613,46 @@ def op_save_file(params):
                      "unchanged and the next save still goes where it did before. This is a "
                      "save-a-copy, not a Save As."),
     }
+
+
+def _session_jobs():
+    """(jobs that finish INTO this session, jobs that only write files) - each a {kind, jobId, running, poll} row.
+
+    A FILE LOAD UNDER A RUNNING JOB (FOUND 2026-11-09). An out-of-process bake keeps running across open_file, and its
+    status call does part of the work in whatever session is loaded when it sees the child finish: bake_texture_set's
+    bakedMaterial is made there, and recipe_detail_bake draws its stitches and runs its checks on the objects there. So
+    a job with that step still to come ties the session to the file it started in."""
+    from . import ops_detailbake, ops_gamebake, ops_render     # noqa: PLC0415 - op modules, loaded by now
+    ties, files = [], []
+    detail_bakes = set()
+    for jid, job in list(ops_detailbake._JOBS.items()):          # noqa: SLF001 - same package
+        if job.get("result") is None:
+            detail_bakes.add(job.get("bakeJob"))
+            ties.append({"kind": "recipe_detail_bake", "jobId": jid, "poll": "recipe_detail_bake {jobId: '%s'}" % jid})
+    for jid, job in list(ops_gamebake._JOBS.items()):            # noqa: SLF001
+        running = job["popen"].poll() is None
+        pending = job.get("baked") is not None and job.get("bakedResult") is None
+        if jid in detail_bakes:
+            continue
+        row = {"kind": "bake_texture_set", "jobId": jid, "running": running,
+               "poll": "bake_texture_set {jobId: '%s'}" % jid}
+        if pending:
+            ties.append(row)
+        elif running:
+            files.append(row)
+    for jid, job in list(ops_render._JOBS.items()):              # noqa: SLF001
+        if job["popen"].poll() is None:
+            files.append({"kind": "render_animation", "jobId": jid, "running": True,
+                          "poll": "render_status {jobId: '%s'}" % jid})
+    return ties, files
+
+
+def _is_dirty():
+    """Unsaved work in memory: the bridge's count of scene-changing calls since the file was loaded or saved to itself,
+    or Blender's own flag where it means something - an interactive session, where a person can edit by hand. In the
+    background the flag is true from the moment a file opens (3.6-5.0) and false after every write (5.2), measured
+    2026-09-16 and 2026-11-09, so it is left out there (op_open_file)."""
+    return ops_undo.bridge_writes() > 0 or (bool(bpy.data.is_dirty) and not bpy.app.background)
 
 
 def op_open_file(params):
@@ -559,15 +688,29 @@ def op_open_file(params):
     # matters, which is exactly the day this parameter exists to protect.
     discard = take_bool(params, "discardUnsaved", default=False)
     # EITHER DIRTY SOURCE REFUSES. Blender's flag alone let a load discard bridge-made work on 5.2.
+    # IN A BACKGROUND BLENDER ONLY THE BRIDGE'S COUNT (FOUND 2026-11-09): there the flag reads true from the moment a
+    # file opens on 3.6-5.0 and stays true after a save to the session's own file, so an open straight after that save,
+    # or as the first call in an untouched factory session, was refused and agents learned to pass discardUnsaved:true -
+    # the habit this guard exists to prevent. Nobody edits a background Blender by hand; every change comes through the
+    # bridge, which counts it (run_python included).
     writes = ops_undo.bridge_writes()
-    if (bpy.data.is_dirty or writes > 0) and not discard:
+    native = bool(bpy.data.is_dirty) and not bpy.app.background
+    if (native or writes > 0) and not discard:
         raise MifOpError(
             "this session has UNSAVED changes (%s) and opening '%s' would discard them permanently - "
             "there is no undo across a file load. Save first with save_file, or pass "
             "discardUnsaved:true if the work is genuinely disposable. NOTHING was opened."
-            % ("; ".join(x for x in ("Blender marks the file modified" if bpy.data.is_dirty else "",
+            % ("; ".join(x for x in ("Blender marks the file modified" if native else "",
                                      "%d bridge call(s) that can change the scene since it was loaded or saved"
                                      % writes if writes else "") if x), path))
+
+    ties, file_jobs = _session_jobs()
+    if ties:
+        raise MifOpError(
+            "%d job(s) started from this session still have work to do IN it when they finish: %s. Opening '%s' now "
+            "would leave that step to run in the opened file. Poll each until it reports complete (or an error), then "
+            "open. NOTHING was opened."
+            % (len(ties), "; ".join("%s %s (poll %s)" % (t["kind"], t["jobId"], t["poll"]) for t in ties), path))
 
     try:
         bpy.ops.wm.open_mainfile(filepath=path)
@@ -590,7 +733,11 @@ def op_open_file(params):
     return {
         "filepath": now,
         "opened": True,
-        "isDirty": bool(bpy.data.is_dirty),
+        "jobsStillRunning": file_jobs or None,
+        "jobsNote": ("%d out-of-process job(s) keep running across the load and write only their own files; poll them "
+                     "as before." % len(file_jobs)) if file_jobs else None,
+        "isDirty": _is_dirty(),
+        "isDirtyNative": bool(bpy.data.is_dirty),
         "counts": _counts(),
     }
 

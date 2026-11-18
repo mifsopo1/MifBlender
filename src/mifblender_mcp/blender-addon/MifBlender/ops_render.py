@@ -38,7 +38,7 @@ from mathutils import Vector
 from . import childproc                          # no window; one heavy job at a time under a memory ceiling
 
 from .ops_common import (abs_output_path, MifOpError, get_object, simulation_guard, _is_id_struct, check_output_path, check_writable_dir, finite_float, finite_floats, finite_int,
-                         reject_unknown, rna_properties, take,
+                         file_before, reject_unknown, replaced_fields, rna_properties, take,
                          take_bool, take_float, take_int, write_rna_property)
 
 _SETTINGS_KEYS = {
@@ -338,13 +338,14 @@ _COMPARE_PX_MIN = 16
 _COMPARE_PX_MAX = 512
 
 
-def _load_scaled_luma(path, px):
-    """(luma list, alpha list, w, h) for an image scaled to fit px on its longest edge.
+def _load_scaled(path, px):
+    """(rgba numpy array (h, w, 4) float32, w, h) for an image scaled to fit px on its longest edge, bottom row first
+    as Blender stores it.
 
-    THE DATABLOCK IS REMOVED BY THE CALLER - this returns plain Python lists precisely so the image
-    does not have to stay alive, because leaving one behind would be this op quietly adding
-    something to the file to answer a question about it.
+    THE DATABLOCK IS REMOVED HERE - this returns a plain array precisely so the image does not have to stay alive,
+    because leaving one behind would be this op quietly adding something to the file to answer a question about it.
     """
+    import numpy as np                                   # noqa: PLC0415 - Blender bundles numpy on every build
     img = bpy.data.images.load(path)
     try:
         w, h = int(img.size[0]), int(img.size[1])
@@ -355,18 +356,11 @@ def _load_scaled_luma(path, px):
             f = float(px) / float(longest)
             img.scale(max(1, int(round(w * f))), max(1, int(round(h * f))))
             w, h = int(img.size[0]), int(img.size[1])
-        n = w * h * 4
-        buf = [0.0] * n
-        # foreach_get is a C-level bulk copy - a Python loop over pixels costs orders of magnitude
-        # more, which is the same reason ops_mesh reaches for it on vertex coordinates.
+        buf = np.empty(w * h * 4, dtype=np.float32)
+        # foreach_get is a C-level bulk copy - a Python loop over pixels costs orders of magnitude more
         img.pixels.foreach_get(buf)
-        luma = [0.0] * (w * h)
-        alpha = [0.0] * (w * h)
-        for i in range(w * h):
-            r, g, b, a = buf[i * 4], buf[i * 4 + 1], buf[i * 4 + 2], buf[i * 4 + 3]
-            luma[i] = 0.2126 * r + 0.7152 * g + 0.0722 * b
-            alpha[i] = a
-        return luma, alpha, w, h
+        # float64 from here, so a threshold test reads the value as the old per-pixel Python floats did
+        return buf.reshape(h, w, 4).astype(np.float64), w, h
     finally:
         try:
             bpy.data.images.remove(img)
@@ -374,116 +368,434 @@ def _load_scaled_luma(path, px):
             pass
 
 
-def op_compare_to_reference(params):
-    """How close is an image to a reference? Two numbers, because they fail differently.
+def _luma(rgba):
+    return 0.2126 * rgba[..., 0] + 0.7152 * rgba[..., 1] + 0.0722 * rgba[..., 2]
 
-    params:
-      image (str, required)      the render to judge
-      reference (str, required)  the picture it is supposed to match
-      comparePx (int)            longest edge both are scaled to, default 128
-      threshold (float)          luminance above which a pixel counts as subject, default 0.1.
-                                 Ignored when the image has real alpha, which is a better mask.
-    """
-    reject_unknown(params, {"image", "reference", "comparePx", "threshold"},
-                   "compare_to_reference")
-    img_path = bpy.path.abspath(str(take(params, "image", required=True, kind=str)))
-    ref_path = bpy.path.abspath(str(take(params, "reference", required=True, kind=str)))
-    for label, p in (("image", img_path), ("reference", ref_path)):
-        if not os.path.isfile(p):
-            raise MifOpError("%s '%s' does not exist. NOTHING was compared." % (label, p))
 
-    px = finite_int(take_float(params, "comparePx", default=_COMPARE_PX_DEFAULT), "comparePx")
-    if px < _COMPARE_PX_MIN or px > _COMPARE_PX_MAX:
-        raise MifOpError("comparePx must be between %d and %d - below that a silhouette carries no "
-                         "information and above it the comparison is slower for no gain. "
-                         "NOTHING was compared." % (_COMPARE_PX_MIN, _COMPARE_PX_MAX))
-    thresh = finite_float(take_float(params, "threshold", default=0.1), "threshold")
+def _shift(mask, dy, dx):
+    import numpy as np                                   # noqa: PLC0415
+    out = np.zeros_like(mask)
+    h, w = mask.shape
+    ys, yd = (slice(0, h - dy), slice(dy, h)) if dy >= 0 else (slice(-dy, h), slice(0, h + dy))
+    xs, xd = (slice(0, w - dx), slice(dx, w)) if dx >= 0 else (slice(-dx, w), slice(0, w + dx))
+    out[yd, xd] = mask[ys, xs]
+    return out
 
-    a_luma, a_alpha, aw, ah = _load_scaled_luma(img_path, px)
-    b_luma, b_alpha, bw, bh = _load_scaled_luma(ref_path, px)
 
-    # DIFFERENT ASPECT RATIOS ARE NOT COMPARED PIXEL-FOR-PIXEL. Two images scaled to the same longest
-    # edge can still differ in the other dimension, and lining those up by index would compare a
-    # pixel against whatever happened to land at the same offset - a number that looks like a
-    # measurement and means nothing.
+def _dilate(mask, r):
+    m = mask.copy()
+    for _ in range(r):
+        m = m | _shift(m, 1, 0) | _shift(m, -1, 0) | _shift(m, 0, 1) | _shift(m, 0, -1)
+    return m
+
+
+def _erode(mask, r):
+    m = mask.copy()
+    for _ in range(r):
+        m = m & _shift(m, 1, 0) & _shift(m, -1, 0) & _shift(m, 0, 1) & _shift(m, 0, -1)
+    return m
+
+
+def _components(mask):
+    """(labels, sizes): 4-connected components of a boolean grid by min-label propagation. 0 is background."""
+    import numpy as np                                   # noqa: PLC0415
+    h, w = mask.shape
+    big = h * w + 1
+    lab = np.where(mask, np.arange(1, h * w + 1).reshape(h, w), big)
+    while True:
+        nxt = lab.copy()
+        for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nb = _shift(lab, dy, dx)
+            nb[nb == 0] = big
+            nxt = np.minimum(nxt, nb)
+        nxt = np.where(mask, nxt, big)
+        # POINTER JUMPING: a label is a pixel's index + 1, so each pixel takes its label's own label - a blob's
+        # smallest index crosses it in a few passes instead of one pixel per pass
+        flat = nxt.ravel()
+        inside = flat < big
+        for _ in range(4):
+            flat[inside] = flat[flat[inside] - 1]
+        nxt = flat.reshape(h, w)
+        if np.array_equal(nxt, lab):
+            break
+        lab = nxt
+    lab = np.where(mask, lab, 0)
+    ids, inv = np.unique(lab, return_inverse=True)
+    inv = inv.reshape(h, w)
+    sizes = np.bincount(inv.ravel())
+    return inv, sizes, ids[0] == 0
+
+
+_KEY_KEYS = ("background", "tolerance", "mode", "close", "minSpeck")
+
+
+def _parse_key(raw, tail):
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise MifOpError("subjectKey is {background, tolerance, mode, close, minSpeck}, got %r. %s" % (raw, tail))
+    bad = sorted(k for k in raw if k not in _KEY_KEYS)
+    if bad:
+        raise MifOpError("subjectKey takes %s; %s is not one. %s" % (", ".join(_KEY_KEYS), ", ".join(bad), tail))
+    bg = raw.get("background", "auto")
+    if bg != "auto":
+        if not isinstance(bg, (list, tuple)) or len(bg) not in (3, 4):
+            raise MifOpError("subjectKey.background is 'auto' or [r, g, b] (0-1, as the file stores it), got %r. %s"
+                             % (bg, tail))
+        bg = finite_floats(list(bg)[:3], "subjectKey.background")
+    mode = str(raw.get("mode", "rgb")).lower()
+    if mode not in ("rgb", "chroma"):
+        raise MifOpError("subjectKey.mode is rgb (color distance) or chroma (hue and saturation, ignoring how bright - "
+                         "for a background lit unevenly), got %r. %s" % (raw.get("mode"), tail))
+    tol = finite_float(raw.get("tolerance", 0.12 if mode == "rgb" else 0.06), "subjectKey.tolerance")
+    close = raw.get("close", 2)
+    speck = raw.get("minSpeck", 8)
+    for k, v, top in (("close", close, 16), ("minSpeck", speck, 100000)):
+        if isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= top:
+            raise MifOpError("subjectKey.%s is a whole number 0-%d, got %r. %s" % (k, top, v, tail))
+    if tol <= 0:
+        raise MifOpError("subjectKey.tolerance must be above 0. %s" % tail)
+    return {"background": bg, "tolerance": tol, "mode": mode, "close": close, "minSpeck": speck}
+
+
+def _key_mask(rgba, key):
+    """A subject mask keyed off a background color: distance from it in RGB or in chromaticity, closed by `close`
+    pixels, specks under `minSpeck` pixels dropped. Returns (mask, report)."""
+    import numpy as np                                   # noqa: PLC0415
+    rgb = rgba[..., :3].astype(np.float64)
+    if key["background"] == "auto":
+        ring = np.concatenate([rgb[:2].reshape(-1, 3), rgb[-2:].reshape(-1, 3), rgb[:, :2].reshape(-1, 3),
+                               rgb[:, -2:].reshape(-1, 3)])
+        bg = np.median(ring, axis=0)
+        bg_from = "the median of the outer two-pixel border"
+    else:
+        bg = np.array(key["background"], dtype=np.float64)
+        bg_from = "given"
+    if key["mode"] == "chroma":
+        def chrom(a):
+            s = a.sum(axis=-1, keepdims=True)
+            return np.where(s > 1e-6, a / np.maximum(s, 1e-6), 1.0 / 3.0)
+        d = np.linalg.norm(chrom(rgb) - chrom(bg[None, None, :])[0, 0], axis=-1)
+    else:
+        d = np.linalg.norm(rgb - bg, axis=-1)
+    mask = d > key["tolerance"]
+    raw_cover = float(mask.mean())
+    if key["close"]:
+        mask = _erode(_dilate(mask, key["close"]), key["close"])
+    dropped = 0
+    if key["minSpeck"]:
+        inv, sizes, has_bg = _components(mask)
+        small = sizes < key["minSpeck"]
+        if has_bg:
+            small[0] = False
+        dropped = int(small.sum())
+        mask = mask & ~small[inv]
+    return mask, {"background": [round(float(c), 4) for c in bg], "backgroundFrom": bg_from, "mode": key["mode"],
+                  "tolerance": key["tolerance"], "close": key["close"], "minSpeck": key["minSpeck"],
+                  "coverageBeforeCleanup": round(raw_cover, 4), "specksDropped": dropped}
+
+
+def _mask_from_file(path, w, h, tail):
+    """A mask image (alpha when it has transparency, else luminance above 0.5) at the compare size."""
+    px = max(w, h)
+    m, mw, mh = _load_scaled(path, px)
+    if (mw, mh) != (w, h):
+        raise MifOpError("the mask '%s' scales to %dx%d and its image to %dx%d - a mask is the same shape as the "
+                         "picture it masks. No comparison was performed." % (path, mw, mh, w, h))
+    if (m[..., 3] < 0.999).any():
+        return m[..., 3] > 0.5, "alpha of %s" % os.path.basename(path)
+    return _luma(m) > 0.5, "luminance > 0.5 of %s (it has no transparency)" % os.path.basename(path)
+
+
+def _compare_one(img_path, ref_path, px, thresh, ref_mask_path, img_mask_path, key):
+    """One image against one reference: the scores, the masks and the RGB, for the reply and the overlay."""
+    import numpy as np                                   # noqa: PLC0415
+    a, aw, ah = _load_scaled(img_path, px)
+    b, bw, bh = _load_scaled(ref_path, px)
+    # DIFFERENT ASPECT RATIOS ARE NOT COMPARED PIXEL-FOR-PIXEL. Two images scaled to the same longest edge can still
+    # differ in the other dimension, and lining those up by index would compare a pixel against whatever happened to
+    # land at the same offset - a number that looks like a measurement and means nothing.
     if (aw, ah) != (bw, bh):
+        # NO GLOBAL CLAIM ABOUT STATE: both images were loaded and removed again before this (audit_mutate_then_deny)
         raise MifOpError(
-            # NO GLOBAL CLAIM ABOUT STATE. This refusal happens AFTER both images were loaded and
-            # removed again, so "NOTHING was compared" - which is what this said - was a promise
-            # about the file that this function is not in a position to make cleanly.
-            # audit_mutate_then_deny caught it: a load is a write, and a write above a refusal that
-            # promises nothing happened is the shape it exists to find. What is true is narrower
-            # and is what it says now.
             "the two images have different aspect ratios (%dx%d vs %dx%d after scaling), so a "
             "pixel-for-pixel comparison would be meaningless. No comparison was performed. Render "
             "at the reference's aspect ratio first - set_render_settings resolutionX/resolutionY."
             % (aw, ah, bw, bh))
-
     n = aw * ah
-    # Real alpha is a better subject mask than any luminance threshold, so it is preferred when
-    # BOTH images have it - a render on a transparent background and a cut-out reference.
-    a_has_alpha = any(v < 0.999 for v in a_alpha)
-    b_has_alpha = any(v < 0.999 for v in b_alpha)
+    a_luma, b_luma = _luma(a), _luma(b)
+    a_has_alpha = bool((a[..., 3] < 0.999).any())
+    b_has_alpha = bool((b[..., 3] < 0.999).any())
     use_alpha = a_has_alpha and b_has_alpha
-
-    if use_alpha:
-        a_mask = [v > 0.5 for v in a_alpha]
-        b_mask = [v > 0.5 for v in b_alpha]
-        mask_source = "alpha (both images have transparency, which is a better mask than a threshold)"
+    key_report = None
+    # EACH IMAGE BY ITS OWN BEST MASK (FOUND 2026-11-09): one opaque image used to put BOTH on the luminance threshold,
+    # so a transparent render against an opaque painted reference lost every dark part of the model. An image with
+    # alpha keeps it; only the opaque one is thresholded, and the reply says which.
+    # THE REFERENCE'S MASK, best first: a mask file, a background key, its alpha, the luminance threshold. A threshold
+    # cannot find the subject on a dark painted sheet (a glowing floor counts as subject), which is what the first two
+    # are for (2026-11-15).
+    opaque = [label for label, has in (("image", a_has_alpha), ("reference", b_has_alpha)) if not has]
+    if ref_mask_path:
+        b_mask, b_src = _mask_from_file(ref_mask_path, aw, ah, "")
+    elif key is not None:
+        b_mask, key_report = _key_mask(b, key)
+        b_src = "subjectKey (%s distance from the background over %g)" % (key["mode"], key["tolerance"])
+    elif b_has_alpha:
+        b_mask, b_src = b[..., 3] > 0.5, "alpha"
     else:
-        a_mask = [v > thresh for v in a_luma]
-        b_mask = [v > thresh for v in b_luma]
-        mask_source = ("luminance > %.3f (one or both images are fully opaque, so alpha could not "
-                       "be used)" % thresh)
+        b_mask, b_src = b_luma > thresh, "luminance > %.3f" % thresh
+    if img_mask_path:
+        a_mask, a_src = _mask_from_file(img_mask_path, aw, ah, "")
+    elif a_has_alpha:
+        a_mask, a_src = a[..., 3] > 0.5, "alpha"
+    else:
+        a_mask, a_src = a_luma > thresh, "luminance > %.3f" % thresh
+    if not ref_mask_path and key is None and not img_mask_path:
+        if use_alpha:
+            mask_source = "alpha (both images have transparency, which is a better mask than a threshold)"
+        else:
+            mask_source = ("luminance > %.3f (one or both images are fully opaque, so alpha could not be used for: %s)"
+                           % (thresh, " and ".join(opaque)))
+            if len(opaque) == 1:
+                mask_source += "; alpha for the %s" % ("reference" if opaque == ["image"] else "image")
+    else:
+        mask_source = "image: %s; reference: %s" % (a_src, b_src)
+    opaque_note = None
+    if "image" in opaque and not img_mask_path:
+        opaque_note = ("the image is fully opaque, so its subject is whatever is brighter than threshold %.3f. A render "
+                       "keeps a real silhouette in its alpha only when it is rendered with a transparent film AND saved "
+                       "with alpha: set_render_settings filmTransparent true and colorMode 'RGBA' (a PNG saved RGB "
+                       "drops it)." % thresh)
 
-    inter = union = 0
-    total_diff = 0.0
-    for i in range(n):
-        if a_mask[i] and b_mask[i]:
-            inter += 1
-        if a_mask[i] or b_mask[i]:
-            union += 1
-        total_diff += abs(a_luma[i] - b_luma[i])
-
+    inter = int((a_mask & b_mask).sum())
+    union = int((a_mask | b_mask).sum())
     iou = (float(inter) / float(union)) if union else None
+    mad = float(np.abs(a_luma - b_luma).mean()) if n else None
 
-    # A MASK COVERING ALMOST THE WHOLE FRAME IS NOT A SILHOUETTE. Measured the first time this ran:
-    # a cube and the same cube at 0.3x scale both scored IoU 1.0, because the opaque grey world
-    # background is brighter than the threshold, so every pixel counted as subject and the
-    # intersection over union of two full frames is 1.0 by definition. It would have passed happily
-    # against a render compared with itself; it took rendering something genuinely DIFFERENT and
-    # still getting 1.0 to see it.
-    #
-    # So a degenerate mask returns NULL rather than a number. A meaningless 1.0 is worse than an
-    # admitted null, because a null cannot be optimised against by mistake.
-    a_cover = float(sum(1 for v in a_mask if v)) / float(n) if n else 0.0
-    b_cover = float(sum(1 for v in b_mask if v)) / float(n) if n else 0.0
+    # A MASK COVERING ALMOST THE WHOLE FRAME IS NOT A SILHOUETTE. Measured the first time this ran: a cube and the same
+    # cube at 0.3x scale both scored IoU 1.0, because the opaque grey world background is brighter than the
+    # threshold, so every pixel counted as subject. A degenerate mask returns NULL rather than a number: a null cannot
+    # be optimised against by mistake.
+    a_cover = float(a_mask.mean()) if n else 0.0
+    b_cover = float(b_mask.mean()) if n else 0.0
     degenerate = None
     if max(a_cover, b_cover) > 0.95:
-        degenerate = ("the subject mask covers %.0f%% of the frame, so it is not separating a "
+        degenerate = ("the %s's subject mask covers %.0f%% of the frame, so it is not separating a "
                       "subject from a background - almost certainly an OPAQUE BACKGROUND brighter "
                       "than the threshold. silhouetteIoU is null rather than a meaningless number. "
                       "FIX: render with a transparent film (set_render_settings filmTransparent, or "
                       "Render Properties > Film > Transparent) and the alpha channel becomes a real "
                       "mask, which this op prefers automatically. Raising `threshold` can also work "
-                      "when the subject is much brighter than the background."
-                      % (max(a_cover, b_cover) * 100.0))
+                      "when the subject is much brighter than the background. For a render, colorMode 'RGBA' "
+                      "on set_render_settings keeps the alpha in the saved file. For a painted reference, pass "
+                      "referenceMask or subjectKey."
+                      % ("image" if a_cover >= b_cover else "reference", max(a_cover, b_cover) * 100.0))
     elif max(a_cover, b_cover) < 0.01:
         degenerate = ("the subject mask covers under 1%% of the frame - the render may be blank, or "
                       "`threshold` (%.3f) may be above everything in it. silhouetteIoU is null "
                       "rather than a number derived from a handful of pixels." % thresh)
     if degenerate:
         iou = None
-
-    return {
-        "image": img_path,
-        "reference": ref_path,
-        "comparedAt": [aw, ah],
+    warnings = []
+    ys, xs = np.nonzero(b_mask)
+    if len(xs):
+        box_w = (int(xs.max()) - int(xs.min()) + 1) / float(aw)
+        box_h = (int(ys.max()) - int(ys.min()) + 1) / float(ah)
+        if box_w >= 0.98 and box_h >= 0.98:
+            warnings.append("the reference mask's box fills the frame (%.0f%% x %.0f%%), so it is probably picking up "
+                            "background - a floor, a glow, a frame line - and not only the subject. Pass "
+                            "referenceMask, or subjectKey to key the background off by color."
+                            % (box_w * 100, box_h * 100))
+    sa, sb = int(a_mask.sum()), int(b_mask.sum())
+    # ONE MASK UNDER HALF THE OTHER (FOUND 2026-11-09: on a dark painted reference the luminance mask kept only the
+    # bright plates, 4515 pixels against the render's 9142, and the score of .35 said little about the shape)
+    mismatch = None
+    if sa and sb and min(sa, sb) < 0.5 * max(sa, sb):
+        small = "reference" if sb < sa else "image"
+        thresholded = (small == "reference" and "luminance" in b_src) or (small == "image" and "luminance" in a_src)
+        hint = (" The %s is opaque, so its mask is a brightness threshold: a dark subject on it reads as background. "
+                "Give it real alpha (a cut-out PNG), or key its background color before comparing (%s)."
+                % (small, "subjectKey or referenceMask" if small == "reference" else "imageMask")
+                if thresholded else "")
+        mismatch = ("the %s's mask covers %d pixels and the other's %d, under half: the score mostly measures that gap.%s"
+                    % (small, min(sa, sb), max(sa, sb), hint))
+    row = {
+        "image": img_path, "reference": ref_path, "comparedAt": [aw, ah],
         "silhouetteIoU": round(iou, 4) if iou is not None else None,
-        "meanAbsDiff": round(total_diff / float(n), 4) if n else None,
+        "meanAbsDiff": round(mad, 4) if mad is not None else None,
         "maskSource": mask_source,
-        "subjectPixels": {"image": sum(1 for v in a_mask if v),
-                          "reference": sum(1 for v in b_mask if v)},
+        "maskSources": {"image": a_src, "reference": b_src},
+        "opaqueImages": opaque or None,
+        "opaqueNote": opaque_note,
+        "maskMismatchNote": mismatch,
+        "subjectPixels": {"image": sa, "reference": sb},
+        "maskCoverage": {"image": round(a_cover, 4), "reference": round(b_cover, 4)},
+        "missingPixels": int((b_mask & ~a_mask).sum()), "extraPixels": int((a_mask & ~b_mask).sum()),
+        "degenerateMask": degenerate,
+        "emptyMaskNote": (None if union else
+                          "NEITHER image has any subject pixels at this threshold, so IoU is "
+                          "undefined rather than 0 - raise threshold, or check the render is not "
+                          "blank."),
+    }
+    if ref_mask_path:
+        row["referenceMask"] = ref_mask_path
+    if img_mask_path:
+        row["imageMask"] = img_mask_path
+    if key_report is not None:
+        row["subjectKey"] = key_report
+    if warnings:
+        row["maskWarnings"] = warnings
+    return row, (a, b, a_mask, b_mask)
+
+
+def _write_overlay(path, tiles):
+    """One row per view, top to bottom: the image, the reference, and the overlay - both gray, missing (in the
+    reference, not the image) red, extra (in the image, not the reference) cyan."""
+    import numpy as np                                   # noqa: PLC0415
+    rows = []
+    gap = 4
+    for a, b, am, bm in tiles:
+        h, w = am.shape
+        def over_dark(x):
+            alpha = x[..., 3:4]
+            return x[..., :3] * alpha + 0.12 * (1.0 - alpha)
+        ov = np.zeros((h, w, 3), dtype=np.float32)
+        ov[am & bm] = (0.78, 0.78, 0.78)
+        ov[bm & ~am] = (1.0, 0.18, 0.18)
+        ov[am & ~bm] = (0.15, 0.85, 1.0)
+        sep = np.full((h, gap, 3), 0.5, dtype=np.float32)
+        rows.append(np.concatenate([over_dark(a), sep, over_dark(b), sep, ov], axis=1))
+    width = max(r.shape[1] for r in rows)
+    padded = []
+    for r in rows:
+        if r.shape[1] < width:
+            r = np.concatenate([r, np.full((r.shape[0], width - r.shape[1], 3), 0.5, dtype=np.float32)], axis=1)
+        padded.append(r)
+    stack = []
+    # Blender stores the bottom row first, so the first view goes LAST in the array to sit on top of the picture
+    for i, r in enumerate(reversed(padded)):
+        if i:
+            stack.append(np.full((gap, width, 3), 0.5, dtype=np.float32))
+        stack.append(r)
+    pic = np.concatenate(stack, axis=0)
+    hh, ww = pic.shape[:2]
+    rgba = np.concatenate([pic, np.ones((hh, ww, 1), dtype=np.float32)], axis=2)
+    # ITS OWN abs_output_path, though compare_to_reference resolves the path before calling: every Image.save() the
+    # add-on makes resolves its path where it saves (test_blender_bake_relative_path BR100), so a second caller
+    # cannot hand it a '//' path that writes nothing.
+    path = abs_output_path(path)
+    img = bpy.data.images.new("MifCompareOverlay", ww, hh, alpha=False)
+    try:
+        img.pixels.foreach_set(rgba.astype(np.float32).ravel())
+        img.filepath_raw = path
+        img.file_format = "PNG"
+        img.save()
+    finally:
+        bpy.data.images.remove(img)
+    return {"path": path, "width": ww, "height": hh, "bytes": os.path.getsize(path) if os.path.isfile(path) else 0,
+            "layout": "one row per view, top to bottom: image | reference | overlay",
+            "legend": {"gray": "in both", "red": "missing - in the reference, not the image",
+                       "cyan": "extra - in the image, not the reference"}}
+
+
+_COMPARE_KEYS = {"image", "reference", "comparePx", "threshold", "referenceMask", "imageMask", "subjectKey", "views",
+                 "overlay", "overwrite"}
+_VIEW_KEYS = {"name", "image", "reference", "referenceMask", "imageMask", "subjectKey", "threshold"}
+
+
+def op_compare_to_reference(params):
+    """How close is an image to a reference? Two numbers, because they fail differently.
+
+    params:
+      image (str)                the render to judge (or views)
+      reference (str)            the picture it is supposed to match
+      comparePx (int)            longest edge both are scaled to, default 128
+      threshold (float)          luminance above which a pixel counts as subject, default 0.1.
+                                 Ignored when the image has real alpha, which is a better mask.
+      referenceMask (str)        (2026-11-15) a mask image for the reference: its alpha, or its luminance over 0.5 when
+                                 it is opaque. A hole painted out of it is a hole in the subject
+      imageMask (str)            the same for the image
+      subjectKey (dict)          {background 'auto' | [r, g, b], tolerance, mode rgb | chroma, close, minSpeck}: build
+                                 the reference's mask by keying its background off by color, closing small gaps and
+                                 dropping specks - for a painted sheet a threshold cannot separate
+      views (list)               [{name, image, reference, referenceMask, imageMask, subjectKey, threshold}, ...]: one
+                                 row per view and a total, in one call; the top-level keys are each view's defaults
+      overlay (str)              a .png path: image | reference | overlay per view (gray both, red missing, cyan extra)
+      overwrite (bool)           default true for the overlay file
+    """
+    reject_unknown(params, _COMPARE_KEYS, "compare_to_reference")
+    tail = "NOTHING was compared."
+    px = finite_int(take_float(params, "comparePx", default=_COMPARE_PX_DEFAULT), "comparePx")
+    if px < _COMPARE_PX_MIN or px > _COMPARE_PX_MAX:
+        raise MifOpError("comparePx must be between %d and %d - below that a silhouette carries no "
+                         "information and above it the comparison is slower for no gain. "
+                         "NOTHING was compared." % (_COMPARE_PX_MIN, _COMPARE_PX_MAX))
+    thresh = finite_float(take_float(params, "threshold", default=0.1), "threshold")
+    key = _parse_key(params.get("subjectKey"), tail)
+    views = params.get("views")
+    if views is not None:
+        if params.get("image") is not None or params.get("reference") is not None:
+            raise MifOpError("views lists every image and reference; image and reference go inside it. %s" % tail)
+        if not isinstance(views, list) or not views or len(views) > 24:
+            raise MifOpError("views is a list of 1-24 {image, reference, ...}, got %r. %s"
+                             % (type(views).__name__ if not isinstance(views, list) else len(views), tail))
+        specs = []
+        for i, v in enumerate(views):
+            if not isinstance(v, dict):
+                raise MifOpError("views[%d] is {image, reference, ...}, got %r. %s" % (i, v, tail))
+            bad = sorted(k for k in v if k not in _VIEW_KEYS)
+            if bad:
+                raise MifOpError("views[%d] takes %s; %s is not one. %s" % (i, ", ".join(sorted(_VIEW_KEYS)),
+                                                                           ", ".join(bad), tail))
+            specs.append({"name": str(v.get("name") or "view%d" % i), "image": v.get("image"),
+                          "reference": v.get("reference"),
+                          "referenceMask": v.get("referenceMask", params.get("referenceMask")),
+                          "imageMask": v.get("imageMask", params.get("imageMask")),
+                          "subjectKey": _parse_key(v["subjectKey"], tail) if v.get("subjectKey") is not None else key,
+                          "threshold": finite_float(v["threshold"], "views[%d].threshold" % i)
+                          if v.get("threshold") is not None else thresh})
+    else:
+        specs = [{"name": None, "image": take(params, "image", required=True, kind=str),
+                  "reference": take(params, "reference", required=True, kind=str),
+                  "referenceMask": params.get("referenceMask"), "imageMask": params.get("imageMask"),
+                  "subjectKey": key, "threshold": thresh}]
+    for s in specs:
+        for label in ("image", "reference", "referenceMask", "imageMask"):
+            raw = s[label]
+            if raw is None:
+                if label in ("image", "reference"):
+                    raise MifOpError("%s'%s' is required. %s" % ("%s: " % s["name"] if s["name"] else "", label, tail))
+                continue
+            if not isinstance(raw, str):
+                raise MifOpError("'%s' must be a file path, got %r. %s" % (label, raw, tail))
+            p = bpy.path.abspath(raw)
+            if not os.path.isfile(p):
+                raise MifOpError("%s '%s' does not exist. NOTHING was compared." % (label, p))
+            s[label] = p
+    overlay = take(params, "overlay", kind=str)
+    # READ BEFORE the exists test, so a malformed overwrite is refused whether or not the file is there yet
+    overwrite = take_bool(params, "overwrite", default=True)
+    out_path = None
+    if overlay is not None:
+        if not overlay.lower().endswith(".png"):
+            raise MifOpError("overlay is a .png path, got %r. %s" % (overlay, tail))
+        out_path = abs_output_path(overlay)
+        check_output_path(overlay, out_path, "compared")
+        if os.path.exists(out_path) and not overwrite:
+            raise MifOpError("%s already exists and overwrite is false. %s" % (out_path, tail))
+        parent = os.path.dirname(out_path)
+        if parent and not os.path.isdir(parent):
+            os.makedirs(parent, exist_ok=True)
+
+    rows, tiles = [], []
+    for s in specs:
+        row, tile = _compare_one(s["image"], s["reference"], px, s["threshold"], s["referenceMask"], s["imageMask"],
+                                 s["subjectKey"])
+        if s["name"] is not None:
+            row = dict({"name": s["name"]}, **row)
+        rows.append(row)
+        tiles.append(tile)
+    notes = {
         "iouNote": ("silhouetteIoU ignores colour and lighting and asks only whether the subject "
                     "occupies the same space in frame - it is the number for matching a blockout. "
                     "1.0 is identical, and there is no threshold here that means 'good enough': "
@@ -491,13 +803,460 @@ def op_compare_to_reference(params):
         "limitNote": ("this is PIXEL similarity, not semantic similarity. A render matching a "
                       "blockout's silhouette exactly with entirely wrong materials scores well on "
                       "IoU and should. A high score is not 'this looks right'."),
-        "maskCoverage": {"image": round(a_cover, 4), "reference": round(b_cover, 4)},
-        "degenerateMask": degenerate,
-        "emptyMaskNote": (None if union else
-                          "NEITHER image has any subject pixels at this threshold, so IoU is "
-                          "undefined rather than 0 - raise threshold, or check the render is not "
-                          "blank."),
     }
+    overlay_out = None
+    if out_path is not None:
+        before = file_before(out_path)
+        overlay_out = _write_overlay(out_path, tiles)
+        overlay_out.update(replaced_fields(before))
+    if views is None:
+        out = dict(rows[0], **notes)
+        if overlay_out is not None:
+            out["overlay"] = overlay_out
+        return out
+    scored = [r for r in rows if r["silhouetteIoU"] is not None]
+    worst = min(scored, key=lambda r: r["silhouetteIoU"]) if scored else None
+    out = {"views": rows, "viewCount": len(rows),
+           "total": {"meanIoU": round(sum(r["silhouetteIoU"] for r in scored) / len(scored), 4) if scored else None,
+                     "minIoU": worst["silhouetteIoU"] if worst else None,
+                     "worstView": worst["name"] if worst else None,
+                     "scored": len(scored), "unscored": [r["name"] for r in rows if r["silhouetteIoU"] is None],
+                     "meanAbsDiff": round(sum(r["meanAbsDiff"] for r in rows) / len(rows), 4)},
+           "comparedAt": rows[0]["comparedAt"]}
+    out.update(notes)
+    if overlay_out is not None:
+        out["overlay"] = overlay_out
+    return out
+
+
+# ---------------------------------------------------------------------------
+# solve_camera_from_reference
+# ---------------------------------------------------------------------------
+# THE GAP (filed 2026-11-09, built 2026-11-15). No tool solved a camera from a picture: agents fitted cameras with their
+# own grid and pattern search, and a local search alone stayed at .49 on a three-quarter view until a coarse grid ran.
+# This does both, on silhouettes it draws itself in numpy (the mesh projected and rasterized - no render, so a candidate
+# costs milliseconds and it runs in a background Blender): a coarse grid over the direction and lens near the one asked
+# for, a pattern search from the best, the frame matched by scale and offset, then the camera's own distance and shift
+# solved from that and the result measured again through the real projection. Several views of one model share the
+# model's orientation, so the yaw each view needs off its nominal direction is compared: on a painted sheet a
+# three-quarter view reached .853 only by dropping front, side and back to about .75, and viewsDisagree says so.
+
+_SC_KEYS = {"object", "objects", "reference", "referenceMask", "subjectKey", "threshold", "direction", "views", "lens",
+            "camera", "apply", "comparePx", "searchDegrees", "setResolution"}
+_SC_VIEW_KEYS = {"name", "reference", "referenceMask", "subjectKey", "threshold", "direction"}
+_SC_NAMED = {"front": (0.0, 0.0), "right": (90.0, 0.0), "back": (180.0, 0.0), "left": (-90.0, 0.0),
+             "top": (0.0, 85.0), "bottom": (0.0, -85.0), "three_quarter": (45.0, 15.0),
+             "three_quarter_left": (-45.0, 15.0), "side": (90.0, 0.0)}
+_SC_LENSES = (18.0, 24.0, 35.0, 50.0, 85.0, 135.0, 200.0)
+_SC_SENSOR = 36.0
+
+
+def _sc_direction(raw, tail):
+    if raw is None:
+        return 0.0, 0.0, "front (default)"
+    if isinstance(raw, str):
+        key = raw.strip().lower().replace(" ", "_").replace("-", "_")
+        if key not in _SC_NAMED:
+            raise MifOpError("direction is one of %s or {azimuth, elevation} in degrees, got %r. %s"
+                             % (", ".join(sorted(_SC_NAMED)), raw, tail))
+        return _SC_NAMED[key][0], _SC_NAMED[key][1], key
+    if isinstance(raw, dict) and set(raw) <= {"azimuth", "elevation"} and raw:
+        az = finite_float(raw.get("azimuth", 0.0), "direction.azimuth")
+        el = finite_float(raw.get("elevation", 0.0), "direction.elevation")
+        if not -89.0 <= el <= 89.0:
+            raise MifOpError("direction.elevation runs -89 to 89 degrees, got %g. %s" % (el, tail))
+        return az, el, "azimuth %g, elevation %g" % (az, el)
+    raise MifOpError("direction is a name (front, right, back, left, top, three_quarter ...) or {azimuth, elevation} "
+                     "in degrees, got %r. %s" % (raw, tail))
+
+
+def _sc_geometry(objs):
+    """World vertices (N, 3) and triangles (T, 3) of the evaluated meshes, joined."""
+    import numpy as np                                   # noqa: PLC0415
+    dg = bpy.context.evaluated_depsgraph_get()
+    verts, tris, base = [], [], 0
+    for o in objs:
+        ev = o.evaluated_get(dg)
+        me = ev.to_mesh()
+        try:
+            n = len(me.vertices)
+            co = np.empty(n * 3, dtype=np.float64)
+            me.vertices.foreach_get("co", co)
+            co = co.reshape(n, 3)
+            m = np.array(o.matrix_world, dtype=np.float64)
+            co = co @ m[:3, :3].T + m[:3, 3]
+            me.calc_loop_triangles()
+            t = np.empty(len(me.loop_triangles) * 3, dtype=np.int64)
+            me.loop_triangles.foreach_get("vertices", t)
+            verts.append(co)
+            tris.append(t.reshape(-1, 3) + base)
+            base += n
+        finally:
+            ev.to_mesh_clear()
+    return np.concatenate(verts), np.concatenate(tris)
+
+
+def _sc_camera(center, radius, az, el, lens):
+    """(position, rotation matrix 3x3 world-from-camera, distance, ortho scale or None) for a camera looking at center
+    from the azimuth / elevation given, far enough back that the whole radius fits."""
+    import numpy as np                                   # noqa: PLC0415
+    a, e = math.radians(az), math.radians(el)
+    off = np.array([math.sin(a) * math.cos(e), -math.cos(a) * math.cos(e), math.sin(e)])
+    if lens is None:
+        dist = radius * 3.0
+        ortho = radius * 2.4
+    else:
+        half = math.atan(_SC_SENSOR / 2.0 / lens)
+        dist = radius / math.sin(half) * 1.15
+        ortho = None
+    pos = center + off * dist
+    fwd = -off
+    right = np.cross(fwd, np.array([0.0, 0.0, 1.0]))
+    if np.linalg.norm(right) < 1e-6:
+        right = np.array([1.0, 0.0, 0.0])
+    right /= np.linalg.norm(right)
+    up = np.cross(right, fwd)
+    rot = np.stack([right, up, -fwd], axis=1)           # columns: camera X, Y, Z in world
+    return pos, rot, dist, ortho
+
+
+def _sc_project(verts, pos, rot, lens, ortho, shift, w, h):
+    """Pixel coordinates (N, 2) as Blender's camera frames them (sensor fit AUTO, 36 mm sensor), bottom row first."""
+    import numpy as np                                   # noqa: PLC0415
+    cam = (verts - pos) @ rot                            # into camera space: x right, y up, z back
+    big = float(max(w, h))
+    if ortho is None:
+        z = -cam[:, 2]
+        z = np.where(z > 1e-6, z, 1e-6)
+        n = cam[:, :2] / z[:, None] * (lens / _SC_SENSOR)
+    else:
+        n = cam[:, :2] / ortho
+    n = n + np.array(shift)
+    return np.stack([w / 2.0 + n[:, 0] * big, h / 2.0 + n[:, 1] * big], axis=1)
+
+
+def _sc_raster(px, tris, w, h):
+    import numpy as np                                   # noqa: PLC0415
+    from .ops_uv import _raster_triangles
+    cov = np.zeros((h, w), dtype=bool)
+    _raster_triangles(cov, px[tris])
+    return cov
+
+
+def _sc_iou(a, b):
+    u = int((a | b).sum())
+    return (float((a & b).sum()) / u) if u else 0.0
+
+
+def _sc_fit(px, tris, ref, w, h):
+    """Score of the projection after matching its scale and centroid to the reference's, and that (s, offset)."""
+    import numpy as np                                   # noqa: PLC0415
+    sil = _sc_raster(px, tris, w, h)
+    area = int(sil.sum())
+    if area == 0:
+        return 0.0, 1.0, np.zeros(2), sil
+    ys, xs = np.nonzero(sil)
+    c_sil = np.array([xs.mean() + 0.5, ys.mean() + 0.5])
+    s = math.sqrt(ref["area"] / float(area))
+    moved = ref["centroid"] + s * (px - c_sil)
+    fitted = _sc_raster(moved, tris, w, h)
+    return _sc_iou(fitted, ref["mask"]), s, ref["centroid"] - s * c_sil, fitted
+
+
+def _sc_solve_view(verts, tris, center, radius, ref, az0, el0, lenses, window, w, h, fixed_az=None):
+    """Grid then pattern search over azimuth, elevation and lens; returns the best candidate's numbers."""
+    best = None
+    tried = 0
+    aw, ew = window
+    az_steps = [az0] if fixed_az is not None else [az0 + d for d in range(-int(aw), int(aw) + 1, 15)]
+    el_steps = [max(-85.0, min(85.0, el0 + d)) for d in range(-int(ew), int(ew) + 1, 10)]
+    for lens in lenses:
+        for az in az_steps:
+            for el in sorted(set(el_steps)):
+                pos, rot, dist, ortho = _sc_camera(center, radius, az, el, lens)
+                px = _sc_project(verts, pos, rot, lens, ortho, (0.0, 0.0), w, h)
+                score = _sc_fit(px, tris, ref, w, h)[0]
+                tried += 1
+                if best is None or score > best[0]:
+                    best = (score, az, el, lens)
+    coarse = best
+    step = 7.5
+    while step >= 0.9:
+        improved = False
+        for daz, del_ in ((step, 0), (-step, 0), (0, step), (0, -step)):
+            if fixed_az is not None and daz:
+                continue
+            az, el = best[1] + daz, max(-85.0, min(85.0, best[2] + del_))
+            pos, rot, dist, ortho = _sc_camera(center, radius, az, el, best[3])
+            px = _sc_project(verts, pos, rot, best[3], ortho, (0.0, 0.0), w, h)
+            score = _sc_fit(px, tris, ref, w, h)[0]
+            tried += 1
+            if score > best[0] + 1e-6:
+                best = (score, az, el, best[3])
+                improved = True
+        if not improved:
+            step /= 2.0
+    return best, coarse, tried
+
+
+def _sc_place(verts, tris, center, radius, ref, az, el, lens, w, h):
+    """Turn the matched scale and offset into the camera's own distance (or ortho scale) and shift, measured again
+    through the plain projection, refined three times."""
+    import numpy as np                                   # noqa: PLC0415
+    pos, rot, dist, ortho = _sc_camera(center, radius, az, el, lens)
+    shift = np.zeros(2)
+    big = float(max(w, h))
+    a, e = math.radians(az), math.radians(el)
+    off = np.array([math.sin(a) * math.cos(e), -math.cos(a) * math.cos(e), math.sin(e)])
+    for _ in range(4):
+        px = _sc_project(verts, pos, rot, lens, ortho, shift, w, h)
+        sil = _sc_raster(px, tris, w, h)
+        area = int(sil.sum())
+        if not area:
+            break
+        ys, xs = np.nonzero(sil)
+        c_sil = np.array([xs.mean() + 0.5, ys.mean() + 0.5])
+        s = math.sqrt(ref["area"] / float(area))
+        if ortho is not None:
+            ortho = ortho / s
+        else:
+            dist = dist / s
+            pos = center + off * dist
+        mid = np.array([w / 2.0, h / 2.0])
+        shift = shift * s + (ref["centroid"] - mid - s * (c_sil - mid)) / big
+        if abs(s - 1.0) < 0.002:
+            break
+    px = _sc_project(verts, pos, rot, lens, ortho, shift, w, h)
+    sil = _sc_raster(px, tris, w, h)
+    return {"score": _sc_iou(sil, ref["mask"]), "position": pos, "rotation": rot, "distance": dist, "ortho": ortho,
+            "shift": shift, "silhouette": sil}
+
+
+def op_solve_camera_from_reference(params):
+    """Find the camera that makes a mesh's silhouette match a reference picture.
+
+    params:
+      object (str) | objects (list)   the mesh(es) the reference shows
+      reference (str)                 the picture (or views)
+      referenceMask / subjectKey / threshold   how the reference's subject is found - compare_to_reference's rules
+      direction                       a name (front, right, back, left, top, three_quarter ...) or {azimuth,
+                                      elevation} degrees: the rough view, searched +-searchDegrees around
+      views (list)                    [{name, reference, referenceMask, subjectKey, threshold, direction}]: views of the
+                                      same model; the yaw each needs off its nominal direction is compared
+      lens                            mm (a fixed perspective), "ortho", or "search" (default: 18-200 mm and ortho)
+      searchDegrees                   [azimuth, elevation] half-windows, default [45, 30]
+      comparePx (int)                 the silhouette size the search works at, default 96 (32-256)
+      apply (bool)                    set a camera to the solution (the first view's), default false: report only
+      camera (str)                    the camera to set or create, default "SolvedCamera"
+      setResolution (bool)            with apply: set the scene's resolution to the reference's aspect (width kept)
+    """
+    import numpy as np                                   # noqa: PLC0415
+    reject_unknown(params, _SC_KEYS, "solve_camera_from_reference")
+    tail = "NOTHING was changed."
+    names = params.get("objects") or ([params["object"]] if params.get("object") else None)
+    if not names or not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+        raise MifOpError("pass object (a mesh) or objects (a list of meshes). %s" % tail)
+    objs = [get_object(n) for n in names]
+    bad = [o.name for o in objs if o.type not in ("MESH", "CURVE", "FONT", "SURFACE")]
+    if bad:
+        raise MifOpError("%s %s no surface to draw a silhouette from. %s" % (", ".join(bad),
+                                                                            "has" if len(bad) == 1 else "have", tail))
+    px_size = finite_int(take_float(params, "comparePx", default=96), "comparePx")
+    if not 32 <= px_size <= 256:
+        raise MifOpError("comparePx runs 32-256, got %d. %s" % (px_size, tail))
+    win = params.get("searchDegrees", [45, 30])
+    if not isinstance(win, (list, tuple)) or len(win) != 2:
+        raise MifOpError("searchDegrees is [azimuth, elevation] half-windows in degrees. %s" % tail)
+    window = tuple(finite_floats(list(win), "searchDegrees"))
+    if not (0 <= window[0] <= 180 and 0 <= window[1] <= 85):
+        raise MifOpError("searchDegrees runs 0-180 for azimuth and 0-85 for elevation, got %s. %s" % (list(win), tail))
+    lens_raw = params.get("lens", "search")
+    if lens_raw == "search":
+        lenses = list(_SC_LENSES) + [None]
+    elif lens_raw == "ortho":
+        lenses = [None]
+    else:
+        lv = finite_float(lens_raw, "lens")
+        if not 1.0 <= lv <= 5000.0:
+            raise MifOpError("lens is mm (1-5000), 'ortho' or 'search', got %r. %s" % (lens_raw, tail))
+        lenses = [lv]
+    thresh = finite_float(take_float(params, "threshold", default=0.1), "threshold")
+    key = _parse_key(params.get("subjectKey"), tail)
+    if params.get("views") is not None:
+        if params.get("reference") is not None:
+            raise MifOpError("views lists every reference; reference goes inside it. %s" % tail)
+        views = params["views"]
+        if not isinstance(views, list) or not 1 <= len(views) <= 12:
+            raise MifOpError("views is a list of 1-12 {name, reference, direction, ...}. %s" % tail)
+        specs = []
+        for i, v in enumerate(views):
+            if not isinstance(v, dict) or v.get("reference") is None:
+                raise MifOpError("views[%d] is {name, reference, direction, ...} with a reference. %s" % (i, tail))
+            extra = sorted(k for k in v if k not in _SC_VIEW_KEYS)
+            if extra:
+                raise MifOpError("views[%d] takes %s; %s is not one. %s" % (i, ", ".join(sorted(_SC_VIEW_KEYS)),
+                                                                           ", ".join(extra), tail))
+            specs.append({"name": str(v.get("name") or "view%d" % i), "reference": v["reference"],
+                          "referenceMask": v.get("referenceMask", params.get("referenceMask")),
+                          "subjectKey": _parse_key(v["subjectKey"], tail) if v.get("subjectKey") is not None else key,
+                          "threshold": finite_float(v["threshold"], "threshold") if v.get("threshold") is not None
+                          else thresh, "direction": _sc_direction(v.get("direction"), tail)})
+    else:
+        if params.get("reference") is None:
+            raise MifOpError("reference (a picture) or views is required. %s" % tail)
+        specs = [{"name": "view", "reference": params["reference"], "referenceMask": params.get("referenceMask"),
+                  "subjectKey": key, "threshold": thresh, "direction": _sc_direction(params.get("direction"), tail)}]
+    for s in specs:
+        for label in ("reference", "referenceMask"):
+            if s[label] is None:
+                continue
+            if not isinstance(s[label], str):
+                raise MifOpError("%s is a file path, got %r. %s" % (label, s[label], tail))
+            p = bpy.path.abspath(s[label])
+            if not os.path.isfile(p):
+                raise MifOpError("%s '%s' does not exist. %s" % (label, p, tail))
+            s[label] = p
+    apply = take_bool(params, "apply", default=False)
+    cam_name = take(params, "camera", default="SolvedCamera", kind=str)
+    set_res = take_bool(params, "setResolution", default=False)
+    if set_res and not apply:
+        raise MifOpError("setResolution goes with apply - it is the scene half of setting the camera. %s" % tail)
+    if apply:
+        existing = bpy.data.objects.get(cam_name)
+        if existing is not None and existing.type != "CAMERA":
+            raise MifOpError("'%s' is a %s, not a camera - pass another camera name. %s"
+                             % (cam_name, existing.type, tail))
+
+    verts, tris = _sc_geometry(objs)
+    if not len(tris):
+        raise MifOpError("%s evaluate to no faces, so there is no silhouette. %s" % (", ".join(names), tail))
+    lo, hi = verts.min(axis=0), verts.max(axis=0)
+    center = (lo + hi) / 2.0
+    radius = max(float(np.linalg.norm(hi - lo)) / 2.0, 1e-6)
+
+    rows = []
+    for s in specs:
+        rgba, w, h = _load_scaled(s["reference"], px_size)
+        if s["referenceMask"]:
+            mask, src = _mask_from_file(s["referenceMask"], w, h, tail)
+        elif s["subjectKey"] is not None:
+            mask, _rep = _key_mask(rgba, s["subjectKey"])
+            src = "subjectKey (%s)" % s["subjectKey"]["mode"]
+        elif (rgba[..., 3] < 0.999).any():
+            mask, src = rgba[..., 3] > 0.5, "alpha"
+        else:
+            mask, src = _luma(rgba) > s["threshold"], "luminance > %.3f" % s["threshold"]
+        cover = float(mask.mean())
+        if not 0.01 <= cover <= 0.95:
+            raise MifOpError("the reference mask of %s covers %.0f%% of the frame, so it does not separate a subject - "
+                             "pass referenceMask or subjectKey. %s" % (s["name"], cover * 100, tail))
+        ys, xs = np.nonzero(mask)
+        ref = {"mask": mask, "area": float(mask.sum()), "centroid": np.array([xs.mean() + 0.5, ys.mean() + 0.5])}
+        az0, el0, asked = s["direction"]
+        best, coarse, tried = _sc_solve_view(verts, tris, center, radius, ref, az0, el0, lenses, window, w, h)
+        placed = _sc_place(verts, tris, center, radius, ref, best[1], best[2], best[3], w, h)
+        rows.append({"name": s["name"], "reference": s["reference"], "maskSource": src, "comparedAt": [w, h],
+                     "asked": asked, "nominalAzimuth": az0, "score": round(placed["score"], 4),
+                     "searchScore": round(best[0], 4), "coarseBest": {"score": round(coarse[0], 4),
+                                                                      "azimuth": coarse[1], "elevation": coarse[2]},
+                     "candidatesTried": tried, "azimuth": round(best[1], 2), "elevation": round(best[2], 2),
+                     "lens": round(best[3], 2) if best[3] is not None else None,
+                     "type": "PERSP" if best[3] is not None else "ORTHO",
+                     "orthoScale": round(placed["ortho"], 5) if placed["ortho"] is not None else None,
+                     "distance": round(placed["distance"], 5),
+                     "shiftX": round(-float(placed["shift"][0]), 5), "shiftY": round(-float(placed["shift"][1]), 5),
+                     "yawOffset": round(((best[1] - az0 + 180.0) % 360.0) - 180.0, 2),
+                     "_placed": placed, "_ref": ref, "_wh": (w, h)})
+
+    out = {"objects": names, "views": None, "frameAspect": None}
+    if len(rows) > 1:
+        offs = [r["yawOffset"] for r in rows]
+        mean = math.degrees(math.atan2(sum(math.sin(math.radians(o)) for o in offs),
+                                       sum(math.cos(math.radians(o)) for o in offs)))
+        spread = max(abs(((o - mean + 180.0) % 360.0) - 180.0) for o in offs)
+        joint = []
+        for r in rows:
+            w, h = r["_wh"]
+            jb, _c, _t = _sc_solve_view(verts, tris, center, radius, r["_ref"], r["nominalAzimuth"] + mean,
+                                        r["elevation"], [r["lens"]] if r["type"] == "PERSP" else [None], (0, 20), w, h,
+                                        fixed_az=True)
+            jp = _sc_place(verts, tris, center, radius, r["_ref"], jb[1], jb[2], jb[3], w, h)
+            joint.append({"name": r["name"], "score": round(jp["score"], 4), "alone": r["score"]})
+        out["consistency"] = {
+            "yawOffsets": {r["name"]: r["yawOffset"] for r in rows}, "commonYaw": round(mean, 2),
+            "spread": round(spread, 2), "viewsDisagree": spread > 10.0,
+            "jointScores": joint,
+            "note": ("each view's yawOffset is how far off its nominal direction its best camera sits; views of one "
+                     "model should share one. jointScores holds every view at the common yaw: a view that scores well "
+                     "alone and badly there is bought at the others' expense, or its nominal direction is wrong.")}
+        if spread > 10.0:
+            out["consistency"]["disagreement"] = (
+                "the views need yaws %.1f degrees apart (%s) - they do not agree on how the model is turned. Check "
+                "each view's nominal direction, or the reference sheet's own consistency, before trusting the "
+                "best single score." % (spread * 2.0 if len(rows) == 2 else spread,
+                                        ", ".join("%s %+.1f" % (r["name"], r["yawOffset"]) for r in rows)))
+    first = rows[0]
+    w, h = first["_wh"]
+    out["frameAspect"] = round(w / float(h), 5)
+    sc = bpy.context.scene
+    scene_aspect = (sc.render.resolution_x * sc.render.pixel_aspect_x) / float(
+        sc.render.resolution_y * sc.render.pixel_aspect_y)
+    if apply:
+        placed = first["_placed"]
+        cam = bpy.data.objects.get(cam_name)
+        created = cam is None
+        if created:
+            data = bpy.data.cameras.new(cam_name)
+            cam = bpy.data.objects.new(cam_name, data)
+            sc.collection.objects.link(cam)
+        from mathutils import Matrix as _M
+        m = _M.Identity(4)
+        for i in range(3):
+            for j in range(3):
+                m[i][j] = float(placed["rotation"][i][j])
+            m[i][3] = float(placed["position"][i])
+        cam.matrix_world = m
+        cd = cam.data
+        cd.sensor_fit = "AUTO"
+        cd.sensor_width = _SC_SENSOR
+        if first["type"] == "PERSP":
+            cd.type = "PERSP"
+            cd.lens = first["lens"]
+        else:
+            cd.type = "ORTHO"
+            cd.ortho_scale = float(placed["ortho"])
+        # BLENDER'S SHIFT MOVES THE FRAME, so the subject moves the other way: the projection here adds the offset to the
+        # subject, and the camera takes it negated
+        cd.shift_x, cd.shift_y = -float(placed["shift"][0]), -float(placed["shift"][1])
+        cd.clip_end = max(cd.clip_end, float(placed["distance"]) + radius * 4.0)
+        if set_res:
+            sc.render.resolution_y = max(4, int(round(sc.render.resolution_x * h / float(w))))
+            sc.render.pixel_aspect_x = sc.render.pixel_aspect_y = 1.0
+            scene_aspect = sc.render.resolution_x / float(sc.render.resolution_y)
+        bpy.context.view_layer.update()
+        out["camera"] = {"name": cam.name, "created": created, "type": cd.type,
+                         "lens": round(cd.lens, 3) if cd.type == "PERSP" else None,
+                         "orthoScale": round(cd.ortho_scale, 5) if cd.type == "ORTHO" else None,
+                         "shift": [round(cd.shift_x, 5), round(cd.shift_y, 5)],
+                         "location": [round(v, 5) for v in cam.matrix_world.translation],
+                         "rotationEuler": [round(v, 5) for v in cam.matrix_world.to_euler()],
+                         "resolution": [sc.render.resolution_x, sc.render.resolution_y],
+                         "activeCamera": sc.camera.name if sc.camera else None}
+    if abs(scene_aspect - out["frameAspect"]) > 0.01:
+        out["aspectWarning"] = ("the scene renders at aspect %.4f and the reference is %.4f, so a render through this "
+                                "camera frames differently from the solve. Pass setResolution with apply, or set "
+                                "the resolution to the reference's aspect." % (scene_aspect, out["frameAspect"]))
+    for r in rows:
+        for k in ("_placed", "_ref", "_wh"):
+            r.pop(k, None)
+    out["views"] = rows
+    out["best"] = max(rows, key=lambda r: r["score"])["name"]
+    out["note"] = ("score is silhouetteIoU at the solved camera, drawn from the mesh (not rendered): what "
+                   "compare_to_reference reports for a transparent-film render of it, within a pixel's edge. Lens is "
+                   "searched over 18-200 mm and orthographic unless given; an unknown perspective is a real "
+                   "ambiguity, and two lenses scoring alike are reported by the best only.")
+    return out
+
 
 def _engine_ids():
     """The render engines THIS build offers - asked of Blender, never read off the RNA.
@@ -937,7 +1696,10 @@ def op_set_render_settings(params):
         # Validated at the top. This op is where a bad path gets REMEMBERED and render_still is
         # where it fails, so checking only there meant this one answered ok and left the failure to
         # surface later, in a different endpoint, against a caller already told it worked.
-        sc.render.filepath = resolved_path
+        # STORED AS GIVEN (FOUND 2026-11-09): a //-relative path was written expanded, so a saved .blend carried one
+        # machine's folder (or, unsaved, lost its //). Blender resolves // itself at render time; the check above ran on
+        # the resolved form, and the reply reports both.
+        sc.render.filepath = str(out_path)
     fmt = take(params, "fileFormat", default=None, kind=str)
     # THE "BEFORE" IS THE SNAPSHOT, taken above every write. The first version of the colorDepth
     # rollback below read the "before" value AFTER this block had already changed it, so it
@@ -1073,6 +1835,7 @@ def op_set_render_settings(params):
                   "resolution": [sc.render.resolution_x, sc.render.resolution_y],
                   "percentage": sc.render.resolution_percentage,
                   "filePath": sc.render.filepath,
+                  "filePathResolved": bpy.path.abspath(sc.render.filepath),
                   "fileFormat": sc.render.image_settings.file_format,
                   "mediaType": getattr(sc.render.image_settings, "media_type", None),
                   "video": _video_settings(sc),
@@ -1215,8 +1978,13 @@ def op_render_still(params):
     backend_plan = _still_backend(sc, params)
     region = _parse_region(params, sc, "NOTHING was rendered.")
 
-    applied = _apply_common(sc, params)
-    backend_reply = _still_backend_apply(sc, backend_plan) if backend_plan is not None else None
+    still_before = _still_settings(sc)
+    try:
+        applied = _apply_common(sc, params)
+        backend_reply = _still_backend_apply(sc, backend_plan) if backend_plan is not None else None
+    except Exception:
+        _restore_still_settings(sc, still_before)
+        raise
     if frame_i is not None:
         sc.frame_set(frame_i)
     if out_path:
@@ -1258,6 +2026,9 @@ def op_render_still(params):
     t0 = time.time()
     try:
         bpy.ops.render.render(write_still=write_still)
+    except Exception:
+        _restore_still_settings(sc, still_before)
+        raise
     finally:
         if region_saved is not None:
             _restore_region(sc, region_saved)
@@ -1345,6 +2116,41 @@ def op_render_still(params):
             "previewMaxPx and omitted before base64 encoding when its PNG exceeds previewMaxBytes. "
             "The full-size file remains at filePath; renderedWidth/renderedHeight describe it and "
             "imageWidth/imageHeight describe the preview attempt.")
+    # ONE RENDER'S VALUES ARE PUT BACK (FOUND 2026-11-09): resolution, percentage, samples and the output path passed
+    # here stayed on the scene for every later render and the saved file. The reply's resolution and samples above are
+    # this render's; settingsRestored names each with the value it was put back to.
+    out["settingsRestored"] = _restore_still_settings(sc, still_before) or None
+    return out
+
+
+def _still_settings(sc):
+    """The scene settings render_still may override for one render: resolution, percentage, the sample counts of every
+    engine, the output path."""
+    r = sc.render
+    snap = {"resolutionX": ("render", "resolution_x", r.resolution_x),
+            "resolutionY": ("render", "resolution_y", r.resolution_y),
+            "percentage": ("render", "resolution_percentage", r.resolution_percentage),
+            "filePath": ("render", "filepath", r.filepath)}
+    if hasattr(sc, "cycles"):
+        snap["cycles.samples"] = ("cycles", "samples", sc.cycles.samples)
+    for attr in ("taa_render_samples", "taa_samples"):
+        if hasattr(getattr(sc, "eevee", None), attr):
+            snap["eevee." + attr] = ("eevee", attr, getattr(sc.eevee, attr))
+    return snap
+
+
+def _restore_still_settings(sc, snap):
+    """Put back what _still_settings read; returns {name: {"used": this render's value, "restored": the value}} for each
+    that had changed."""
+    out = {}
+    for name, (holder, attr, value) in snap.items():
+        obj = sc.render if holder == "render" else getattr(sc, holder, None)
+        if obj is None:
+            continue
+        now = getattr(obj, attr)
+        if now != value:
+            setattr(obj, attr, value)
+            out[name] = {"used": now, "restored": getattr(obj, attr)}
     return out
 
 
@@ -1719,11 +2525,24 @@ def op_render_animation(params):
     # silently produces the wrong frames. So it is enforced there and DOWNGRADED TO A WARNING here,
     # with the risk stated rather than an unverifiable claim of safety. Suppressing the refusal
     # while saying nothing would be the worse of the three options.
-    dirty_checkable = not bpy.app.background
-    if dirty_checkable and bpy.data.is_dirty:
-        raise MifOpError("the session has unsaved changes, so the file on disk is NOT the scene you "
+    # NOW CHECKED IN BOTH (FOUND 2026-11-09): the bridge counts every call that can change the scene since the file
+    # was loaded or saved to itself (ops_undo.bridge_writes), and in a background session every change comes through
+    # it. So the guard is real there too, from that count; a GUI session also reads Blender's flag, since a person can
+    # edit by hand - and on 5.2 the flag misses the bridge's own writes, which the count catches.
+    try:
+        from . import ops_undo                                  # noqa: PLC0415
+        writes = ops_undo.bridge_writes()
+    except Exception:                                           # noqa: BLE001 - an offline stand-in has no undo module
+        writes = 0
+    dirty_checkable = True
+    native = bool(bpy.data.is_dirty) and not bpy.app.background
+    if native or writes > 0:
+        raise MifOpError("the session has unsaved changes (%s), so the file on disk is NOT the scene you "
                          "are looking at - rendering it would silently produce the wrong frames. "
-                         "Save first with save_file (repointSession:true). NOTHING was started.")
+                         "Save first with save_file (repointSession:true). NOTHING was started."
+                         % "; ".join(x for x in ("Blender marks the file modified" if native else "",
+                                                 "%d bridge call(s) that can change the scene since it was saved"
+                                                 % writes if writes else "") if x))
     if not os.path.isfile(blend):
         raise MifOpError("bpy.data.filepath is '%s' but no file is there - it was moved or deleted "
                          "since the last save. NOTHING was started." % blend)
@@ -1839,11 +2658,7 @@ def op_render_animation(params):
         # SAID, NOT ASSUMED. In background mode the staleness of the file on disk is UNKNOWN to
         # this op, and a caller relying on it deserves to be told rather than reassured.
         "unsavedChangesChecked": dirty_checkable,
-        "unsavedChangesWarning": (None if dirty_checkable else
-                                  "bpy.data.is_dirty is always True under blender -b and never "
-                                  "clears, so this op CANNOT tell whether the file on disk matches "
-                                  "this session. If anything changed since the last save, the child "
-                                  "is rendering the older scene."),
+        "unsavedChangesWarning": None,
         "frameStart": start, "frameEnd": end, "frameStep": step,
         "framesExpected": len(frames),
         "outputDir": outdir,
@@ -2078,7 +2893,8 @@ def _pick_enum(holder, prop, value, label, verb):
 
 
 def op_set_color_management(params):
-    """View transform, look, exposure and gamma - the settings that change every pixel silently.
+    """View transform, look, exposure and gamma - the settings that change every pixel silently. Called with no
+    arguments it changes nothing and reads them back (readOnly true), with the lists this config offers.
 
     THE LAST OF THE FIVE Tier 1 gaps, and the one behind "why does this look washed out". Colour
     management is applied to every render and every saved image, it is invisible in the scene data,
@@ -2161,10 +2977,10 @@ def op_set_color_management(params):
         raise MifOpError("workingSpace needs Blender 5.0 or later (bpy.data.colorspace.working_space); this is %s. "
                          "NOTHING was changed." % bpy.app.version_string)
     working_before = getattr(getattr(bpy.data, "colorspace", None), "working_space", None)
-    if not any(v is not None for v in (vt, look, dev, seq, exposure, gamma, curve, working)):
-        raise MifOpError("nothing to do - pass at least one of viewTransform, look, exposure, "
-                         "gamma, displayDevice, sequencerColorspace, useCurveMapping or workingSpace. NOTHING "
-                         "was changed.")
+    # NO ARGUMENTS IS A READ (FOUND 2026-11-10): it used to refuse "nothing to do", so a caller needed render_info for
+    # the values this op sets. Nothing below writes when every key is None, and the reply is the same read-back,
+    # marked readOnly.
+    read_only = not any(v is not None for v in (vt, look, dev, seq, exposure, gamma, curve, working))
 
     # READ AND CHECKED BEFORE THE FIRST WRITE (2026-09-21): useCurveMapping and the sequencer colour space were
     # checked after exposure and gamma had been written - "Everything else requested was applied".
@@ -2306,6 +3122,7 @@ def op_set_color_management(params):
     return {
         "ok": True,
         "scene": sc.name,
+        "readOnly": read_only,
         "before": before,
         # None RATHER THAN A WRONG LIST. Reporting ['NONE'] as the available transforms - which is
         # what the RNA gives - tells a caller something false in a field they would act on. An
@@ -3209,6 +4026,7 @@ def op_set_stereo(params):
 
 
 OPS = {
+    "solve_camera_from_reference": op_solve_camera_from_reference,
     "set_stereo": op_set_stereo,
     "preview_garment": op_preview_garment,
     "set_render_settings": op_set_render_settings,

@@ -24,7 +24,7 @@ import time
 
 import bpy
 
-from .ops_common import (MifOpError, caller_deadline, check_output_path, check_writable_dir, finite_float, get_object,
+from .ops_common import (MifOpError, remove_objects, caller_deadline, check_output_path, check_writable_dir, finite_float, get_object,
                          reject_unknown, take, take_bool, take_float, take_int)
 
 _KEYS = ("object", "detail", "build", "types", "folder", "pattern", "width", "height", "samples", "margin", "uvLayer",
@@ -277,7 +277,7 @@ def _subdivided_copy(low, levels, name):
         dense = bpy.data.meshes.new_from_object(ev, preserve_all_data_layers=True, depsgraph=dg)
     finally:
         old = tmp.data
-        bpy.data.objects.remove(tmp)
+        remove_objects([tmp])
         bpy.data.meshes.remove(old)
     det = low.copy()
     det.data = dense
@@ -977,7 +977,7 @@ def op_recipe_detail_bake(params):
 def _remove(o):
     try:
         me = o.data
-        bpy.data.objects.remove(o)
+        remove_objects([o])
         if me is not None and me.users == 0:
             bpy.data.meshes.remove(me)
     except (ReferenceError, RuntimeError):

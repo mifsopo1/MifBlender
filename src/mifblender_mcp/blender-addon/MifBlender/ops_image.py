@@ -2827,9 +2827,168 @@ def op_channel_pack_image(params):
     return out
 
 
-_IST_KEYS = {"image", "file", "normal", "tiling", "pixels", "uvs", "tile"}
+_IST_KEYS = {"image", "file", "normal", "tiling", "pixels", "uvs", "tile", "role", "baseColor"}
 _IST_CHANNELS = ("R", "G", "B", "A")
 _IST_MAX_PIXELS = 67108864          # 8192 x 8192: a 1 GB float read beyond that is refused rather than attempted
+
+# ------------------------------------------------------------------------------------------- the PBR plausibility check
+# FILED 2026-11-14, BUILT 2026-11-15: nothing said whether a texture set is physically plausible. role= reads one map
+# against what its role should look like and DESCRIBES - every finding carries its number, its threshold and where the
+# threshold came from - and never refuses: a stylized texture can break every rule on purpose.
+#
+# THE THRESHOLDS. Base color: Adobe's "The PBR Guide, Part 2" (Substance; McDermott) gives non-metal albedo a floor of
+# 30-50 sRGB (30 tolerant, 50 strict) and a ceiling of 240 sRGB; metals sit higher, so a bright share on a metal is
+# expected. The baked-lighting, metallic, roughness-copy and AO limits have no published number, so they were set from
+# a known-good scanned set: 47 CC0 ambientCG sets (Color, Roughness, 33 AmbientOcclusion, 10 Metalness) measured
+# through this op on 2026-11-15 (Blender 5.0.1). Each limit sits above the worst value that set produced, named in
+# PBR_CALIBRATION, so a real scan does not trip it.
+_PBR_ROLES = ("base_color", "metallic", "roughness", "ao")
+_PBR_GUIDE = "Adobe Substance, The PBR Guide Part 2 (non-metal base color 30-50 sRGB floor, 240 sRGB ceiling)"
+_PBR_SCANNED = "above the worst of 47 ambientCG scanned sets measured 2026-11-15 (PBR_CALIBRATION)"
+# {metric: (the worst value the scanned set produced, the set that produced it)} - the limit sits beyond it
+PBR_CALIBRATION = {"darkShare": (0.0086, "WoodFloor043"), "brightShare": (0.0055, "Plaster002, non-metal; 1.0 on metals"),
+                   "lowFrequencyRange": (1.0324, "WoodFloor041"), "lightingGradient": (0.2015, "RoofingTiles011A"),
+                   "inBetweenShare": (0.4225, "Metal046B"), "roughnessRange": (0.0157, "the flattest scan"),
+                   "copiesBaseColor": (0.9924, "Concrete036"), "aoWhite": (0.9392, "WoodFloor043"),
+                   "aoBlack": (0.0, "every set")}
+PBR_LIMITS = {"darkShare": 0.05, "brightShare": 0.05, "lowFrequencyRange": 1.25, "lightingGradient": 0.35,
+              "inBetweenShare": 0.5, "roughnessRange": 0.01, "copiesBaseColor": 0.995, "aoWhite": 0.98, "aoBlack": 0.5}
+
+
+def _srgb_encode(lin):
+    import numpy as np                                               # noqa: PLC0415
+    lin = np.clip(lin, 0.0, 1.0)
+    return np.where(lin <= 0.0031308, lin * 12.92, 1.055 * np.power(lin, 1.0 / 2.4) - 0.055)
+
+
+def _srgb_decode(enc):
+    import numpy as np                                               # noqa: PLC0415
+    enc = np.clip(enc, 0.0, 1.0)
+    return np.where(enc <= 0.04045, enc / 12.92, np.power((enc + 0.055) / 1.055, 2.4))
+
+
+def _blocks(a, n=16):
+    """n x n block means of a 2D array (the low frequencies), trimming the remainder."""
+    h, w = a.shape
+    bh, bw = max(1, h // n), max(1, w // n)
+    a = a[:bh * n, :bw * n] if h >= n and w >= n else a
+    if h < n or w < n:
+        return a
+    return a.reshape(n, bh, n, bw).mean(axis=(1, 3))
+
+
+def _finding(check, measured, limit, source, bad, what):
+    """One plausibility row. `measured` is a statistic of the image's own pixels (_pbr_report), never a caller's value."""
+    return {"check": check, "value": round(float(measured), 4), "limit": limit, "source": source,
+            "verdict": "warn" if bad else "ok", "means": what}
+
+
+def _pbr_report(img, a, role, base, tail):
+    """The role's checks on pixels `a` (h, w, channels) as stored. `base`: a base color's pixels for the roughness copy
+    check, or None."""
+    import numpy as np                                               # noqa: PLC0415
+    nch = a.shape[2]
+    rgb = a[:, :, :3] if nch >= 3 else np.repeat(a[:, :, :1], 3, axis=2)
+    rgb = np.where(np.isfinite(rgb), rgb, 0.0)
+    cs = img.colorspace_settings.name.lower()
+    stored_srgb = (not img.is_float) and cs in ("srgb", "srgb - texture")
+    findings = []
+    out = {"role": role, "readAs": None}
+    lim = PBR_LIMITS
+    if role == "base_color":
+        if stored_srgb:
+            enc, lin = rgb, _srgb_decode(rgb)
+            out["readAs"] = "sRGB-encoded as stored (%s, 8-bit)" % img.colorspace_settings.name
+        else:
+            lin, enc = rgb, _srgb_encode(rgb)
+            out["readAs"] = "linear as stored (%s%s), encoded to sRGB for the limits" % (
+                img.colorspace_settings.name, ", float" if img.is_float else "")
+        lum_lin = 0.2126 * lin[..., 0] + 0.7152 * lin[..., 1] + 0.0722 * lin[..., 2]
+        lum_enc = _srgb_encode(lum_lin)
+        dark30 = float((lum_enc < 30 / 255.0).mean())
+        dark50 = float((lum_enc < 50 / 255.0).mean())
+        bright = float((enc.max(axis=2) > 240 / 255.0).mean())
+        findings.append(_finding("darkShare", dark30, "share under 30 sRGB above %g" % lim["darkShare"], _PBR_GUIDE,
+                                 dark30 > lim["darkShare"], "pixels darker than any real non-metal albedo (coal, "
+                                 "fresh asphalt sit near 30-50 sRGB); usually shading or AO baked into the color"))
+        out["darkShareStrict50"] = round(dark50, 4)
+        findings.append(_finding("brightShare", bright, "share over 240 sRGB above %g" % lim["brightShare"],
+                                 _PBR_GUIDE, bright > lim["brightShare"], "pixels brighter than a non-metal reflects "
+                                 "(fresh snow is about 240 sRGB); fine on a metal, whose base color is its reflectance"))
+        m = float(lum_lin.mean())
+        bl = _blocks(lum_lin)
+        lf = float((np.percentile(bl, 95) - np.percentile(bl, 5)) / m) if m > 1e-6 else 0.0
+        n = bl.shape[0]
+        yy, xx = np.mgrid[0:n, 0:bl.shape[1]]
+        A = np.stack([xx.ravel(), yy.ravel(), np.ones(bl.size)], axis=1).astype(np.float64)
+        coef = np.linalg.lstsq(A, bl.ravel(), rcond=None)[0]
+        grad = float(math.hypot(coef[0] * bl.shape[1], coef[1] * n) / m) if m > 1e-6 else 0.0
+        findings.append(_finding("lowFrequencyRange", lf, "above %g" % lim["lowFrequencyRange"], _PBR_SCANNED,
+                                 lf > lim["lowFrequencyRange"], "how far the image's broad brightness swings (16 x 16 "
+                                 "block means, 5th to 95th percentile, over the mean): large broad light and dark areas "
+                                 "are what baked lighting and cast shadows leave in an albedo"))
+        findings.append(_finding("lightingGradient", grad, "above %g" % lim["lightingGradient"], _PBR_SCANNED,
+                                 grad > lim["lightingGradient"], "a plane fitted to the block means, end to end over the "
+                                 "mean: a light from one side brightens one side of the map"))
+        out["notMeasured"] = "the shapes of cast shadows: only their broad brightness is read"
+    elif role == "metallic":
+        v = rgb[..., 0]
+        between = float(((v > 0.1) & (v < 0.9)).mean())
+        out["readAs"] = "the red channel as stored"
+        findings.append(_finding("inBetweenShare", between, "share between 0.1 and 0.9 above %g" % lim["inBetweenShare"],
+                                 _PBR_SCANNED, between > lim["inBetweenShare"], "a surface is metal or it is not: a "
+                                 "real metallic map is 0 or 1 nearly everywhere, with gray only on transitions such "
+                                 "as rust edges or dirt over metal"))
+        out["metalShare"] = round(float((v >= 0.9).mean()), 4)
+    elif role == "roughness":
+        v = rgb[..., 0]
+        rng = float(np.percentile(v, 95) - np.percentile(v, 5))
+        out["readAs"] = "the red channel as stored"
+        findings.append(_finding("range", rng, "under %g" % lim["roughnessRange"], _PBR_SCANNED,
+                                 rng < lim["roughnessRange"], "5th to 95th percentile: a near-constant roughness "
+                                 "reads as one plastic sheen - fine for a uniform material, rare in a scan"))
+        out["mean"] = round(float(v.mean()), 4)
+        if base is not None:
+            b = base[:, :, :3] if base.shape[2] >= 3 else np.repeat(base[:, :, :1], 3, axis=2)
+            bl_lum = _blocks(0.2126 * b[..., 0] + 0.7152 * b[..., 1] + 0.0722 * b[..., 2], 64)
+            rl = _blocks(v, 64)
+            if bl_lum.shape == rl.shape and bl_lum.std() > 1e-6 and rl.std() > 1e-6:
+                r = float(np.corrcoef(bl_lum.ravel(), rl.ravel())[0, 1])
+                findings.append(_finding("copiesBaseColor", abs(r), "|r| above %g" % lim["copiesBaseColor"],
+                                         _PBR_SCANNED, abs(r) > lim["copiesBaseColor"], "the correlation of roughness "
+                                         "with the base color's luminance (64 x 64 block means; r %.3f): near 1 the "
+                                         "roughness was probably derived from the color, not authored" % r))
+            else:
+                out["copiesBaseColorNote"] = "not measured: the base color or the roughness is flat at 64 x 64 blocks"
+    elif role == "ao":
+        v = rgb[..., 0]
+        out["readAs"] = "the red channel as stored"
+        out["mean"] = round(float(v.mean()), 4)
+        white = float((v > 0.98).mean())
+        black = float((v < 0.02).mean())
+        findings.append(_finding("whiteShare", white, "above %g" % lim["aoWhite"], _PBR_SCANNED, white > lim["aoWhite"],
+                                 "an AO map that is white nearly everywhere occludes nothing - often an empty bake"))
+        findings.append(_finding("blackShare", black, "above %g" % lim["aoBlack"], _PBR_SCANNED, black > lim["aoBlack"],
+                                 "an AO map that is black nearly everywhere darkens the whole surface - a bake that "
+                                 "missed its rays or hit its own cage"))
+    keys = {"range": "roughnessRange", "whiteShare": "aoWhite", "blackShare": "aoBlack"}
+    for f in findings:
+        worst = PBR_CALIBRATION.get(keys.get(f["check"], f["check"]))
+        if worst is not None and f["source"] == _PBR_SCANNED:
+            f["scannedWorst"] = {"value": worst[0], "set": worst[1]}
+    if role == "roughness" and base is not None:
+        out["copiesBaseColorNote"] = out.get("copiesBaseColorNote") or (
+            "scanned sets correlate too - 4 of 47 above 0.86 and one at 0.99 - because a real surface's dark crevices "
+            "are often its rough ones, so a high r alone is a hint, not proof")
+    warns = [f["check"] for f in findings if f["verdict"] == "warn"]
+    out["findings"] = findings
+    out["warnings"] = warns
+    out["plausible"] = not warns
+    out["note"] = ("describes and warns, never refuses: a stylized texture may break these on purpose. The limits are "
+                   "for physically based scanned or authored maps.")
+    return out
+
+
 
 
 def op_image_stats(params):
@@ -2860,6 +3019,16 @@ def op_image_stats(params):
     path = take(params, "file", kind=str)
     if (name is None) == (path is None):
         raise MifOpError("image_stats takes image (a name in this file) OR file (a path on disk). %s" % tail)
+    role = take(params, "role", kind=str)
+    if role is not None:
+        role = role.strip().lower().replace(" ", "_").replace("-", "_")
+        role = {"basecolor": "base_color", "albedo": "base_color", "diffuse": "base_color", "metalness": "metallic",
+                "ambient_occlusion": "ao", "occlusion": "ao"}.get(role, role)
+        if role not in _PBR_ROLES:
+            raise MifOpError("role is one of %s, got %r. %s" % (", ".join(_PBR_ROLES), params.get("role"), tail))
+    base_ref = take(params, "baseColor", kind=str)
+    if base_ref is not None and role != "roughness":
+        raise MifOpError("baseColor is what role roughness compares against; it goes with role roughness. %s" % tail)
     loaded = None
     if path is not None:
         full = os.path.abspath(bpy.path.abspath(path))
@@ -2978,9 +3147,40 @@ def op_image_stats(params):
                                 "value": [None if not math.isfinite(float(v)) else round(float(v), 6) for v in a[y, x]]})
         if samples:
             out["samples"] = samples
+        if role is not None:
+            base = None
+            if base_ref is not None:
+                base = _read_pixels_of(base_ref, tail)
+            out["pbr"] = _pbr_report(img, a, role, base, tail)
+            if out["pbr"]["warnings"]:
+                warn.append("PBR %s: %s" % (role, ", ".join(out["pbr"]["warnings"])))
         if warn:
             out["warning"] = "; ".join(warn)
         return out
+    finally:
+        if loaded is not None:
+            bpy.data.images.remove(loaded)
+
+
+def _read_pixels_of(ref, tail):
+    """(h, w, channels) pixels of an image named in the file, or of a file loaded and removed again."""
+    import numpy as np                                               # noqa: PLC0415
+    loaded = None
+    if os.path.isfile(os.path.abspath(bpy.path.abspath(ref))) and bpy.data.images.get(ref) is None:
+        try:
+            loaded = bpy.data.images.load(os.path.abspath(bpy.path.abspath(ref)), check_existing=False)
+        except RuntimeError as exc:
+            raise MifOpError("Blender could not read baseColor '%s' as an image (%s). %s" % (ref, exc, tail))
+        im = loaded
+    else:
+        im = _get_image(ref, tail)
+    try:
+        w, h, nch = int(im.size[0]), int(im.size[1]), int(im.channels) or 4
+        if not w or not h or w * h > _IST_MAX_PIXELS:
+            raise MifOpError("baseColor '%s' is %dx%d - empty, or over the size this reads. %s" % (ref, w, h, tail))
+        b = np.empty(w * h * nch, dtype=np.float32)
+        im.pixels.foreach_get(b)
+        return b.reshape(h, w, nch)
     finally:
         if loaded is not None:
             bpy.data.images.remove(loaded)

@@ -495,7 +495,7 @@ def op_hair_to_cards(params):
 
 _BTS_KEYS = ("object", "types", "folder", "pattern", "width", "height", "samples", "margin", "uvLayer", "source",
              "extrusion", "maxRayDistance", "cage", "packOrm", "outOfProcess", "jobId", "greenChannel", "memoryLimitGB",
-             "bakedMaterial", "assignBaked")
+             "bakedMaterial", "assignBaked", "computeBackend")
 _BTS_SUFFIX = {"AO": "AO", "NORMAL": "N", "DIFFUSE": "BC", "BASE_COLOR": "BC", "ROUGHNESS": "R", "METALLIC": "M",
                "EMIT": "E",
                "CURVATURE": "Curv", "ALPHA": "A", "MATERIAL_ID": "ID", "HEIGHT": "H", "POSITION": "Pos",
@@ -505,16 +505,22 @@ _JOB_SCRIPT = r'''
 import json, sys, traceback
 sys.path.insert(0, @@ADDON@@)
 import bpy
-from MifBlender import ops_material, ops_image
+from MifBlender import ops_material, ops_image, ops_render
 spec = json.load(open(@@SPEC@@, encoding="utf-8"))
 rows = []
+used = {"backend": None, "device": "CPU", "devices": [], "note": "no computeBackend asked: the default, the CPU"}
+if spec.get("computeBackend"):
+    _sc = bpy.context.scene
+    _sc.render.engine = "CYCLES"
+    used = ops_render._still_backend_apply(_sc, ops_render._still_backend(_sc, {"computeBackend": spec["computeBackend"]}))
+    used.pop("note", None)
 for req in spec["bakes"]:
     try:
         r = ops_material.op_bake_texture(req["params"])
         rows.append({"type": req["type"], "ok": True, "file": r.get("savedTo"), "signature": r.get("savedSignature")})
     except Exception as exc:
         rows.append({"type": req["type"], "ok": False, "error": str(exc)[:600]})
-    json.dump({"rows": rows, "done": False}, open(@@OUT@@, "w", encoding="utf-8"))
+    json.dump({"rows": rows, "done": False, "computeUsed": used}, open(@@OUT@@, "w", encoding="utf-8"))
 orm = None
 if spec.get("orm"):
     try:
@@ -522,7 +528,7 @@ if spec.get("orm"):
         orm = {"ok": True, "file": r.get("file"), "readBack": r.get("readBack")}
     except Exception as exc:
         orm = {"ok": False, "error": str(exc)[:600]}
-json.dump({"rows": rows, "orm": orm, "done": True}, open(@@OUT@@, "w", encoding="utf-8"))
+json.dump({"rows": rows, "orm": orm, "done": True, "computeUsed": used}, open(@@OUT@@, "w", encoding="utf-8"))
 '''
 
 
@@ -538,7 +544,8 @@ def _bake_set_status(job_id):
         res = {"rows": [], "done": False}
     out = {"jobId": job_id, "running": code is None, "exitCode": code, "mapsExpected": len(job["types"]),
            "mapsDone": len(res.get("rows") or []), "maps": res.get("rows") or [], "orm": res.get("orm"),
-           "elapsedSeconds": round(time.time() - job["started"], 1), "log": job["log"]}
+           "elapsedSeconds": round(time.time() - job["started"], 1), "log": job["log"],
+           "computeUsed": res.get("computeUsed")}
     if job.get("watch") is not None:
         out["job"] = job["watch"].report()
     if code is not None:
@@ -585,6 +592,9 @@ def op_bake_texture_set(params):
                                    carried as nothing. Out of process it is made by the status call that sees the job
                                    finish. assignBaked (bool) also puts it in every material slot of the object. It reads the
                                    UV layer the bake wrote: uvMap in the reply names it when that is not the render-active one.
+      computeBackend (str)         the job's device, the names render_still takes (OPTIX, CUDA, HRT, ONEAPI, METAL, NONE).
+                                   Default: the CPU, as before. Checked before the session copy; a backend with no device
+                                   here is refused, never a quiet CPU bake. The status reply's computeUsed says what ran.
     BASE_COLOR is the albedo: a DIFFUSE bake is the diffuse color pass, base color x (1 - metallic), so a worn metal's
     bare edges come out black in it - bake BASE_COLOR for a metal.
     """
@@ -610,6 +620,24 @@ def op_bake_texture_set(params):
     if "DIFFUSE" in types and "BASE_COLOR" in types:
         raise MifOpError("DIFFUSE and BASE_COLOR both write the BC map - BASE_COLOR is the albedo (a DIFFUSE bake is "
                          "black wherever the surface is metal); pass one. %s" % tail)
+    # computeBackend: the job's Blender starts with factory preferences, so it bakes on the CPU unless told. The name is
+    # checked here against this machine's devices, before the session copy; a device-less backend would bake on the CPU
+    # in silence.
+    backend = None
+    if params.get("computeBackend") is not None:
+        from types import SimpleNamespace                      # noqa: PLC0415
+        from .ops_render import _still_backend                 # noqa: PLC0415
+        if not take_bool(params, "outOfProcess", default=True):
+            raise MifOpError("computeBackend is for the out-of-process job; this Blender's own device is set with "
+                             "render_still computeBackend. %s" % tail)
+        # a bake runs Cycles whatever the scene renders with, so the check is asked as for a Cycles scene; nothing is
+        # written, and a backend with no device on this machine is refused here, naming the ones that have one
+        try:
+            checked = _still_backend(SimpleNamespace(render=SimpleNamespace(engine="CYCLES")),
+                                     {"computeBackend": params["computeBackend"]})
+        except MifOpError as exc:
+            raise MifOpError(str(exc).replace("NOTHING was rendered.", "") + " " + tail) from None
+        backend = checked[1]
     baked = _baked_plan(params, obj, types, tail)
     folder = _folder(params, tail)
     pattern = take(params, "pattern", default="T_{object}_{suffix}", kind=str)
@@ -644,6 +672,9 @@ def op_bake_texture_set(params):
     # Blender already baking and holding the child slot, and nothing told the caller its jobId
     mem = take_float(params, "memoryLimitGB", default=None)
     mem_bytes = None if mem is None else childproc.memory_limit_bytes(mem)
+    if backend is not None:
+        for b in bakes:
+            b["params"]["device"] = "GPU" if backend != "NONE" else "CPU"
     if not take_bool(params, "outOfProcess", default=True):
         from .ops_image import op_channel_pack_image           # noqa: PLC0415
         from .ops_material import op_bake_texture              # noqa: PLC0415
@@ -686,7 +717,7 @@ def op_bake_texture_set(params):
         load = orm.pop("_load")
         orm["channels"] = {c: ({"image": os.path.basename(load[c]), "channel": "R"} if c in load else v)
                            for c, v in orm["channels"].items()}
-    spec = {"bakes": bakes, "orm": orm}
+    spec = {"bakes": bakes, "orm": orm, "computeBackend": backend}
     spec_path, out_path = os.path.join(work, "spec.json"), os.path.join(work, "result.json")
     json.dump(spec, open(spec_path, "w", encoding="utf-8"))
     addon = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

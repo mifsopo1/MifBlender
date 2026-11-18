@@ -30,9 +30,11 @@ _COMPACT_AT = 2 * MAX_RECORDS           # lines in the file before a compaction 
 # candidate. "source" is the person's work. An op not named here is "unclassified", which reads as unknown: a guess here
 # would be the very inference the registry exists to replace.
 _INTERMEDIATE = frozenset((
-    "export_mesh", "export_scene", "export_actions", "export_camera", "export_groom", "export_vertex_positions",
+    "export_mesh", "export_scene", "export_actions", "export_camera", "export_groom", "export_vertex_positions", "read_mesh_data",
+    "export_uv_layout",
     "mixdown_audio", "extract_audio", "render_still", "render_viewport", "compose_atlas", "preview_garment",
-    "bake_texture", "bake_texture_set", "bake_vertex_animation", "bake_hidden_face_map", "build_lod_chain"))
+    "bake_texture", "bake_texture_set", "bake_vertex_animation", "bake_hidden_face_map", "build_lod_chain",
+    "uefn_check"))
 _SOURCE = frozenset(("save_file", "save_image", "set_asset_library", "create_udim_image", "material_from_maps"))
 
 _PENDING = []

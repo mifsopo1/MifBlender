@@ -1,12 +1,12 @@
 <!-- mcp-name: io.github.mifsopo1/mifblender -->
 <p align="center">
-  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.3.1/assets/crab_hero.jpg" alt="A plated crab walker on a desert stage at sunset, built and rendered in Blender" width="100%">
+  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/crab_hero.jpg" alt="A plated crab walker on a desert stage at sunset, built and rendered in Blender" width="100%">
 </p>
 
 <h1 align="center">MifBlender</h1>
 
 <p align="center"><b>Your AI assistant, working inside a running Blender.</b><br>
-428 typed tools for modeling, materials, UVs, rigging, animation, physics, geometry nodes and rendering.<br>
+437 typed tools for modeling, materials, UVs, rigging, animation, physics, geometry nodes and rendering.<br>
 Each one checks its parameters, does the work on Blender's main thread and reads the result back.</p>
 
 <p align="center">
@@ -45,13 +45,13 @@ Each strip below shows the final render, the wireframe and the clay view.
 
 | Pangoliath | Rust Bucket | Frost Titan |
 |:---:|:---:|:---:|
-| <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/jam/jam_pangoliath_roar.gif" alt="Pangoliath going from idle to a roar, rendered in Cycles"> | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/jam/jam_rustbucket_roar.gif" alt="The Rust Bucket mech going from idle to a roar, rendered in Cycles"> | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/jam/jam_frosttitan_roar.gif" alt="The Frost Titan going from idle to a roar, rendered in Cycles"> |
+| <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/jam/jam_pangoliath_roar.gif" alt="Pangoliath going from idle to a roar, rendered in Cycles"> | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/jam/jam_rustbucket_roar.gif" alt="The Rust Bucket mech going from idle to a roar, rendered in Cycles"> | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/jam/jam_frosttitan_roar.gif" alt="The Frost Titan going from idle to a roar, rendered in Cycles"> |
 
 The roars are one shared clip on one shared 35-bone skeleton, keyed pose by pose with `set_bone_pose` and `key_pose`,
 blended in from the idle on the NLA and rendered in Cycles with `render_animation`.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/jam/jam_pangoliath_strip.jpg" alt="Pangoliath in final, wireframe and clay views" width="100%">
+  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/jam/jam_pangoliath_strip.jpg" alt="Pangoliath in final, wireframe and clay views" width="100%">
 </p>
 
 **Pangoliath:** 248,728 triangles, 35 bones, 7 materials on one 4K baked texture set. The body is a distance-field shape,
@@ -59,14 +59,14 @@ remeshed to quads with `remesh_mesh`. The plates, claws and their skin weights w
 `create_mesh`. The surfaces are node graphs baked to albedo, normal, ORM and emissive maps with `bake_texture_set`.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/jam/jam_rustbucket_strip.jpg" alt="The Rust Bucket mech in final, wireframe and clay views" width="100%">
+  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/jam/jam_rustbucket_strip.jpg" alt="The Rust Bucket mech in final, wireframe and clay views" width="100%">
 </p>
 
 **Rust Bucket:** 268,356 triangles, 35 bones, 13 materials on one 4K baked texture set. A scrap mech of rigid plates,
 drums and rams, each part skinned whole to its bone. The chipped paint, rust and grime are node graphs baked to texture.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/jam/jam_frosttitan_strip.jpg" alt="The Frost Titan in final, wireframe and clay views" width="100%">
+  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/jam/jam_frosttitan_strip.jpg" alt="The Frost Titan in final, wireframe and clay views" width="100%">
 </p>
 
 **Frost Titan:** 244,497 triangles, 35 bones, 7 materials on one 4K baked texture set. Built the same way as Pangoliath:
@@ -75,34 +75,34 @@ frozen fur clumps, icicles, ice armour and crystal horns placed on the body surf
 #### Vehicles, buildings and a tree
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/jam/jam_tank_strip.jpg" alt="A fictional battle tank in final, wireframe and clay views" width="100%">
+  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/jam/jam_tank_strip.jpg" alt="A fictional battle tank in final, wireframe and clay views" width="100%">
 </p>
 
 **A fictional tank:** 10,500 triangles, 4 materials, a turret and barrel on named sockets, a breakable version and a
 wreck. The camouflage, chipped edges, rain runs and mud are one 4K bake.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/jam/jam_taxi_strip.jpg" alt="A brand-free taxi in final, wireframe and clay views" width="100%">
+  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/jam/jam_taxi_strip.jpg" alt="A brand-free taxi in final, wireframe and clay views" width="100%">
 </p>
 
 **A brand-free taxi:** 13,900 triangles, 6 materials. A body lofted through smooth profile curves with real wheel arches,
 three baked paint variants and a burnt-out wreck.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/jam/jam_donutshop_strip.jpg" alt="A donut shop with a giant donut on the roof, in final, wireframe and clay views" width="100%">
+  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/jam/jam_donutshop_strip.jpg" alt="A donut shop with a giant donut on the roof, in final, wireframe and clay views" width="100%">
 </p>
 
 **A donut shop:** 18,024 triangles in 86 breakable pieces. The 8 m sprinkled donut on the roof is its own rolling prop.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/jam/jam_banktower_strip.jpg" alt="A 160 m art deco bank tower in final, wireframe and clay views" width="100%">
+  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/jam/jam_banktower_strip.jpg" alt="A 160 m art deco bank tower in final, wireframe and clay views" width="100%">
 </p>
 
 **A bank tower:** 160 m tall, 119,044 triangles in 1,863 separate pieces so it can come down piece by piece: a stone
 podium with a colonnade, stone piers between glass bays, two setbacks and a stepped crown.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/jam/jam_streettree_strip.jpg" alt="A London plane street tree in final, wireframe and clay views" width="100%">
+  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/jam/jam_streettree_strip.jpg" alt="A London plane street tree in final, wireframe and clay views" width="100%">
 </p>
 
 **A street tree:** a London plane grown with MifBlender's own `build_tree`, 30,199 triangles with three lower LODs down to
@@ -112,21 +112,21 @@ cards are drawn from each species' leaf outline.
 ### The crab walker
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.3.1/assets/crab_walk.gif" alt="The crab walker's walk cycle" width="100%">
+  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/crab_walk.gif" alt="The crab walker's walk cycle" width="100%">
 </p>
 
 The crab walker: 515 pieces, an interior, a rig and a walk cycle, built with these tools in a long, guided session.
 
 | The form, in clay | The topology |
 |:---:|:---:|
-| <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.3.1/assets/crab_clay.jpg" alt="Clay render of the crab walker"> | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.3.1/assets/crab_wire.jpg" alt="Wireframe close-up of a crab walker leg"> |
+| <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/crab_clay.jpg" alt="Clay render of the crab walker"> | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/crab_wire.jpg" alt="Wireframe close-up of a crab walker leg"> |
 
 | The cabin | Every angle |
 |:---:|:---:|
-| <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.3.1/assets/crab_interior.jpg" alt="The crab walker's lit wooden cabin"> | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.3.1/assets/crab_turntable.jpg" alt="Eight views around the crab walker"> |
+| <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/crab_interior.jpg" alt="The crab walker's lit wooden cabin"> | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/crab_turntable.jpg" alt="Eight views around the crab walker"> |
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.3.1/assets/crab_rig.jpg" alt="The crab walker's game rig in wireframe through one walk cycle" width="100%">
+  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/crab_rig.jpg" alt="The crab walker's game rig in wireframe through one walk cycle" width="100%">
 </p>
 
 **What it cost: $58.35** for one long session that built the model, rig, walk, bakes, video and packaging, run by Claude Opus
@@ -145,7 +145,7 @@ session started fresh, with only the saved file and a running journal to go on, 
 with `bl_compare_to_reference`.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.3.1/assets/creature_walk.gif" alt="The creature's walk cycle from a three-quarter camera and from the side" width="100%">
+  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/creature_walk.gif" alt="The creature's walk cycle from a three-quarter camera and from the side" width="100%">
 </p>
 
 The finished model: 910,104 vertices with a painted tone on each vertex, and a 77-bone rig with IK on the arms and legs. In the
@@ -154,10 +154,10 @@ claws stay within 0.008 mm of the fingers.
 
 | Reference and model | The face |
 |:---:|:---:|
-| <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.3.1/assets/creature_pair.jpg" alt="The creature from the front, beside its reference sheet"> | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.3.1/assets/creature_head.jpg" alt="Close-up of the creature's head beside its reference"> |
+| <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/creature_pair.jpg" alt="The creature from the front, beside its reference sheet"> | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/creature_head.jpg" alt="Close-up of the creature's head beside its reference"> |
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.3.1/assets/creature_views.jpg" alt="The finished creature from eight angles" width="100%">
+  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/creature_views.jpg" alt="The finished creature from eight angles" width="100%">
 </p>
 
 **What it cost: $91.72** for eight staged sessions that built the model, paint, 77-bone rig and walk, run by Claude Opus 5.5
@@ -192,9 +192,9 @@ Each of these was built from the one prompt under it:
 
 | | |
 |:---:|:---:|
-| <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.3.1/assets/prompt_robot.jpg" alt="A boxy robot on tank treads"><br><sub>"Model a cute boxy robot with antenna, round eyes and tank treads, lit for a nice render."</sub> | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.3.1/assets/prompt_bonsai.jpg" alt="A bonsai tree in a shallow pot"><br><sub>"Model a bonsai tree in a shallow ceramic pot with a few small rocks, lit for a nice render."</sub> |
-| <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.3.1/assets/prompt_lowpoly_car.jpg" alt="A low-poly cartoon car"><br><sub>"Model a low-poly cartoon car with round wheels, headlights and a little spoiler, lit for a nice render."</sub> | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.3.1/assets/prompt_teapot.jpg" alt="A teapot and cup on a wooden tray"><br><sub>"Model a cute ceramic teapot with a cup and saucer on a small wooden tray, lit for a nice render."</sub> |
-| <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.3.1/assets/prompt_castle_tower.jpg" alt="A stone castle tower with a flag"><br><sub>"Model a stone castle tower with battlements, arrow slits and a flag on top, lit for a nice render."</sub> | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.3.1/assets/prompt_chest.jpg" alt="An open treasure chest spilling gold coins"><br><sub>"Model a wooden treasure chest with iron bands, its lid open, and gold coins spilling out, lit for a nice render."</sub> |
+| <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/prompt_robot.jpg" alt="A boxy robot on tank treads"><br><sub>"Model a cute boxy robot with antenna, round eyes and tank treads, lit for a nice render."</sub> | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/prompt_bonsai.jpg" alt="A bonsai tree in a shallow pot"><br><sub>"Model a bonsai tree in a shallow ceramic pot with a few small rocks, lit for a nice render."</sub> |
+| <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/prompt_lowpoly_car.jpg" alt="A low-poly cartoon car"><br><sub>"Model a low-poly cartoon car with round wheels, headlights and a little spoiler, lit for a nice render."</sub> | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/prompt_teapot.jpg" alt="A teapot and cup on a wooden tray"><br><sub>"Model a cute ceramic teapot with a cup and saucer on a small wooden tray, lit for a nice render."</sub> |
+| <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/prompt_castle_tower.jpg" alt="A stone castle tower with a flag"><br><sub>"Model a stone castle tower with battlements, arrow slits and a flag on top, lit for a nice render."</sub> | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/prompt_chest.jpg" alt="An open treasure chest spilling gold coins"><br><sub>"Model a wooden treasure chest with iron bands, its lid open, and gold coins spilling out, lit for a nice render."</sub> |
 
 ### Simulation, shading and scale
 
@@ -202,15 +202,15 @@ Scripted scenes, each built entirely from typed calls:
 
 | | | |
 |:---:|:---:|:---:|
-| <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.3.1/assets/scene_newyork.jpg" alt="Manhattan as a scale model"><br><sub>Manhattan as a scale model</sub> | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.3.1/assets/scene_liquid.jpg" alt="Liquid poured over a head"><br><sub>A baked liquid sim</sub> | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.3.1/assets/scene_pile.jpg" alt="125 toys poured into a crate"><br><sub>125 rigid bodies</sub> |
-| <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.3.1/assets/scene_robotarm.jpg" alt="A robot arm carrying a block"><br><sub>IK with a baked carry</sub> | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.3.1/assets/scene_facepaint.jpg" alt="27 cubies painted face by face"><br><sub>27 cubies, painted face by face</sub> | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.3.1/assets/scene_staircase.jpg" alt="A spiral stair"><br><sub>A spiral stair from one tread</sub> |
-| <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.3.1/assets/scene_geodesic.jpg" alt="A geodesic lit from inside"><br><sub>A geodesic lit from inside</sub> | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.3.1/assets/scene_fur.jpg" alt="A furred sphere"><br><sub>30,000 hairs from one call</sub> | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.3.1/assets/scene_passes.jpg" alt="One render shown as beauty, normals and mist"><br><sub>Render passes</sub> |
+| <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/scene_newyork.jpg" alt="Manhattan as a scale model"><br><sub>Manhattan as a scale model</sub> | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/scene_liquid.jpg" alt="Liquid poured over a head"><br><sub>A baked liquid sim</sub> | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/scene_pile.jpg" alt="125 toys poured into a crate"><br><sub>125 rigid bodies</sub> |
+| <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/scene_robotarm.jpg" alt="A robot arm carrying a block"><br><sub>IK with a baked carry</sub> | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/scene_facepaint.jpg" alt="27 cubies painted face by face"><br><sub>27 cubies, painted face by face</sub> | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/scene_staircase.jpg" alt="A spiral stair"><br><sub>A spiral stair from one tread</sub> |
+| <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/scene_geodesic.jpg" alt="A geodesic lit from inside"><br><sub>A geodesic lit from inside</sub> | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/scene_fur.jpg" alt="A furred sphere"><br><sub>30,000 hairs from one call</sub> | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/scene_passes.jpg" alt="One render shown as beauty, normals and mist"><br><sub>Render passes</sub> |
 
 ### Game props
 
 | Clean to worn, from one setting | Topology you can check |
 |:---:|:---:|
-| <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.3.1/assets/props_wear.jpg" alt="A table, crate, chair and barrel, clean and worn"> | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.3.1/assets/props_wire.jpg" alt="Five game props in clay and wireframe"> |
+| <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/props_wear.jpg" alt="A table, crate, chair and barrel, clean and worn"> | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.4.0/assets/props_wire.jpg" alt="Five game props in clay and wireframe"> |
 
 ## What is in it
 
@@ -224,7 +224,7 @@ Scripted scenes, each built entirely from typed calls:
 | **Checking** | mesh quality reports, comparing a render to a reference image, reading results back |
 
 A lean default sends only `find_tools`, `mif_call` and `run_python` up front and finds the rest on demand, so a long session
-stays small. Set `MIF_TOOL_PACKS=blender` to load all 428 tools, or name the packs you want; there are 13.
+stays small. Set `MIF_TOOL_PACKS=blender` to load all 437 tools, or name the packs you want; there are 14.
 
 ## AI apps
 

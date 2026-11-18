@@ -3,7 +3,7 @@
  "packs": {
   "core": {
    "title": "Core",
-   "description": "Loaded with any named selection - a selection of Blender packs only keeps just its six backend-neutral tools, the ones that find, load and call the rest, and run_python - while the unset default loads only find_tools, mif_call and run_python. Orientation and the commonest reads and writes: self_audit, describe_endpoint, mif_help, find_tools (finds tools in packs that are not loaded, and names the pack), the pack tools, mif_call (reaches ANY tool by name, loaded or not), run_python (a Python script in Blender, when the add-on allows it, or in the Unreal Editor, where its Python plugin is on), find_assets, get/set_property, list_level_actors, batch, saving (list_dirty_packages, save_package, save_dirty_packages), ping, project_paths.",
+   "description": "Loaded with any named selection - a selection of Blender packs only keeps just its seven backend-neutral tools, the ones that find, load and call the rest, run_python and mif_view_image - while the unset default loads only find_tools, mif_call and run_python. Orientation and the commonest reads and writes: self_audit, describe_endpoint, mif_help, find_tools (finds tools in packs that are not loaded, and names the pack), the pack tools, mif_call (reaches ANY tool by name, loaded or not), run_python (a Python script in Blender, when the add-on allows it, or in the Unreal Editor, where its Python plugin is on), find_assets, get/set_property, list_level_actors, batch, saving (list_dirty_packages, save_package, save_dirty_packages), ping, project_paths.",
    "backend": "any",
    "tools": [
     "find_tools",
@@ -11,6 +11,7 @@
     "mif_enable_pack",
     "mif_help",
     "mif_list_packs",
+    "mif_view_image",
     "run_python",
     "mif_project_mode"
    ],
@@ -20,71 +21,14 @@
     "mif_enable_pack",
     "mif_help",
     "mif_list_packs",
+    "mif_view_image",
     "run_python",
     "mif_project_mode"
    ],
    "rules": [
     {
-     "rule": "Test get_property's typed, never value (export text: a false bool is the truthy string 'False'). Write set_property values in typed's form: lists, objects for structs (typed's keys are case-sensitive: X/Y/Z, Pitch/Yaw/Roll), enum names, references as '/Game/Dir/Mesh.Mesh'.",
-     "tools": [
-      "get_property",
-      "set_property"
-     ]
-    },
-    {
-     "rule": "For a placed actor's component, pass the actorPath as set_property/get_property path and walk by property name, e.g. 'StaticMeshComponent.StaticMesh'. A component held in an array is addressed by index ('Switches[0].StaticMesh'), never by its object name ('Switch0').",
-     "tools": [
-      "set_property",
-      "get_property"
-     ]
-    },
-    {
      "rule": "An error does not mean nothing changed: a failed call keeps any edit it made before failing, and a value of the wrong JSON type (2 for a boolean, 1.5 for an integer) can fail the call after the handler already ran with that parameter's default. Re-read the target after any error.",
      "tools": []
-    },
-    {
-     "rule": "Edits live only in editor memory until saved: a new asset vanishes on restart, and list_dirty_packages lists what would be lost. Read mode refuses every write. Scratch mode refuses saves and writes outside /Game/_Mif*; only a person can raise it to full, in the panel.",
-     "tools": [
-      "list_dirty_packages"
-     ]
-    },
-    {
-     "rule": "batch ops are {op: '<endpoint>', ...} written in its tool's arguments (graph_id, src_node) or camelCase (graphId, srcNode). Every op runs even after one fails and nothing rolls back: read each results[i] error; ok:false says only that some op or the final compile failed.",
-     "tools": [
-      "batch"
-     ]
-    },
-    {
-     "rule": "When describe_endpoint answers status params_not_declared it omits acceptedParams: the parameters are unknown, not none (only acceptsNoParameters:true means none). Fall back to mif_help('<tool>') and the tool's own parameter list.",
-     "tools": [
-      "describe_endpoint",
-      "mif_help"
-     ]
-    },
-    {
-     "rule": "list_level_actors' rotation is {x: pitch, y: yaw, z: roll} in degrees (location in cm), renormalised on read, so compare with a tolerance. It reads the editor world: check world is the map you expect, and while PIE runs it returns count 0 with worldType still 'editor'.",
-     "tools": [
-      "list_level_actors"
-     ]
-    },
-    {
-     "rule": "find_assets' count is the match total and returned the rows sent (limit defaults to 100): check truncated. It reads the asset registry, so files copied into Content/ while the editor runs can come back count 0 with no error; rescan with audit_unused(path_prefix, rescan=True).",
-     "tools": [
-      "find_assets",
-      "audit_unused"
-     ]
-    },
-    {
-     "rule": "set_property reaches a Blueprint's class defaults (bReplicates, variable defaults) only on its class default object, '/Game/Dir/BP.Default__BP_C'; '/Game/Dir/BP.BP' is the Blueprint editor object. The edit survives a compile; save the package to keep it.",
-     "tools": [
-      "set_property"
-     ]
-    },
-    {
-     "rule": "set_property writes a value outside the property's ClampMin/ClampMax (flagged in clampViolation) unless enforce_clamps=True, and by default also sets the property's EditCondition flag (overrideFlagWritten) so the engine reads it; override_flag='refuse' refuses instead.",
-     "tools": [
-      "set_property"
-     ]
     }
    ]
   },
@@ -450,6 +394,7 @@
     "bl_create_udim_image",
     "bl_derive_image_map",
     "bl_describe_material",
+    "bl_export_uv_layout",
     "bl_fix_normal_map",
     "bl_image_stats",
     "bl_import_pbr_texture_set",
@@ -548,13 +493,14 @@
   },
   "blender_nodes": {
    "title": "Blender: Nodes (Geometry, Shader, Compositor)",
-   "description": "Node graphs: create node groups, add and link nodes, set node properties and group interfaces, assign geometry-node groups, and the compositor; the generic mesh attributes geometry nodes read, and part of a mesh spun about an axis.",
+   "description": "Node graphs: create node groups, add and link nodes, set node properties and group interfaces, assign geometry-node groups, and the compositor; the generic mesh attributes geometry nodes read, part of a mesh spun about an axis, and race roads built along a spline (bl_build_road) and measured (bl_road_report).",
    "backend": "blender",
    "tools": [
     "bl_add_group_interface",
     "bl_add_group_node",
     "bl_assign_node_group",
     "bl_build_pass_composite",
+    "bl_build_road",
     "bl_compositor_info",
     "bl_create_node_group",
     "bl_group_nodes",
@@ -562,15 +508,25 @@
     "bl_link_group_nodes",
     "bl_list_group_nodes",
     "bl_list_node_groups",
+    "bl_read_mesh_data",
     "bl_remove_node",
+    "bl_road_report",
     "bl_run_node_tool",
     "bl_set_compositing",
     "bl_set_mesh_attribute",
+    "bl_set_mesh_vertices",
     "bl_set_node_property",
     "bl_spin_mesh"
    ],
    "requires": [
     "blender_core"
+   ],
+   "makes": [
+    "road",
+    "racetrack",
+    "raceway",
+    "circuit",
+    "highway"
    ],
    "rules": [
     {
@@ -894,6 +850,7 @@
     "bl_pose_coverage",
     "bl_push_out_for_poses",
     "bl_recipe_fit_outfit",
+    "bl_refine_hands",
     "bl_rigify_snap",
     "bl_set_armature_properties",
     "bl_set_bone_collections",
@@ -1048,7 +1005,6 @@
     "bl_build_collar",
     "bl_build_rib",
     "bl_build_sole",
-    "bl_collect_vdb_frames",
     "bl_create_curves",
     "bl_create_force_field",
     "bl_displace_by_rule",
@@ -1146,10 +1102,12 @@
    "tools": [
     "bl_add_strip",
     "bl_build_tracking_scene",
+    "bl_collect_vdb_frames",
     "bl_compare_to_reference",
     "bl_compose_atlas",
     "bl_create_mask",
     "bl_create_view_layer",
+    "bl_create_volume",
     "bl_delete_view_layer",
     "bl_edit_clip_tracks",
     "bl_edit_strip",
@@ -1171,6 +1129,7 @@
     "bl_set_sequencer",
     "bl_set_stereo",
     "bl_set_view_layer",
+    "bl_solve_camera_from_reference",
     "bl_solve_clip",
     "bl_track_clip"
    ],
@@ -1237,40 +1196,22 @@
    ]
   },
   "blender_io": {
-   "title": "Blender: Import, Export & Generation",
-   "description": "Moving assets in and out: scene and mesh import/export, the game-ready recipe, the Blender-to-Unreal mesh round trip, and generated assets (gen_*). mif_send_to_unreal hands a model made in Blender to Unreal as a checked static mesh, or a whole kit in one call.",
+   "title": "Blender: Import, Libraries & Generation",
+   "description": "Bringing assets in: scene and mesh import, linked libraries and overrides, asset libraries and marked assets, custom normals and mesh data carried across, and generated assets (gen_*). Exports and the hand-off to Unreal or UEFN are blender_handoff.",
    "backend": "blender",
    "tools": [
-    "bl_bake_pivot_painter",
-    "bl_bake_texture_set",
-    "bl_bake_vertex_animation",
-    "bl_coplanar_overlaps",
-    "bl_create_volume",
-    "bl_export_actions",
-    "bl_export_camera",
-    "bl_export_groom",
-    "bl_export_material_textures",
-    "bl_export_mesh",
-    "bl_export_scene",
-    "bl_export_vertex_positions",
     "bl_gen_asset",
     "bl_gen_image",
     "bl_gen_mesh",
     "bl_gen_status",
     "bl_gen_texture",
-    "bl_hair_to_cards",
-    "bl_heightmap_from_mesh",
     "bl_import_mesh",
     "bl_import_scene",
     "bl_library_override",
     "bl_list_asset_libraries",
     "bl_list_libraries",
     "bl_mark_asset",
-    "bl_material_from_maps",
-    "bl_mesh_from_heightmap",
-    "bl_recipe_game_ready",
     "bl_set_asset_library",
-    "bl_set_collection_exporter",
     "bl_set_custom_normals",
     "bl_set_library",
     "bl_transfer_mesh_data"
@@ -1285,6 +1226,72 @@
       "bl_import_mesh"
      ]
     },
+    {
+     "rule": "bl_gen_image, bl_gen_mesh, bl_gen_texture and bl_gen_asset block Blender for the whole ComfyUI job (minutes). In an interactive Blender a job longer than the add-on's job timeout (150 s default) errors while generation goes on: raise it, run one job at a time, don't retry blind.",
+     "tools": [
+      "bl_gen_image",
+      "bl_gen_mesh",
+      "bl_gen_texture",
+      "bl_gen_asset"
+     ]
+    },
+    {
+     "rule": "bl_gen_image appends a fixed product-shot suffix to every prompt (single object, plain background, whole object in frame): it makes reference images for mesh generation, not tiling textures or scenes. bl_gen_texture paints an existing mesh and needs the image it came from.",
+     "tools": [
+      "bl_gen_image",
+      "bl_gen_texture"
+     ]
+    },
+    {
+     "rule": "bl_gen_status, bl_gen_image, bl_gen_mesh, bl_gen_texture and bl_gen_asset reach ComfyUI at `host`, else Blender's MIF_COMFY_HOST, else 127.0.0.1:8188. Off this machine, Blender's MIF_COMFY_HOST or MIF_COMFY_ALLOW_REMOTE must name it. The MCP server's environment is never read.",
+     "tools": [
+      "bl_gen_status",
+      "bl_gen_image",
+      "bl_gen_mesh",
+      "bl_gen_texture",
+      "bl_gen_asset"
+     ]
+    },
+    {
+     "rule": "Before a session's first bl_gen_image, bl_gen_mesh, bl_gen_texture or bl_gen_asset, tell the person the license terms of the model it runs and that following them is their responsibility; bl_gen_status's license block has all three. MifBridge checks no location.",
+     "tools": [
+      "bl_gen_status",
+      "bl_gen_image",
+      "bl_gen_mesh",
+      "bl_gen_texture",
+      "bl_gen_asset"
+     ]
+    }
+   ]
+  },
+  "blender_handoff": {
+   "title": "Blender: Export & Hand-off",
+   "description": "Sending assets out: mesh and scene export, animation clips, a material's textures, cameras, hair, the game-ready recipe, game-asset bakes, the UEFN check and export, and the Blender-Unreal bridge both ways. mif_send_to_unreal hands a model made in Blender to Unreal as a checked static mesh, or a whole kit in one call.",
+   "backend": "blender",
+   "tools": [
+    "bl_bake_pivot_painter",
+    "bl_bake_texture_set",
+    "bl_bake_vertex_animation",
+    "bl_coplanar_overlaps",
+    "bl_export_actions",
+    "bl_export_camera",
+    "bl_export_groom",
+    "bl_export_material_textures",
+    "bl_export_mesh",
+    "bl_export_scene",
+    "bl_export_vertex_positions",
+    "bl_hair_to_cards",
+    "bl_heightmap_from_mesh",
+    "bl_material_from_maps",
+    "bl_mesh_from_heightmap",
+    "bl_recipe_game_ready",
+    "bl_set_collection_exporter",
+    "bl_uefn_check"
+   ],
+   "requires": [
+    "blender_core"
+   ],
+   "rules": [
     {
      "rule": "bl_export_mesh bakes every enabled modifier into the FBX (use_mesh_modifiers is on by default), and any enabled modifier other than an exported rig's Armature drops the mesh's shape keys. bl_export_scene to glTF/GLB does the opposite: no modifiers unless apply_modifiers=True.",
      "tools": [
@@ -1310,48 +1317,6 @@
       "bl_object_info",
       "bl_recipe_game_ready"
      ]
-    },
-    {
-     "rule": "mif_mesh_roundtrip deletes every object in the connected Blender file (its import clears file-wide), even with dry_run=True. Its defaults suit a road tile - extrude_skirt on the Y boundary edges, preserve_x on, 15 uu - so pass edit, selector and preserve_x for anything else.",
-     "tools": [
-      "mif_mesh_roundtrip"
-     ]
-    },
-    {
-     "rule": "bl_gen_image, bl_gen_mesh, bl_gen_texture and bl_gen_asset block Blender for the whole ComfyUI job (minutes). In an interactive Blender a job longer than the add-on's job timeout (150 s default) errors while generation goes on: raise it, run one job at a time, don't retry blind.",
-     "tools": [
-      "bl_gen_image",
-      "bl_gen_mesh",
-      "bl_gen_texture",
-      "bl_gen_asset"
-     ]
-    },
-    {
-     "rule": "bl_gen_image appends a fixed product-shot suffix to every prompt (single object, plain background, whole object in frame): it makes reference images for mesh generation, not tiling textures or scenes. bl_gen_texture paints an existing mesh and needs the image it came from.",
-     "tools": [
-      "bl_gen_image",
-      "bl_gen_texture"
-     ]
-    },
-    {
-     "rule": "bl_gen_status, bl_gen_image, bl_gen_mesh, bl_gen_texture and bl_gen_asset reach ComfyUI at `host`, else MIF_COMFY_HOST from BLENDER's environment, else 127.0.0.1:8188 - the MCP server's environment is never read. Pass host on every call when ComfyUI is elsewhere.",
-     "tools": [
-      "bl_gen_status",
-      "bl_gen_image",
-      "bl_gen_mesh",
-      "bl_gen_texture",
-      "bl_gen_asset"
-     ]
-    },
-    {
-     "rule": "Before a session's first bl_gen_image, bl_gen_mesh, bl_gen_texture or bl_gen_asset, tell the person the license terms of the model it runs and that following them is their responsibility; bl_gen_status's license block has all three. MifBridge checks no location.",
-     "tools": [
-      "bl_gen_status",
-      "bl_gen_image",
-      "bl_gen_mesh",
-      "bl_gen_texture",
-      "bl_gen_asset"
-     ]
     }
    ]
   }
@@ -1370,7 +1335,8 @@
    "blender_sculpt",
    "blender_physics",
    "blender_render",
-   "blender_io"
+   "blender_io",
+   "blender_handoff"
   ]
  }
 }

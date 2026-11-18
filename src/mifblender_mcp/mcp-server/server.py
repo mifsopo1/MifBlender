@@ -10,7 +10,8 @@ mif_enable_pack, mif_list_packs and run_python work as they do in MifBridge.
 Config (environment):
   MIF_BLENDER_HOST  default 127.0.0.1
   MIF_BLENDER_PORT  default 8792   (the add-on's port; NOT 9876, the third-party blender-mcp add-on's)
-  MIF_BLENDER_TOKEN default "dev"  (must match the add-on's token)
+  MIF_BLENDER_TOKEN default: the add-on's per-install token, read from MIF_BLENDER_TOKEN_FILE or
+                    ~/.mifbridge/blender_token, then "dev". Set it only for the add-on's Custom token.
   MIF_BLENDER_CONNECT_TIMEOUT default 3    (seconds)
   MIF_BLENDER_PROBE_TIMEOUT   default 5    (seconds; bl_status only)
   MIF_BLENDER_TIMEOUT         default 180  (seconds; geometry work)
@@ -112,7 +113,79 @@ try:
     BLENDER_PORT = int(os.environ.get("MIF_BLENDER_PORT", "8792"))
 except ValueError:
     BLENDER_PORT = 8792
-BLENDER_TOKEN = os.environ.get("MIF_BLENDER_TOKEN", TOKEN)
+# THE BLENDER TOKEN (1.4, FOUND 2026-11-11 in a code review): MifBlender shipped with "dev", the value every doc named,
+# with run_python on. A GUI Blender now makes a random token per install and keeps it in a per-user file
+# (MifBlender/token_store.py: MIF_BLENDER_TOKEN_FILE, else ~/.mifbridge/blender_token - _bl_token_file resolves the same
+# path, and the two must stay in sync; the token suite's BT100 checks it). This server tries, in order: a token its
+# environment names (MIF_BLENDER_TOKEN, else MIF_BRIDGE_TOKEN - one secret for both backends - unless that is the old
+# default "dev"), the file's token, then "dev" (a headless Blender a script serves keeps it). A Blender refuses a wrong
+# token before it runs anything (code bad_token), so the next one is sent at once and the one that worked is kept. A
+# config that still says MIF_BLENDER_TOKEN=dev or MIF_BRIDGE_TOKEN=dev therefore keeps working with no change, and a
+# configured secret that was refused while another token worked is said once in the reply (_BL_TOKEN_NOTE).
+_LEGACY_BLENDER_TOKEN = "dev"
+
+
+def _bl_token_file() -> str:
+    raw = (os.environ.get("MIF_BLENDER_TOKEN_FILE") or "").strip()
+    if raw:
+        return os.path.abspath(os.path.expanduser(raw))
+    return os.path.join(os.path.expanduser("~"), ".mifbridge", "blender_token")
+
+
+def _bl_file_token():
+    """The per-install token MifBlender wrote, or None (no file yet, or not a usable token). Read on every use: a
+    Blender started after this server makes the file then."""
+    try:
+        with open(_bl_token_file(), "r", encoding="utf-8") as fh:
+            tok = fh.read().strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return tok if len(tok) >= 16 and all(" " < c <= "~" for c in tok) else None
+
+
+def _bl_configured_token():
+    """(token, the variable it came from) when this server's environment names one that is not the old default."""
+    for var in ("MIF_BLENDER_TOKEN", "MIF_BRIDGE_TOKEN"):
+        val = os.environ.get(var)
+        if val is not None:
+            return (None, None) if val == _LEGACY_BLENDER_TOKEN else (val, var)
+    return None, None
+
+
+def _bl_tokens() -> list:
+    """Every token worth sending, in order: the configured one, the file's, the old default. Never empty."""
+    configured, _var = _bl_configured_token()
+    out = []
+    for t in (configured, _bl_file_token(), _LEGACY_BLENDER_TOKEN):
+        if t is not None and t not in out:
+            out.append(t)
+    return out
+
+
+def _bl_token_refused(data) -> bool:
+    """A Blender's refusal of the token: code bad_token (1.4) or an older add-on's words. Nothing ran."""
+    return (isinstance(data, dict) and data.get("ok") is False
+            and (data.get("code") == "bad_token" or str(data.get("error") or "").startswith("bad or missing token")))
+
+
+BLENDER_TOKEN = _bl_tokens()[0]
+_BL_TOKEN_NOTE = {"pending": None}
+
+
+def _bl_token_help(data, sent):
+    """The last refusal, with what this server sent (by source, never the value) and how to make them agree."""
+    out = dict(data) if isinstance(data, dict) else {"ok": False}
+    configured, var = _bl_configured_token()
+    sources = (["%s from this server's environment" % var] if configured is not None else []) + (
+        ["the per-install token in %s" % _bl_token_file()] if _bl_file_token() else []) + ["the old default 'dev'"]
+    out["error"] = (
+        "%s. This server sent %d token(s) - %s - and the Blender at %s:%d refused each; nothing ran. With the add-on's "
+        "Token preference on Per-install, the token is in its token file (the add-on preferences show the path), which "
+        "this server reads when MIF_BLENDER_TOKEN is unset or 'dev' - a server and a Blender run as different users, or "
+        "with different MIF_BLENDER_TOKEN_FILE, read different files. With Custom, set MIF_BLENDER_TOKEN to the same "
+        "value in this server's config." % (str(out.get("error") or "bad token").rstrip("."), sent, "; ".join(sources),
+                                             BLENDER_HOST, BLENDER_PORT))
+    return out
 # GENERATIVE TOOLS ARE ON BY DEFAULT, AND EACH PROJECT CHOOSES (2026-10-01, reversing the same day's
 # non-generative default). The bl_gen_* tools are the only ones that run a trained model (Flux and Hunyuan3D-2, through
 # a ComfyUI the user runs). MIF_GENERATIVE=off here switches them off for every project this server touches; the
@@ -264,7 +337,7 @@ def _compact_blocks(blocks):
 
 # LOADED WITHOUT A SEARCH. Claude Code defers every MCP tool behind its ToolSearch unless the tool's _meta carries
 # "anthropic/alwaysLoad" (code.claude.com/docs/en/mcp.md), so a session on core - the default since e4e86226 - could
-# not call even these without a lookup first. the benchmark's round three measured it: every Blender run spent its first two
+# not call even these without a lookup first. Benchmark round three measured it: every Blender run spent its first two
 # requests on ToolSearch -> find_tools -> mif_call to reach bl_run_python, and find_tools' answers were 52.6% of what
 # those runs carried (docs/TOKEN_OPTIMIZATION.md 2.6). These are what a default session reaches for first, so they come
 # up front: 1,195 characters, ~528 tokens a request (measured), against a lookup request of 5-8k. Everything else stays
@@ -799,6 +872,25 @@ def _hs_report(backend: str) -> dict:
     return {"backend": backend, "verdict": None, "agree": None,
             "pending": "not read yet - the handshake runs at the end of the first call that reaches it"}
 
+
+def _listening_pid(port: int):
+    """The PID listening on 127.0.0.1:<port> (or any address), from the OS TCP table; None when unknown. Windows only."""
+    import ctypes
+    from ctypes import wintypes
+    iphlp = ctypes.WinDLL("iphlpapi")
+    size = wintypes.DWORD(0)
+    AF_INET, TCP_TABLE_OWNER_PID_LISTENER = 2, 3
+    iphlp.GetExtendedTcpTable(None, ctypes.byref(size), False, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0)
+    buf = ctypes.create_string_buffer(size.value + 4096)
+    if iphlp.GetExtendedTcpTable(buf, ctypes.byref(size), False, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0) != 0:
+        return None
+    count = struct.unpack_from("<I", buf, 0)[0]
+    for i in range(count):
+        _state, _addr, lport, _raddr, _rport, pid = struct.unpack_from("<6I", buf, 4 + i * 24)
+        if socket.ntohs(lport & 0xFFFF) == port:
+            return pid
+    return None
+
 # Each endpoint's (bucket, writeGated, access), read once a session from self_audit's rows (_ue_buckets_after_call), keyed
 # by base url. A timeout says a call's outcome is unknown unless the endpoint is known not to write: its access is read or
 # observe (the plugin's safety table, docs/34_SAFETY_CLASSIFICATION.md). A plugin older than the access column is judged as
@@ -914,18 +1006,25 @@ def _bl_registered(alive_only=True):
 
 def _bl_probe(port: int, timeout: float = 2.0) -> dict:
     """One ping on its own socket to 127.0.0.1:port - the handshake that proves a listener is a MifBlender that takes our
-    token. Never touches the session's socket. {"ok": False, "error"} when it does not answer."""
-    frame = json.dumps({"endpoint": "ping", "token": BLENDER_TOKEN, "params": {}}).encode("utf-8")
-    try:
-        with socket.create_connection((BLENDER_HOST, int(port)), timeout=timeout) as s:
-            s.settimeout(timeout)
-            s.sendall(struct.pack(_BL_HDR_FMT, len(frame)) + frame)
-            (length,) = struct.unpack(_BL_HDR_FMT, _bl_recv_exact(s, _BL_HDR_SIZE))
-            if length > _BL_MAX_FRAME:
-                return {"ok": False, "error": "frame too large"}
-            return json.loads(_bl_recv_exact(s, length).decode("utf-8"))
-    except (OSError, ValueError, ConnectionError) as exc:
-        return {"ok": False, "error": str(exc)}
+    token. Never touches the session's socket. {"ok": False, "error"} when it does not answer. Each token _bl_tokens
+    names is tried in turn on a refusal, the session's current one first."""
+    tokens = [BLENDER_TOKEN] + [t for t in _bl_tokens() if t != BLENDER_TOKEN]
+    out = {"ok": False, "error": "no token to send"}
+    for tok in tokens:
+        frame = json.dumps({"endpoint": "ping", "token": tok, "params": {}}).encode("utf-8")
+        try:
+            with socket.create_connection((BLENDER_HOST, int(port)), timeout=timeout) as s:
+                s.settimeout(timeout)
+                s.sendall(struct.pack(_BL_HDR_FMT, len(frame)) + frame)
+                (length,) = struct.unpack(_BL_HDR_FMT, _bl_recv_exact(s, _BL_HDR_SIZE))
+                if length > _BL_MAX_FRAME:
+                    return {"ok": False, "error": "frame too large"}
+                out = json.loads(_bl_recv_exact(s, length).decode("utf-8"))
+        except (OSError, ValueError, ConnectionError) as exc:
+            return {"ok": False, "error": str(exc)}
+        if not _bl_token_refused(out):
+            return out
+    return out
 
 
 def _bl_listener_row(r, probe=None):
@@ -1024,6 +1123,17 @@ def _bl_busy_error(op: str, waited: float) -> dict:
         "modal operator or an open file browser and needs clearing by hand.")}
 
 
+# WHAT TO DO OVER THE FRAME CAP, BY OP (FOUND 2026-11-09): the refusal told every op to "pass a file path", and
+# bl_create_mesh, the op a big mesh meets it on, had no file parameter. A route is named only where the op has one.
+_BL_FRAME_ROUTES = {
+    "create_mesh": "Write vertices, faces and the other geometry keys to a .json or .npz and pass file= on "
+                   "bl_create_mesh instead (mif_help('bl_create_mesh') has the layout; the file bl_read_mesh_data "
+                   "writes is one).",
+    "set_mesh_vertices": "Pass file= on bl_set_mesh_vertices instead: the .json or .npz bl_read_mesh_data writes.",
+}
+_BL_FRAME_ROUTE_DEFAULT = "This op reads no file of its data: split the work into smaller calls."
+
+
 def _blender(op: str, /, _timeout: float = None, _lock_timeout: float = None, _job_timeout: float = None,
              **params) -> dict:
     """Send one framed op to the MifBlender addon and return its JSON verbatim.
@@ -1036,7 +1146,7 @@ def _blender(op: str, /, _timeout: float = None, _lock_timeout: float = None, _j
     for argument 'op'" on EVERY call through MCP - since the tool was added on 2026-09-08, while the
     server instructions and every Blender pack prompt named it as the authority on an op's
     parameters. Its tests spoke to the add-on directly, so none of them went through this function.
-    The benchmark caught it: 5 agent calls, 5 failures (docs/TOKEN_OPTIMIZATION.md).
+    A benchmark caught it: 5 agent calls, 5 failures (docs/TOKEN_OPTIMIZATION.md).
 
     _lock_timeout bounds the wait for the transport lock (NOT the read). Omit it
     and the call queues behind whatever is in flight, which is right for real
@@ -1045,7 +1155,7 @@ def _blender(op: str, /, _timeout: float = None, _lock_timeout: float = None, _j
     full 180s work timeout - the one tool you reach for when Blender is stuck was
     the one tool made unavailable by Blender being stuck.
     """
-    global _BL_INFLIGHT
+    global _BL_INFLIGHT, BLENDER_TOKEN
     refused = _generative_refusal(op, params)
     if refused:
         return refused        # before the socket: a refused generative call never reaches Blender, let alone ComfyUI
@@ -1076,7 +1186,7 @@ def _blender(op: str, /, _timeout: float = None, _lock_timeout: float = None, _j
     if len(payload) > _BL_MAX_FRAME:
         return {"ok": False, "error": (
             f"request for Blender op '{op}' is {len(payload)} bytes, over the {_BL_MAX_FRAME}-byte "
-            "frame cap. Pass a file path rather than inline geometry.")}
+            f"frame cap. NOTHING was sent. {_BL_FRAME_ROUTES.get(op, _BL_FRAME_ROUTE_DEFAULT)}")}
     header = struct.pack(_BL_HDR_FMT, len(payload))
 
     # Bounded acquire ONLY when the caller asked for one. threading.Lock.acquire
@@ -1089,52 +1199,68 @@ def _blender(op: str, /, _timeout: float = None, _lock_timeout: float = None, _j
         return _bl_busy_error(op, time.monotonic() - waited)
     _BL_INFLIGHT = (op, time.monotonic())
     try:
-        frame["deadline"] = round(time.time() + read_timeout, 3)
-        payload = json.dumps(frame).encode("utf-8")
-        header = struct.pack(_BL_HDR_FMT, len(payload))
-        # The retry covers the SEND phase only, and only on a socket we reused.
-        # A send that fails on a keep-alive socket means the frame never landed
-        # whole, so the op cannot have run: reconnecting and resending is safe.
-        # A failure after the send is NEVER retried - the op may already have
-        # mutated the scene, and re-running a bevel would bevel twice.
-        sock = None
-        for attempt in (0, 1):
-            reused = _BL_SOCK is not None
-            try:
-                sock = _bl_connect()
-            except OSError as exc:
-                _bl_close()
-                return _bl_unreachable(exc)
-            try:
-                sock.settimeout(BLENDER_CONNECT_TIMEOUT)
-                sock.sendall(header + payload)
-            except OSError as exc:
-                _bl_close()
-                if reused and attempt == 0:
-                    _log("bl--", op, "stale keep-alive socket, reconnecting")
-                    continue
-                return _bl_unreachable(exc)
-            break
+        # A REFUSED TOKEN IS SENT AGAIN WITH THE NEXT ONE (1.4, see BLENDER_TOKEN): the add-on checks the token before
+        # it runs anything and closes the socket, so a resend cannot run the op twice.
+        tried = []
+        while True:
+            frame["token"] = BLENDER_TOKEN
+            frame["deadline"] = round(time.time() + read_timeout, 3)
+            payload = json.dumps(frame).encode("utf-8")
+            header = struct.pack(_BL_HDR_FMT, len(payload))
+            # The retry covers the SEND phase only, and only on a socket we reused.
+            # A send that fails on a keep-alive socket means the frame never landed
+            # whole, so the op cannot have run: reconnecting and resending is safe.
+            # A failure after the send is NEVER retried - the op may already have
+            # mutated the scene, and re-running a bevel would bevel twice.
+            sock = None
+            for attempt in (0, 1):
+                reused = _BL_SOCK is not None
+                try:
+                    sock = _bl_connect()
+                except OSError as exc:
+                    _bl_close()
+                    return _bl_unreachable(exc)
+                try:
+                    sock.settimeout(BLENDER_CONNECT_TIMEOUT)
+                    sock.sendall(header + payload)
+                except OSError as exc:
+                    _bl_close()
+                    if reused and attempt == 0:
+                        _log("bl--", op, "stale keep-alive socket, reconnecting")
+                        continue
+                    return _bl_unreachable(exc)
+                break
 
-        try:
-            sock.settimeout(read_timeout)
-            (length,) = struct.unpack(_BL_HDR_FMT, _bl_recv_exact(sock, _BL_HDR_SIZE))
-            if length > _BL_MAX_FRAME:
-                raise ValueError(f"frame header claims {length} bytes, over the {_BL_MAX_FRAME} cap")
-            data = json.loads(_bl_recv_exact(sock, length).decode("utf-8"))
-        except socket.timeout:
+            try:
+                sock.settimeout(read_timeout)
+                (length,) = struct.unpack(_BL_HDR_FMT, _bl_recv_exact(sock, _BL_HDR_SIZE))
+                if length > _BL_MAX_FRAME:
+                    raise ValueError(f"frame header claims {length} bytes, over the {_BL_MAX_FRAME} cap")
+                data = json.loads(_bl_recv_exact(sock, length).decode("utf-8"))
+            except socket.timeout:
+                _bl_close()
+                return {"ok": False, "error": (
+                    f"Blender read timeout after {read_timeout}s on '{op}'. NOT retried: the operation "
+                    "may have run to completion. Blender's main thread is blocked - a modal operator, "
+                    "an open file browser or a render will do it. Dismiss it and call bl_status. Raise "
+                    "MIF_BLENDER_TIMEOUT for a genuinely long geometry op. If it had not started by now, it never "
+                    "will: the add-on refuses a request that reaches it after this deadline.")}
+            except (OSError, ValueError, UnicodeDecodeError) as exc:
+                _bl_close()
+                return {"ok": False, "error": (
+                    f"Blender transport error on '{op}': {exc}. The connection was dropped; the next "
+                    "call reconnects. Check Blender's system console for an addon traceback.")}
+            if not _bl_token_refused(data):
+                break
+            tried.append(BLENDER_TOKEN)
+            nxt = next((t for t in _bl_tokens() if t not in tried), None)
             _bl_close()
-            return {"ok": False, "error": (
-                f"Blender read timeout after {read_timeout}s on '{op}'. NOT retried: the operation "
-                "may have run to completion. Blender's main thread is blocked - a modal operator, "
-                "an open file browser or a render will do it. Dismiss it and call bl_status. Raise "
-                "MIF_BLENDER_TIMEOUT for a genuinely long geometry op. If it had not started by now, it never "
-                "will: the add-on refuses a request that reaches it after this deadline.")}
-        except (OSError, ValueError, UnicodeDecodeError) as exc:
-            _bl_close()
-            return {"ok": False, "error": (
-                f"Blender transport error on '{op}': {exc}. The connection was dropped; the next "
-                "call reconnects. Check Blender's system console for an addon traceback.")}
+            if nxt is None:
+                data = _bl_token_help(data, len(tried))
+                break
+            if tried[0] == _bl_configured_token()[0] and _bl_configured_token()[1] == "MIF_BLENDER_TOKEN":
+                _BL_TOKEN_NOTE["pending"] = "MIF_BLENDER_TOKEN"     # MIF_BRIDGE_TOKEN is Unreal's too: never told to drop it
+            BLENDER_TOKEN = nxt
     finally:
         _BL_INFLIGHT = None
         _BL_LOCK.release()
@@ -1142,6 +1268,13 @@ def _blender(op: str, /, _timeout: float = None, _lock_timeout: float = None, _j
     if not isinstance(data, dict):
         return {"ok": False, "error": f"Blender returned a non-object response for '{op}': {data!r:.300}"}
     _log("bl<-", op, data)
+    if _BL_TOKEN_NOTE["pending"]:
+        # SAID ONCE: the token this server was configured with was refused and another worked
+        data["tokenNote"] = ("%s in this server's environment was refused by this Blender; the per-install token (%s) "
+                             "or the old default worked and is used from now on. Remove %s from this server's config, "
+                             "or set it to the add-on's Custom token." % (_BL_TOKEN_NOTE["pending"], _bl_token_file(),
+                                                                          _BL_TOKEN_NOTE["pending"]))
+        _BL_TOKEN_NOTE["pending"] = None
     _bl_mode_seen(op, data)            # the open .blend's mode: read once per file (_project_mode_after_call)
     _hs_seen_blender(op, data)         # the version handshake: a ping is read in place, a fresh socket makes it due
     _gen_license_after(op, body, data)  # the license block: which models this call ran, and their terms
@@ -1151,7 +1284,7 @@ def _blender(op: str, /, _timeout: float = None, _lock_timeout: float = None, _j
 # AN OP INSIDE A BATCH TAKES THE NAMES ITS OWN TOOL ADVERTISES. Each tool renames its parameters on the way out -
 # add_tree_widget's blueprint_id reaches Unreal as blueprintId, bl_apply_transform's object_name reaches Blender as
 # object - but batch and bl_batch forwarded their ops verbatim, so an agent writing an op the way the tool list had just
-# taught it was refused: 13 failed batch calls in the benchmark's UMG and material runs, and bl_batch's apply_transform in the
+# taught it was refused: 13 failed batch calls in a benchmark's UMG and material runs, and bl_batch's apply_transform in the
 # bracket runs, each costing a whole request (docs/TOKEN_OPTIMIZATION.md). The map is READ OFF THE TOOL'S OWN CALL to
 # _post / _blender, never written by hand, so it cannot drift from what the tool itself sends. Only a name its tool
 # renames is changed: a backend name (the camelCase Unreal reads) passes untouched, and anything the backend does not
@@ -1179,10 +1312,19 @@ def _source_of(fn) -> str:
     return inspect.getsource(fn)
 
 
+# A PARAMETER TWO CALLS OF ONE TOOL SEND UNDER DIFFERENT KEYS (1.4, FOUND 2026-11-11). Until then a tool that posted its
+# op more than once - a copy mode, a preview commit - got NO map at all, so bl_batch passed the snake_case keys of 24
+# bl_ tools through untranslated and the add-on refused them (bl_add_modifier, bl_apply_modifier, bl_bevel_edges, ...).
+# The pairs now merge across every call; only a parameter that two calls really send under different keys stays out
+# of the map, recorded here as {(backend, op): {param: [keys]}} so the payload contract suite's P116 can pin it empty.
+_OP_PARAM_CONFLICTS = {}
+
+
 def _op_param_names(backend: str, op: str) -> dict:
     """{tool parameter: backend key} for the tool that wraps `op` - the tool named `op` for Unreal, `bl_<op>` for
-    Blender - read off that tool's single call to its transport. Empty when there is no such tool, or it posts `op`
-    more than once (no one map would be right), or its source cannot be read."""
+    Blender - read off every call that tool makes to its transport for `op`, merged. A parameter two calls send under
+    different keys maps to neither (_OP_PARAM_CONFLICTS names it). Empty when there is no such tool, or its source
+    cannot be read."""
     key = (backend, op)
     if key in _OP_PARAM_NAMES:
         return _OP_PARAM_NAMES[key]
@@ -1200,9 +1342,10 @@ def _op_param_names(backend: str, op: str) -> dict:
     calls = [] if node is None else [
         n for n in ast.walk(node) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
         and n.func.id == transport and n.args and isinstance(n.args[0], ast.Constant) and n.args[0].value == op]
-    if len(calls) == 1:
+    seen = {}                                             # param -> every backend key any call sends it under
+    for call in calls:
         pairs = []
-        for kw in calls[0].keywords:
+        for kw in call.keywords:
             if kw.arg is not None:
                 pairs.append((kw.arg, kw.value))
             elif isinstance(kw.value, ast.Dict):          # **{"class": cls or None}
@@ -1211,7 +1354,13 @@ def _op_param_names(backend: str, op: str) -> dict:
         for backend_key, value in pairs:
             used = {n.id for n in ast.walk(value) if isinstance(n, ast.Name) and n.id in params}
             if len(used) == 1:                            # a value built from two parameters maps neither
-                names[used.pop()] = backend_key
+                seen.setdefault(used.pop(), set()).add(backend_key)
+    conflicts = {p: sorted(ks) for p, ks in seen.items() if len(ks) > 1}
+    names = {p: next(iter(ks)) for p, ks in seen.items() if len(ks) == 1}
+    if conflicts:
+        _OP_PARAM_CONFLICTS[key] = conflicts
+    else:
+        _OP_PARAM_CONFLICTS.pop(key, None)
     _OP_PARAM_NAMES[key] = names
     return names
 
@@ -1241,7 +1390,7 @@ def _bl_tool_op(tool: str):
 
 
 # A BATCH REPLY THE AGENT CANNOT SEE IS WORSE THAN A SHORT ONE. Each op's full read-back rides in results[], and a
-# read-back can list the whole action (bl_set_keyframe reports every F-curve on it), so the benchmark's walk cycles sent
+# read-back can list the whole action (bl_set_keyframe reports every F-curve on it), so a benchmark's walk cycles sent
 # bl_batch replies of 67,686 to 253,721 characters - 11 of them in 5 of 6 runs. Claude Code refuses a tool result over
 # 25,000 tokens and shows the agent an error instead, so it saw NOTHING of those batches, failures included, and spent
 # requests reading the state back (docs/TOKEN_OPTIMIZATION.md). Over the line, each op that SUCCEEDED keeps its names,
@@ -1251,7 +1400,7 @@ _BATCH_SHOW_CHARS = 24000
 
 # A NOTE REPEATED ON EVERY OP IS SAID ONCE. Some ops attach an explanatory note to every result - set_keyframe's
 # valueNote, set_bone_pose's constrainedNote, transform_object's bakedNote - so a batch of ninety keyframes carried the
-# same sentence ninety times: 37,207 characters over the 105 the benchmark runs on 11baf1c7 (docs/TOKEN_OPTIMIZATION.md
+# same sentence ninety times: 37,207 characters over the 105 benchmark runs on 11baf1c7 (docs/TOKEN_OPTIMIZATION.md
 # 2.5). A note - a string field named *Note, 40 characters or more - that repeats word for word across the succeeded
 # ops of one op type moves to sharedNotes once, with the rows it came from. A failed op keeps everything, a note on one
 # op stays where it is, and only *Note fields move, so every value an op returned is still on its own row.
@@ -1310,6 +1459,17 @@ def _batch_results_refusal(results):
 def _errors_only(res):
     """A batch reply with each succeeded op reduced to {index, op, ok}; failed ops untouched; the omission counted."""
     rows = res.get("results") if isinstance(res, dict) else None
+    # A BATCH THAT WROTE NOTHING IS ITSELF THE ERROR (FOUND 2026-11-09): over the change cap the batch answers a dry run
+    # with results [], and under results='errors' an empty list read as "nothing failed" - a build rendered empty frames
+    # for a round. The batch's own refusal is put in results, so the list is never empty when nothing was written.
+    if isinstance(res, dict) and res.get("ok") is False and not rows:
+        row = {"index": None, "op": "batch", "ok": False, "error": res.get("error"),
+               "nothingWritten": bool(res.get("nothingWritten") or res.get("dryRun") or res.get("capped"))}
+        if res.get("previewId"):
+            row["previewId"] = res.get("previewId")
+        return dict(res, results=[row], resultsOmitted=0,
+                    resultsOmittedNote="results='errors': the batch itself was refused and ran no op; its refusal is "
+                                       "the one row.")
     if not isinstance(rows, list):
         return res
     kept, omitted = [], 0
@@ -1433,20 +1593,41 @@ _TOOL_SPELLINGS = {
     "reverse_anim_sequence": {"new_path": "output_path"},
     "bake_locomotion": {"new_path": "output_path"},
     "plan_side_steps": {"new_path": "output_path"},
+    # THE SPELLINGS AGENTS REACH FOR (FOUND 2026-11-09): find_tools(query=), bl_delete_object(name=) and
+    # bl_open_file(file_path=) or (path=) each cost a refused request late in a long build.
+    "find_tools": {"query": "keyword"},
+    "bl_delete_object": {"name": "object_name"},
+    "bl_open_file": {"file_path": "filepath", "path": "filepath"},
 }
+# A BLENDER OBJECT IS `object` IN 199 bl_ TOOLS AND `object_name` IN 24 (bl_delete_object, bl_object_info,
+# bl_export_mesh, bl_add_modifier among them), so the last tool's spelling was the wrong one for the next (FOUND
+# 2026-11-09). mif_call already swapped the two; a direct call now takes either as well. Not in docs-first mode, where
+# mif_call leaves the guess to the refusal (2.13).
+_BL_SPELLING_PAIRS = (("object", "object_name"), ("object_name", "object"))
+_BL_FILE_SPELLINGS = ("filepath", "file_path", "file")
 _PAIR_ALIAS_CACHE = {}
 
 
 def _pair_aliases(tool: str) -> dict:
-    """{alias: declared name} for `tool` from _SPELLING_PAIRS and its registered schema; {} for a bl_ tool or an unknown one."""
+    """{alias: declared name} for `tool` from _SPELLING_PAIRS (a bl_ tool: _BL_SPELLING_PAIRS) and its registered schema;
+    {} for an unknown one."""
     if tool in _PAIR_ALIAS_CACHE:
         return _PAIR_ALIAS_CACHE[tool]
     found = {}
     tools = getattr(getattr(globals().get("mcp"), "_tool_manager", None), "_tools", None)
-    entry = tools.get(tool) if isinstance(tools, dict) and not tool.startswith("bl_") else None
+    entry = tools.get(tool) if isinstance(tools, dict) else None
     if entry is not None:
         declared = set(((getattr(entry, "parameters", None) or {}).get("properties") or {}).keys())
-        for alias, name in _SPELLING_PAIRS + tuple((_TOOL_SPELLINGS.get(tool) or {}).items()):
+        pairs = (() if _DOCS_FIRST else _BL_SPELLING_PAIRS) if tool.startswith("bl_") else _SPELLING_PAIRS
+        if tool.startswith("bl_") and not _DOCS_FIRST:
+            # ONE FILE PATH, ANY OF ITS SPELLINGS (FOUND 2026-11-09: bl_save_file(file_path=) raised, it takes filepath,
+            # while bl_render_still takes file_path): a tool declaring exactly one of these takes the others for it.
+            # path counts only as an alias - a tool that declares path (a stroke's points) keeps its own meaning.
+            files = [k for k in _BL_FILE_SPELLINGS if k in declared]
+            if len(files) == 1:
+                pairs = pairs + tuple((alias, files[0]) for alias in _BL_FILE_SPELLINGS + ("path",)
+                                      if alias != files[0])
+        for alias, name in pairs + tuple((_TOOL_SPELLINGS.get(tool) or {}).items()):
             if name in declared and alias not in declared and alias not in found:
                 found[alias] = name
         _PAIR_ALIAS_CACHE[tool] = found
@@ -1465,6 +1646,8 @@ def _deprecated_renames(tool: str, args: dict):
         if old not in out:
             continue
         if new in out:
+            if tool.startswith("bl_") and old not in (_PARAM_ALIASES.get(tool) or {}):
+                continue                 # left for the unknown-parameter refusal, as mif_call refuses it (P120)
             both.append((old, new))
             continue
         out[new] = out.pop(old)
@@ -1786,6 +1969,30 @@ _FIND_INTENTS = (
     ((), ("roadmap",), False, ("mif_roadmap",)),
     (("mod",), ("plan", "step", "steps", "start", "how"), False, ("mif_roadmap",)),
     ((), ("plan", "step", "steps"), True, ("mif_roadmap",)),
+    # A MATERIAL'S GLOW IS A KEY, NOT A TOOL (FOUND 2026-11-09): "emission" found no material tool, since the keys sit in
+    # bl_set_material_properties' parameters as emissive and emissive_strength (_FIND_KEYS names them on the row)
+    ((), ("emission", "emissive", "glow", "emit", "emitting"), False, ("bl_set_material_properties",)),
+    # A BUNDLE OF CABLES IS A TUBE WITH STRANDS (FOUND 2026-11-09: find_tools('braid') found nothing)
+    ((), ("braid", "bundle", "strand", "cables", "wires", "rope"), False, ("bl_build_tube",)),
+    (("sleeve",), ("cable", "wire", "tube", "hose", "braid"), False, ("bl_build_tube",)),   # a cable sleeve, not a garment's
+    # AN ATTRIBUTE NODE IS A NODE TYPE (FOUND 2026-11-09): "material attribute node" found no node tool, though
+    # ShaderNodeAttribute through bl_add_group_node is how a material reads a mesh attribute
+    (("attribute",), ("material", "shader", "node"), False,
+     ("bl_add_group_node", "bl_set_node_property", "bl_list_group_nodes")),
+)
+# WHAT TO PASS, ON A ROW AN INTENT PINNED: (query words, any one of which, tool, the use). The row carries it as `use`, so a
+# search that landed on a tool by a word its name lacks also says which parameters that word means.
+_FIND_KEYS = (
+    (("emission", "emissive", "glow", "emit", "emitting"), "bl_set_material_properties",
+     "emissive [r, g, b] is the glow's color and emissive_strength its strength (the Principled BSDF's Emission Color "
+     "and Emission Strength)"),
+    (("attribute",), "bl_add_group_node",
+     "type='ShaderNodeAttribute' in group='material:<name>' with properties={'attribute_name': '<attribute>'} reads a "
+     "mesh attribute in a material; link its Color, Vector or Factor output with bl_link_group_nodes"),
+    (("attribute",), "bl_list_group_nodes", "values=True reads each input socket's value"),
+    (("braid", "bundle", "sleeve", "strand", "cables", "wires", "rope"), "bl_build_tube",
+     "strands (a count, or [{radius, offset, angle}]) with twist (turns per metre) lays the cables round one path as one "
+     "object; smooth_path=True curves it through the points; ends FLAT, ROUND or OPEN"),
 )
 _FIND_INTENT_GAME = ("player", "game", "pie", "play")   # what "needs the game" means: the game, not the editor
 
@@ -1858,7 +2065,7 @@ def _find_partial(words, name, desc):
 def _find_summary(name, desc):
     """A find_tools row's summary: the tool's served lead - the sentence the tool list itself shows, whole - instead
     of its first 200 characters, which cut mid-word ("... THE ADDON'S DEFAU...") and averaged 178 characters to the
-    lead's 128 over the 716 rows the benchmark's agents were shown (docs/TOKEN_OPTIMIZATION.md). The mif_help pointer is
+    lead's 128 over the 716 rows a benchmark's agents were shown (docs/TOKEN_OPTIMIZATION.md). The mif_help pointer is
     left off: every tool answers mif_help."""
     return _lead(name, " ".join((desc or "").split())).split(" Full notes: mif_help(")[0]
 
@@ -2142,7 +2349,60 @@ _FIND_FULL_ROWS = 15     # find_tools' default limit: a default answer is unchan
 @mcp.tool()
 def find_tools(keyword: str, limit: int = 15) -> dict:
     "Search every MifBridge tool, loaded here or not, by a keyword or a few words: each row gives the tool's summary and parameters, and an unloaded tool's pack."
-    return _find_tools(keyword, limit, True)
+    out = _find_tools(keyword, limit, True)
+    # UEFN (preview): Epic's 854 UEFN tools are reached through uefn_call, not registered one by one, so a search that
+    # names UEFN, Fortnite or Verse also gets the catalog's best matches - and no other search pays for them.
+    if isinstance(out, dict) and _re.search(r"(?i)\b(uefn|fortnite|verse)\b", keyword or ""):
+        try:
+            hits = _uefn().find_catalog(keyword, limit=8)
+            if hits.get("tools"):
+                out["uefnCatalog"] = hits
+        except Exception:  # noqa: BLE001 - the catalog is optional to a search
+            pass
+    return out
+
+
+# THE BACKEND A SEARCH COVERS. A Unity user must not be offered Unreal's tools, and an Unreal or Blender session must not start seeing uy_ tools: a search's rows are what an agent plans from.
+# IT IS IN THE KEYWORD, NOT A PARAMETER, on purpose: find_tools is always loaded, so a parameter costs every client on every request, and it took both ratchets over (F100 and P150, 28 characters).
+#   find_tools("backend:unity material")   backend:unreal, backend:blender, backend:unity, plus the tools no backend owns; backend:any lifts the filter
+#   find_tools("unity set property")       the word unity means backend:unity
+# With neither: everything but Unity, unless this session asked for Unity. A session whose selection is Unity alone (MIF_TOOL_PACKS=unity) is scoped to Unity by default.
+_FIND_BACKENDS = {"unreal": "ue", "ue": "ue", "blender": "blender", "unity": "unity", "any": None}
+_UNITY_SESSION = {"on": False, "only": False}
+
+
+def _find_backend_scope(q):
+    """(the query with any backend words taken out, a predicate over tool names or None, a refusal or None). Before any of this, a server with no Unity pack answers exactly as it always did."""
+    packs = _packs() or {}
+    of = {}
+    for pid, p in packs.items():
+        if pid != "__error__" and isinstance(p, dict):
+            for tn in p.get("tools") or []:
+                # core is "any" as a pack, and all but its neutral list talks to Unreal only (_core_unreal_tools)
+                of.setdefault(tn, "ue" if pid == "core" else p.get("backend"))
+    named = _re.search(r"(?:^|\s)backend:(\S*)", q)
+    if named and named.group(1) not in _FIND_BACKENDS:
+        return q, None, {"ok": False, "error": "backend:%s is not a backend. Use backend:unreal, backend:blender, backend:unity or backend:any." % named.group(1)}
+    if named:
+        q, want = (q[:named.start()] + " " + q[named.end():]).strip(), named.group(1)
+    elif "unity" in q.split() and any(b == "unity" for b in of.values()):
+        rest = " ".join(w for w in q.split() if w != "unity")
+        q, want = rest or q, "unity"
+    elif _UNITY_SESSION["only"]:
+        want = "unity"
+    else:
+        want = "any" if _UNITY_SESSION["on"] else None
+    if want == "any" or not any(b == "unity" for b in of.values()) and want is None:
+        return q, None, None
+    if want is None:
+        return q, (lambda name: of.get(name) != "unity"), None
+    code = _FIND_BACKENDS[want]
+    neutral = set((packs.get("core") or {}).get("neutral") or [])
+
+    def keep(name):
+        b = of.get(name)
+        return name in neutral or b == code or (code != "unity" and (b == "any" or b is None))
+    return q, keep, None
 
 
 def _find_tools(keyword, limit=15, probe=False):
@@ -2151,6 +2411,11 @@ def _find_tools(keyword, limit=15, probe=False):
     q = (keyword or "").strip().lower()
     if not q:
         return {"ok": False, "error": "keyword is required - a substring to search tool names/descriptions for."}
+    q, in_scope, refused = _find_backend_scope(q)
+    if refused:
+        return refused
+    if not q:
+        return {"ok": False, "error": "keyword is required as well as a backend - a substring to search tool names/descriptions for."}
     try:
         tools = mcp._tool_manager.list_tools()
     except Exception as e:
@@ -2172,6 +2437,8 @@ def _find_tools(keyword, limit=15, probe=False):
         desc = t.description or ""
         if t.name == "find_tools" or (t.name in _GEN_TOOLS and _gen_block()):
             continue   # the search tool itself is never the point; a gen tool is not offered while generation is off
+        if in_scope and not in_scope(t.name):
+            continue
         candidates.append((name, desc, t, False, None))
         rank = _rank(name, desc)
         if rank is None:
@@ -2198,6 +2465,8 @@ def _find_tools(keyword, limit=15, probe=False):
                 pack_of.setdefault(tn, pid)
     for name, fn in sorted(_UNLOADED.items()):
         if name in _GEN_TOOLS and _gen_block():
+            continue
+        if in_scope and not in_scope(name):
             continue
         desc = getattr(fn, "__doc__", "") or ""
         candidates.append((name, desc, fn, True, pack_of.get(name)))
@@ -2249,8 +2518,15 @@ def _find_tools(keyword, limit=15, probe=False):
         partial = bool(scored)
         kept = pinned_kept + scored
     results = [row for _, row in kept][:max(1, limit)]
+    forms = set()
+    for w in words:
+        forms |= _find_forms(w)
+    for row in results[:_FIND_FULL_ROWS]:
+        for some, tool_name, use in _FIND_KEYS:
+            if row["name"] == tool_name and row["name"] in pinned and any(w in forms for w in some):
+                row["use"] = use
     # PAST THE FIRST _FIND_FULL_ROWS A ROW IS ITS NAME. A broad search at limit 40 was 14,737 characters, every row a
-    # summary and its parameters, and it stayed in context for the rest of the run: benchmark round ten's Python-off
+    # summary and its parameters, and it stayed in context for the rest of the run: Benchmark round ten's Python-off
     # arm asked limit 30 or more in most runs, and those answers were replayed as 1.5 million tokens over A3, A5, A8 and
     # X1 (docs/TOKEN_OPTIMIZATION.md 2.18). The best-ranked rows keep everything; the rest are names to pick from,
     # with what a held-back one needs (loaded, pack) - mif_help('<tool>') or a narrower search gives the rest.
@@ -2341,7 +2617,7 @@ def _audio(module):
 # two, which stay callable by name, so each application keeps its own gate: the add-on's preference for Blender,
 # exec_console's for Unreal.
 # KNOWN SLIPS IN AN AGENT'S OWN PYTHON, answered with the fix in the reply that failed - nothing rides on a request
-# that did not. benchmark round six: Blender 5's Action has no fcurves (4 failed calls, most on the walk cycle), and
+# that did not. Benchmark round six: Blender 5's Action has no fcurves (4 failed calls, most on the walk cycle), and
 # Unreal's Package has no is_dirty (3, as in round five). Both fixes read on the installs (docs/TOKEN_OPTIMIZATION.md
 # 2.10): bpy_extras.anim_utils.action_get_channelbag_for_slot is in Blender 5.2's scripts; the dirty-package calls are
 # BlueprintCallable on UEditorLoadingAndSavingUtils (FileHelpers.h, 5.8).
@@ -2552,7 +2828,7 @@ def bl_status(echo: str = None, list_ops: bool = False, port: int = None, pid: i
     res = _blender("ping", echo=echo, _timeout=BLENDER_PROBE_TIMEOUT,
                    _lock_timeout=BLENDER_PROBE_TIMEOUT)
     # THE OP LIST IS 3,300 OF THE REPLY'S ~4,200 CHARACTERS, and this is the call to make before any Blender work, so an
-    # agent that did as told carried ~200 op names in every later request of the session (the benchmark, 2026-09-22,
+    # agent that did as told carried ~200 op names in every later request of the session (a benchmark, 2026-09-22,
     # docs/TOKEN_OPTIMIZATION.md). The count stays; the names are one flag away, because the add-on's describe_op
     # points at ping for the full list. The add-on's own ping, which the suites and mif_mesh_roundtrip read, is unchanged.
     if not list_ops and isinstance(res, dict) and isinstance(res.get("ops"), list):
@@ -2605,8 +2881,9 @@ def bl_scene_info(detail: bool = False, limit: int = None, name_excludes: list =
 
 @mcp.tool()
 def bl_list_objects(object_type: str = "", pattern: str = None,
-                    detail: bool = False, limit: int = None, name_excludes: list = None, near: dict = None) -> dict:
-    "List objects in the Blender scene with their types. object_type filters to one Blender type ('MESH', 'EMPTY', 'ARMATURE', ...); omit it for everything. pattern filters by NAME and is echoed back in filteredBy, so a caller can tell an empty result from a filter that matched nothing. detail returns more per object. near {point, radius, by ORIGIN|BOUNDS} keeps those within the radius, nearest first, with distance. Read-only."
+                    detail: bool = False, limit: int = None, name_excludes: list = None, near: dict = None,
+                    collection: str = None, recursive: bool = None) -> dict:
+    "List the Blender scene's objects. object_type filters to one Blender type ('MESH', 'EMPTY', 'ARMATURE', ...); omit it for everything. pattern filters by NAME and is echoed back in filteredBy, so a caller can tell an empty result from a filter that matched nothing. collection filters; rows name their parent. detail returns more per object. near {point, radius, by ORIGIN|BOUNDS} keeps those within the radius, nearest first, with distance. Read-only."
     # pattern and detail were accepted by the addon and sent by nothing (ops_scene.py:66-67), so
     # listing a busy scene meant retrieving everything and filtering client-side. The addon reports
     # `filteredBy: {type, pattern}` precisely so a caller can tell "nothing matched" from "no filter
@@ -2617,7 +2894,8 @@ def bl_list_objects(object_type: str = "", pattern: str = None,
     # makes the guard pure downside. The `or None` on object_type above is different: that one is a
     # STRING whose empty value genuinely means "no filter".
     return _blender("list_objects", type=object_type or None, pattern=pattern,
-                    detail=detail, limit=limit, nameExcludes=name_excludes, near=near)
+                    detail=detail, limit=limit, nameExcludes=name_excludes, near=near,
+                    collection=collection, recursive=recursive)
 
 
 @mcp.tool()
@@ -2745,11 +3023,11 @@ def bl_set_vertex_color(object: str, name: str = None, color: list = None, domai
 @mcp.tool()
 def bl_mesh_stats(object: str, evaluated: bool = None, attribute_stats: list | bool = None,
                   frame: int = None, components: bool = None, attribute_values: dict = None,
-                  allow_simulation: bool = None, instances: Any = None) -> dict:
+                  allow_simulation: bool = None, instances: Any = None, islands: bool | dict = None) -> dict:
     "Vertex/edge/face/triangle counts and a world bounding box for a Blender mesh, plus the EVALUATED counts after modifiers - a Subsurf mesh has a base count and a rendered count differing by an order of magnitude, and both are reported rather than one chosen for you. THE BOX IS COMPUTED FROM VERTICES, NEVER FROM obj.bound_box, which is CACHED AND STALE: measured on all four builds, move a vertex to z=50 and bound_box still reports the old extent - mesh.update() does not refresh it, only view_layer.update() does. A box read off bound_box after any edit is quietly wrong, which is the worst kind of wrong for a number people position things against. Also guards the case where evaluated_get silently returns the UNevaluated object, which happens when the object is not in the active view layer's depsgraph. An object that draws instances - Geometry Nodes instances, particles, instancing - answers with instancesNote: instances are not part of any evaluated mesh, so this does not see them (measured on 3.6-5.2). ATTRIBUTES: `attributes` lists the base mesh's named attributes and evaluated.attributes the evaluated mesh's, with evaluated.attributesAddedByModifiers naming what the stack added - an Ocean's foam layer, a Store Named Attribute's output - which is what a material's Attribute node reads BY NAME. A CURVE, TEXT or SURFACE object is measured by its evaluated mesh (base is null - splines are not vertices), so what a bevel, an extrude, a resolution or a node group builds on a curve is readable. attribute_stats - a LIST of names, ['foam', ...], or true for every named attribute - reads what those attributes HOLD - min, max and mean per component (colours linear, as a shader reads them), off the evaluated mesh when there is one (attributeStatsFrom says which): a name that exists can still hold nothing useful, as an Ocean's foam under a JONSWAP spectrum does (0.093-0.105 everywhere, so a ColorRamp starting at 0.35 renders black). An unknown name is refused naming the attributes that exist. colorAttributes lists the colour attributes, and activeColorAttribute and renderColorAttribute say which one is active and which one renders - bl_set_vertex_color's make_active and make_render, which can differ. With frame=N it measures at that frame and puts the scene frame back; a cloth, soft body or rigid body cache that is unbaked, outdated or ends before N is refused rather than read. A mesh with shape keys beyond its basis is evaluated like a modifier stack - the keys deform with no modifier, and the evaluated box is where the keyed mesh is. With instances=true it lists each instance the object draws, its source and world transform."
     return _blender("mesh_stats", object=object, evaluated=evaluated, attributeStats=attribute_stats,
                     frame=frame, components=components, attributeValues=attribute_values,
-                    allowSimulation=allow_simulation, instances=instances)
+                    allowSimulation=allow_simulation, instances=instances, islands=islands)
 
 
 @mcp.tool()
@@ -2757,13 +3035,13 @@ def bl_mesh_quality(object: str = None, uv_layer: str = None, texel_density_for=
                     kind: str = None, module_cm: float = None, boundary_loops: bool = None, bone: str = None,
                     armature: str = None, poles: bool = None, joint_rings: dict = None,
                     facing_against=None, flipped_against: str = None, collection: str = None, thickness=None,
-                    thickness_min_cm: float = None, game_ready: bool | dict = None) -> dict:
+                    thickness_min_cm: float = None, game_ready: bool | dict = None, profile: str = None) -> dict:
     "Measure the objectively checkable things that get an asset REJECTED from a store: ngons, non-manifold edges, loose verts and edges, zero-area faces, unapplied scale and rotation, empty material slots, UV loops outside the 0-1 tile, and texel density spread across faces. Returns every NUMBER plus `concerns`, which lists only defects with a defensible objective threshold - it says NOTHING about whether the asset looks good and does not pretend to. READ notMeasured BEFORE TRUSTING A CLEAN REPORT: a mesh with no UV layer gets no UV verdict at all, which is an absence of data rather than a pass, and an empty concerns list beside a skipped check is not a clean bill of health. Measures the mesh AS AUTHORED, not the evaluated result, because that is what exports and what a store inspects - a subdivision modifier would make every ngon and density figure describe something the file does not contain. texel_density_for takes a size or [w, h]. game_ready {triangleBudget, allowNgons, uvOneTile, allowFloating, allowWaste} adds gameReady: pass or fail, each reason a measured number with its limit and the call that fixes it, or `choices` where only you can tell: floating parts, and triangles over the size class's number, the budget when no triangleBudget is given. Parts 2% or more of the longest side away, slivers under 10 micrometers, near-zero tangents and wasted faces fail it: 90% flat with no painted colors, or half out of any ray's reach."
     return _blender("mesh_quality", object=object, uvLayer=uv_layer,
                     texelDensityFor=texel_density_for, conventions=conventions, kind=kind, module=module_cm,
                     boundaryLoops=boundary_loops, bone=bone, armature=armature, poles=poles, jointRings=joint_rings,
                     facingAgainst=facing_against, flippedAgainst=flipped_against, collection=collection,
-                    thickness=thickness, thicknessMinCm=thickness_min_cm, gameReady=game_ready)
+                    thickness=thickness, thicknessMinCm=thickness_min_cm, gameReady=game_ready, profile=profile)
 
 
 @mcp.tool()
@@ -2810,7 +3088,7 @@ def bl_build_kit_piece(kind: str = None, opening: str = None, module: float = No
                        height: float = None, width: float = None, thickness: float = None,
                        opening_width: float = None, opening_height: float = None, sill_height: float = None,
                        opening_offset: float = None, pivot: str = None, bevel: float = None,
-                       bevel_segments: int = None, trim: bool = None, uv_tile_cm: float = None, color: list = None,
+                       bevel_segments: int = None, trim: bool | dict = None, uv_tile_cm: float = None, color: list = None,
                        material: str = None, trim_color: list = None, trim_material: str = None,
                        grid_cm: float = None, collision: bool = None, name: str = None, location: list = None,
                        rotation: list = None, collection: str = None, slat_pitch: float = None,
@@ -2829,17 +3107,43 @@ def bl_build_kit_piece(kind: str = None, opening: str = None, module: float = No
 def bl_set_vertex_color_by_rule(object: str, rule: str, name: str = None, channel: str = None, range: list = None,
                                 invert: bool = None, combine: str = None, seed: int = None, element: str = None,
                                 distance: float = None, rays: int = None, space: str = None,
-                                make_active: bool = None, dirt: dict = None, group: str = None,
-                                adjust: dict = None) -> dict:
-    "Write a 0-1 mask into a Blender mesh's color attribute by a rule - up (faces that look up), height, cavity or random per part - for a material to blend moss, dirt, grime or variation with. Also rules dirt, fromWeight and adjust. Call mif_help(\"bl_set_vertex_color_by_rule\") first."
+                                make_active: bool = None, dirt: dict = None, group=None,
+                                adjust: dict = None, weight_combine: str = None) -> dict:
+    "Write a 0-1 mask into a Blender mesh's color attribute by a rule - up (faces that look up), height, cavity or random per part - a material's moss, dirt or variation mask. Also rules dirt, fromWeight and adjust. Call mif_help(\"bl_set_vertex_color_by_rule\") first."
     return _blender("set_vertex_color_by_rule", object=object, rule=rule, name=name, channel=channel, range=range,
                     invert=invert, combine=combine, seed=seed, element=element, distance=distance, rays=rays,
-                    space=space, makeActive=make_active, dirt=dirt, group=group, adjust=adjust)
+                    space=space, makeActive=make_active, dirt=dirt, group=group, adjust=adjust,
+                    weightCombine=weight_combine)
 
 @mcp.tool()
 def bl_build_lod_chain(object: str, ratios: list = None, file: str = None, overwrite: bool = None) -> dict:
     "Make hand LODs for a Blender mesh that Unreal's FBX importer reads as its LODs - decimated copies under an Empty whose fbx_type is LodGroup, the object itself LOD0 - and optionally write them to an FBX. Call mif_help(\"bl_build_lod_chain\") first."
     return _blender("build_lod_chain", object=object, ratios=ratios, file=file, overwrite=overwrite)
+
+
+@mcp.tool()
+def bl_build_road(points: list = None, curve: str = None, name: str = None, closed: bool = None, width: float = None,
+                  design_speed: float = None, side_friction: float = None, max_bank: float = None,
+                  bank_rate: float = None, crown: float = None, smoothing: bool | dict = None,
+                  shoulder: str | dict = None, curbs: bool | dict = None, barriers: str | bool | dict = None,
+                  markings: bool | dict = None, sections: list = None, jumps: list = None,
+                  chunk_length: float = None, lods: bool = None, uv_tile: float = None, materials: dict = None,
+                  collision: bool = None, collection: str = None, file: str = None, overwrite: bool = None) -> dict:
+    "Build a race road in Blender along points or a curve: clothoid-eased corners, rounded crests, banking from radius and speed, crown, curbs, shoulders, barriers, markings and jumps, as LOD'd chunks with UCX_ hulls and an optional FBX. Call mif_help(\"bl_build_road\") first."
+    return _blender("build_road", points=points, curve=curve, name=name, closed=closed, width=width,
+                    designSpeed=design_speed, sideFriction=side_friction, maxBank=max_bank, bankRate=bank_rate,
+                    crown=crown, smoothing=smoothing, shoulder=shoulder, curbs=curbs, barriers=barriers,
+                    markings=markings, sections=sections, jumps=jumps, chunkLength=chunk_length, lods=lods,
+                    uvTile=uv_tile, materials=materials, collision=collision, collection=collection, file=file,
+                    overwrite=overwrite)
+
+
+@mcp.tool()
+def bl_road_report(road: str = None, points: list = None, curve: str = None, closed: bool = None,
+                   design_speed: float = None, thresholds: dict = None) -> dict:
+    "Measure a road built by bl_build_road on its mesh - each corner's radius, curvature rate, bank against the formula and curb coverage, each crest's sight distance, grades, barrier gaps, collision and UV stretch - pass or warn against cited thresholds. Points or a curve measure an alignment alone (kinks)."
+    return _blender("road_report", road=road, points=points, curve=curve, closed=closed,
+                    designSpeed=design_speed, thresholds=thresholds)
 
 
 @mcp.tool()
@@ -2924,10 +3228,12 @@ def bl_decimate_mesh(object_name: str = None, ratio: float = None, target_tris: 
 
 @mcp.tool()
 def bl_apply_transform(object_name: str, location: bool = None, rotation: bool = None,
-                       scale: bool = None, fix_normals: bool = None, with_meshes: bool = None) -> dict:
-    "Bake an object's loc/rot/scale into its MESH DATA in Blender. Name a channel and only named ones apply; name none and all three do. An ARMATURE is applied with its skinned meshes (with_meshes, default true)."
+                       scale: bool = None, fix_normals: bool = None, with_meshes: bool = None,
+                       scale_actions: bool = None) -> dict:
+    "Bake an object's loc/rot/scale into its MESH DATA in Blender. Name a channel and only named ones apply; name none and all three do. An ARMATURE is applied with its skinned meshes (with_meshes, default true); scale_actions scales its clips' location keys too."
     return _blender("apply_transform", object=object_name, location=location,
-                    rotation=rotation, scale=scale, fixNormals=fix_normals, withMeshes=with_meshes)
+                    rotation=rotation, scale=scale, fixNormals=fix_normals, withMeshes=with_meshes,
+                    scaleActions=scale_actions)
 
 
 @mcp.tool()
@@ -3204,10 +3510,10 @@ def bl_derive_image_map(image: str, kind: str, name: str = None, strength: float
 
 @mcp.tool()
 def bl_image_stats(image: str = None, file: str = None, normal: bool = None, tiling: bool = None, pixels: list = None,
-                   uvs: list = None, tile: int = None) -> dict:
+                   uvs: list = None, tile: int = None, role: str = None, base_color: str = None) -> dict:
     "Describe a Blender image's pixels - per channel min, max, mean, stddev, NaN and Inf counts, share at 0 and 1, alpha coverage; a normal-map check, a tiling check and samples at pixels or UVs. Catches a black bake, an inverted normal or a NaN EXR. See mif_help."
     return _blender("image_stats", image=image, file=file, normal=normal, tiling=tiling, pixels=pixels, uvs=uvs,
-                    tile=tile)
+                    tile=tile, role=role, baseColor=base_color)
 
 
 @mcp.tool()
@@ -3272,7 +3578,17 @@ def bl_list_node_groups(type: str = None, limit: int = None, name_excludes: list
 
 @mcp.tool()
 def bl_describe_op(op: str) -> dict:
-    "What a Blender addon op accepts, and the RECORDED REASON for keys it deliberately does not take - the discovery half of the notes work. reject_unknown has been able to answer a wrongly-guessed key since 2026-09-07 (bl_add_modifier says apply is absent because adding and applying are separate on purpose, and points at bl_apply_modifier), but only to a caller who had already been refused. The UE side serves the same table through describe_endpoint and can be read BEFORE the call; this is the addon's equivalent. It reads the accept-list and the notes dict out of the RUNNING SOURCE with ast rather than from a generated table, so unlike the UE side it cannot drift from the guard it describes - accept-lists that are module-level constants are resolved by asking the imported module, which is exact. An op with no reject_unknown guard comes back with acceptedKeys null and a reason, never as an empty list, because reporting no keys for an op that simply has no guard is the same class of quiet lie the notes exist to prevent. `refusals` lists the op's VALUE RULES as written in its source - every refusal message, placeholders like %s left unfilled - so ranges, allowed words and required combinations can be read before the call instead of met one refusal at a time; helpers in the same module are followed one level (refusalsFromHelpers), and a message built at runtime is counted in refusalsUnreadable rather than dropped."
+    "What a Blender addon op accepts, and the RECORDED REASON for keys it deliberately does not take - the discovery half of the notes work. reject_unknown has been able to answer a wrongly-guessed key since 2026-09-07 (bl_add_modifier says apply is absent because adding and applying are separate on purpose, and points at bl_apply_modifier), but only to a caller who had already been refused. The UE side serves the same table through describe_endpoint and can be read BEFORE the call; this is the addon's equivalent. It reads the accept-list and the notes dict out of the RUNNING SOURCE with ast rather than from a generated table, so unlike the UE side it cannot drift from the guard it describes - accept-lists that are module-level constants are resolved by asking the imported module, which is exact. An op with no reject_unknown guard comes back with acceptedKeys null and a reason, never as an empty list, because reporting no keys for an op that simply has no guard is the same class of quiet lie the notes exist to prevent. `refusals` lists the op's VALUE RULES as written in its source - every refusal message, placeholders like %s left unfilled - so ranges, allowed words and required combinations can be read before the call instead of met one refusal at a time; helpers in the same module are followed one level (refusalsFromHelpers), and a message built at runtime is counted in refusalsUnreadable rather than dropped. op takes the add-on op name (add_modifier) or the tool name (bl_add_modifier), the two spellings bl_batch takes; the reply's op is the add-on name."
+    # THE TOOL NAME IS THE OP IT POSTS (2026-11-09): bl_batch and the tool list say bl_add_modifier, and describing
+    # the op about to be batched was refused "unknown op". Read off the tool's own _blender call, as bl_batch does.
+    posted = _bl_tool_op(op) if isinstance(op, str) and op.strip().startswith("bl_") else None
+    if posted:
+        reply = _blender("describe_op", op=posted)
+        if isinstance(reply, dict) and reply.get("ok"):
+            reply = dict(reply, askedAs=op.strip(),
+                         spellingNote="%s is the tool; it posts the add-on op '%s'. bl_batch takes either name in "
+                                      "an entry's op." % (op.strip(), posted))
+        return reply
     return _blender("describe_op", op=op)
 
 
@@ -3452,11 +3768,11 @@ def bl_build_vehicle_body(bottom: list, belt: list, half_width: list, roof: list
 def bl_build_lathe(profile: list, name: str = None, segments: int = None, axis: str = None, caps: bool = None,
                    smooth: bool = None, uv_scale: float = None, material: str = None, location: list = None,
                    rotation: list = None, scale: list = None, collection: str = None,
-                   take_over_name: bool = None) -> dict:
+                   take_over_name: bool = None, lightmap: bool = None) -> dict:
     "Revolve a profile [[r, h], ...] round an axis into a Blender solid of revolution (a can, a bottle, a post) whose every face points out, checked by signed volume. r 0 is a pole; caps close open ends."
     return _blender("build_lathe", profile=profile, name=name, segments=segments, axis=axis, caps=caps, smooth=smooth,
                     uvScale=uv_scale, material=material, location=location, rotation=rotation, scale=scale,
-                    collection=collection, takeOverName=take_over_name)
+                    collection=collection, takeOverName=take_over_name, lightmap=lightmap)
 
 
 @mcp.tool()
@@ -3465,13 +3781,16 @@ def bl_build_tube(radius: float, points: list = None, start: list = None, end: l
                   smooth: bool = None, uv_scale: float = None, material: str = None, name: str = None,
                   location: list = None, rotation: list = None, scale: list = None, collection: str = None,
                   take_over_name: bool = None, surface: str = None, lift: float = None, step: float = None,
-                  hang_ends: list = None, end_caps: str | list = None, stoppers: list = None) -> dict:
-    "A round Blender tube along points (closed for a neon loop), laid on a surface mesh lift off it, or hanging between start and end with sag (a catenary): a cable, a pipe, a drawcord. Capped into a closed solid that faces out."
+                  hang_ends: list = None, end_caps: str | list = None, stoppers: list = None,
+                  smooth_path: bool = None, path_samples: int = None, ends: str = None, strands: int | list = None,
+                  twist: float = None, lightmap: bool = None) -> dict:
+    "A round Blender tube along points (closed for a neon loop), laid on a surface mesh lift off it, or hanging between start and end with sag (a catenary): a cable, a pipe, a drawcord. Capped into a closed solid that faces out. smooth_path=True curves it through the points, ends FLAT, ROUND or OPEN finishes it, and strands (a count, or a list of radius, offset and angle) with twist lays a bundle or braid of cables as one object."
     return _blender("build_tube", radius=radius, points=points, start=start, end=end, sag=sag,
                     samples=samples, sides=sides, closed=closed, caps=caps, smooth=smooth, uvScale=uv_scale,
                     material=material, name=name, location=location, rotation=rotation, scale=scale,
                     collection=collection, takeOverName=take_over_name, surface=surface, lift=lift, step=step,
-                    hangEnds=hang_ends, endCaps=end_caps, stoppers=stoppers)
+                    hangEnds=hang_ends, endCaps=end_caps, stoppers=stoppers, smoothPath=smooth_path,
+                    pathSamples=path_samples, ends=ends, strands=strands, twist=twist, lightmap=lightmap)
 
 
 @mcp.tool()
@@ -3529,6 +3848,15 @@ def bl_circularize(object: str, faces: list = None, loop: list = None, flatten: 
     "Make a Blender mesh loop (loop [vertex i...]) or a face region's rim (faces) a circle in its best-fit plane. flatten false keeps the host's curvature; regularize spaces vertices evenly; radius defaults to the mean. Replies deviation from a circle before and after."
     return _blender("circularize", object=object, faces=faces, loop=loop, flatten=flatten, radius=radius,
                     regularize=regularize, space=space)
+
+
+@mcp.tool()
+def bl_refine_hands(object: str, armature: str = None, normal_map: str = None, relief: float = None, normal_green: str = None, sides: list = None,
+                    joint_sds: float = None, end_joint_ratio: float = None, shaft: float = None, min_scale: float = None, relief_cap: float = None,
+                    dry_run: bool = None) -> dict:
+    "Slim a MetaHuman body's chunky fingers and thumb against a measured reference and push real knuckles into the form from its own baked normal map, on an imported mesh: only positions move, every vertex, UV and weight stays. Reads back breadths, moves and fold alignment."
+    return _blender("refine_hands", object=object, armature=armature, normalMap=normal_map, relief=relief, normalGreen=normal_green, sides=sides,
+                    jointSds=joint_sds, endJointRatio=end_joint_ratio, shaft=shaft, minScale=min_scale, reliefCap=relief_cap, dryRun=dry_run)
 
 
 @mcp.tool()
@@ -3785,10 +4113,12 @@ def bl_add_quads_on_surface(object: str, target: str, from_edges: list = None, q
 
 @mcp.tool()
 def bl_subdivide_multires(object: str, mode: str = None, levels: int = None, modifier: str = None,
-                          sculpt_levels: int = None, viewport_levels: int = None, render_levels: int = None) -> dict:
-    "Run a Blender Multires modifier's Subdivide (CATMULL_CLARK, SIMPLE, LINEAR), UNSUBDIVIDE or REBUILD, and set its sculpt, viewport and render levels. Total levels before and after, base and top-level vertex counts."
+                          sculpt_levels: int = None, viewport_levels: int = None, render_levels: int = None,
+                          memory_budget_gb: float = None, dry_run: bool = None) -> dict:
+    "Run a Blender Multires modifier's Subdivide (CATMULL_CLARK, SIMPLE, LINEAR), UNSUBDIVIDE or REBUILD, and set its sculpt, viewport and render levels. Total levels before and after, base and top-level vertex counts. A subdivide states the memory it will take before taking it: over free memory less 4 GB, or memory_budget_gb, it is refused; dry_run=True answers the estimate alone."
     return _blender("subdivide_multires", object=object, mode=mode, levels=levels, modifier=modifier,
-                    sculptLevels=sculpt_levels, viewportLevels=viewport_levels, renderLevels=render_levels)
+                    sculptLevels=sculpt_levels, viewportLevels=viewport_levels, renderLevels=render_levels,
+                    memoryBudgetGB=memory_budget_gb, dryRun=dry_run or None, _timeout=900)
 
 
 @mcp.tool()
@@ -3976,21 +4306,22 @@ def bl_transfer_by_uv(object: str, source: str, uv_map: str = None, source_uv_ma
                     weldDistance=weld_distance, levels=levels, evaluated=evaluated)
 
 @mcp.tool()
-def bl_loft_garment(body: str, armature: str, rings: list, segments: int = None, ease: float = None,
+def bl_loft_garment(body: str, rings: list, armature: str = None, segments: int = None, ease: float = None,
                     offset: float = None, edge_length: float = None, evaluated: bool = None, name: str = None,
-                    collection: str = None, garment: str = None, ease_table: dict = None) -> dict:
-    "Loft a Blender garment tube round a body through rings [{bone, at, ease, offset}] at its bones: each ring the body's own cross-section square to the bone, eased out; rows at edge_length, UVs down the tube."
+                    collection: str = None, garment: str = None, ease_table: dict = None, axis=None,
+                    center: list = None, limb: dict = None) -> dict:
+    "Loft a Blender garment tube round a body through rings at its bones or, without a rig, along axis (X, Y, Z or a vector) with center or along limb {from, to}. Bone rings [{bone, at, ease, offset}]: each the body's own cross-section square to the bone, eased out; rows at edge_length, UVs down the tube. Axis rings [{height}], limb rings [{at}]; each ring centred on the body's own section there."
     return _blender("loft_garment", body=body, armature=armature, rings=rings, segments=segments, ease=ease,
                     offset=offset, edgeLength=edge_length, evaluated=evaluated, name=name, collection=collection,
-                    garment=garment, easeTable=ease_table)
+                    garment=garment, easeTable=ease_table, axis=axis, center=center, limb=limb)
 
 
 @mcp.tool()
-def bl_measure_garment_ease(body: str, garment: str, armature: str, rings: list, segments: int = None,
-                            evaluated: bool = None) -> dict:
-    "Measure a Blender garment's ease off the body it was fitted to, ring by ring at its bones (rings [{bone, at, region}]): body and garment perimeters, ease, gaps; table {region: ease} feeds bl_loft_garment's ease_table."
+def bl_measure_garment_ease(body: str, garment: str, rings: list, armature: str = None, segments: int = None,
+                            evaluated: bool = None, axis=None, center: list = None, limb: dict = None) -> dict:
+    "Measure a Blender garment's ease off the body it was fitted to, ring by ring at its bones (rings [{bone, at, region}]): body and garment perimeters, ease, gaps; table {region: ease} feeds bl_loft_garment's ease_table. Without a rig, rings by axis and center or by limb, as bl_loft_garment's."
     return _blender("measure_garment_ease", body=body, garment=garment, armature=armature, rings=rings,
-                    segments=segments, evaluated=evaluated)
+                    segments=segments, evaluated=evaluated, axis=axis, center=center, limb=limb)
 
 
 @mcp.tool()
@@ -4033,34 +4364,36 @@ def bl_fit_mesh(object: str = None, target: str = None, mode: str = None, iterat
                     dryRun=dry_run or None, previewTtlSeconds=preview_ttl_seconds)
 
 @mcp.tool()
-def bl_build_sole(body: str, armature: str, bone: str, thickness: float = None, margin: float = None,
+def bl_build_sole(body: str, armature: str = None, bone: str = None, thickness: float = None, margin: float = None,
                   heel_thickness: float = None, segments: int = None, ground: float = None,
                   sample_height: float = None, evaluated: bool = None, name: str = None,
                   collection: str = None, last: str = None, footprint_top: float = None,
-                  heel_length: float = None) -> dict:
-    "A Blender shoe sole round a foot's footprint: the foot under a foot bone (heel to toe) seen from above, from sample_height up to footprint_top (default the bone's higher end, the ankle), eased out by margin, a closed solid from the ground up to thickness at the toe and heel_thickness at the heel. With heel_length the heel is a block: the top flat at heel_thickness from the footprint's back to heel_length along the bone and flat at thickness ahead of it, with a vertical breast between them."
+                  heel_length: float = None, foot: dict = None) -> dict:
+    "A Blender shoe sole round a foot's footprint: the foot under a foot bone (heel to toe) seen from above, from sample_height up to footprint_top (default the bone's higher end, the ankle), eased out by margin, a closed solid from the ground up to thickness at the toe and heel_thickness at the heel. With heel_length the heel is a block: the top flat at heel_thickness from the footprint's back to heel_length along the bone and flat at thickness ahead of it, with a vertical breast between them. Without a rig, foot {heel, toe} stands in for the bone."
     return _blender("build_sole", body=body, armature=armature, bone=bone, thickness=thickness, margin=margin,
                     heelThickness=heel_thickness, segments=segments, ground=ground, sampleHeight=sample_height,
                     evaluated=evaluated, name=name, collection=collection, last=last, footprintTop=footprint_top,
-                    heelLength=heel_length)
+                    heelLength=heel_length, foot=foot)
 
 @mcp.tool()
-def bl_attach_hood(object: str, body: str, armature: str, rings: list, ease: float = None, offset: float = None,
-                   edge_length: float = None, neck: dict = None, front: list = None, opening: dict = None,
-                   crown_lift: float = None, evaluated: bool = None) -> dict:
-    "Loft a Blender hood up from a garment's neckline through rings [{bone, at, ease, offset}] round the head, close it over the crown with a centre seam and cut the face opening {halfAngle, bottom, top}: every new face a quad."
+def bl_attach_hood(object: str, body: str, rings: list, armature: str = None, ease: float = None,
+                   offset: float = None, edge_length: float = None, neck: dict = None, front: list = None,
+                   opening: dict = None, crown_lift: float = None, evaluated: bool = None, axis=None,
+                   center: list = None, limb: dict = None) -> dict:
+    "Loft a Blender hood up from a garment's neckline through rings [{bone, at, ease, offset}] round the head, close it over the crown with a centre seam and cut the face opening {halfAngle, bottom, top}: every new face a quad. Without a rig, rings by axis and center or by limb, as bl_loft_garment's."
     return _blender("attach_hood", object=object, body=body, armature=armature, rings=rings, ease=ease, offset=offset,
                     edgeLength=edge_length, neck=neck, front=front, opening=opening, crownLift=crown_lift,
-                    evaluated=evaluated)
+                    evaluated=evaluated, axis=axis, center=center, limb=limb)
 
 @mcp.tool()
-def bl_attach_sleeve(object: str, body: str, armature: str, rings: list, ease: float = None, offset: float = None,
-                     edge_length: float = None, armhole_radius: float = None, min_facing: float = None,
-                     evaluated: bool = None, garment: str = None, ease_table: dict = None) -> dict:
-    "Cut a round armhole in a Blender garment where an arm bone's line meets it and loft the sleeve out of it through rings [{bone, at, ease, offset}] (as bl_loft_garment's): one garment, every new face a quad."
+def bl_attach_sleeve(object: str, body: str, rings: list, armature: str = None, ease: float = None,
+                     offset: float = None, edge_length: float = None, armhole_radius: float = None,
+                     min_facing: float = None, evaluated: bool = None, garment: str = None, ease_table: dict = None,
+                     axis=None, center: list = None, limb: dict = None) -> dict:
+    "Cut a round armhole in a Blender garment where an arm bone's line meets it and loft the sleeve out of it through rings [{bone, at, ease, offset}] (as bl_loft_garment's): one garment, every new face a quad. Without a rig, rings by limb {from, to} (or axis and center), as bl_loft_garment's."
     return _blender("attach_sleeve", object=object, body=body, armature=armature, rings=rings, ease=ease,
                     offset=offset, edgeLength=edge_length, armholeRadius=armhole_radius, minFacing=min_facing,
-                    evaluated=evaluated, garment=garment, easeTable=ease_table)
+                    evaluated=evaluated, garment=garment, easeTable=ease_table, axis=axis, center=center, limb=limb)
 
 
 @mcp.tool()
@@ -4156,11 +4489,12 @@ def bl_set_skin_vertices(object: str, vertices: list = None, all: bool = None, g
 @mcp.tool()
 def bl_uv_pack(object: str, uv_layer: str = None, margin: float = None, rotate: bool = None,
                equalize_by_area: bool = None, texture_size=None, merge_overlap: bool = None,
-               target_texel_density: float = None, unit: str = None, region: list = None) -> dict:
+               target_texel_density: float = None, unit: str = None, region: list = None,
+               margin_method: str = None) -> dict:
     "Pack a Blender mesh's existing UV islands into the 0-1 tile WITHOUT re-unwrapping - optionally equalising them by area first, so every island gets one texel density. Reports the density spread before and after (1.0 = equal), the layout's area and bounds. texture_size packs for that texture: on [w, h] V is stretched by w / h so texels stay square and rotation is refused (the pack treats the tile as square). target_texel_density (needs texture_size, unit PX_PER_CM default) scales the layout to that density instead of the largest that fits. merge_overlap keeps overlapping islands stacked."
     return _blender("uv_pack", object=object, uvLayer=uv_layer, margin=margin, rotate=rotate,
                     equalizeByArea=equalize_by_area, textureSize=texture_size, mergeOverlap=merge_overlap,
-                    targetTexelDensity=target_texel_density, unit=unit, region=region)
+                    targetTexelDensity=target_texel_density, unit=unit, region=region, marginMethod=margin_method)
 
 
 @mcp.tool()
@@ -4209,6 +4543,14 @@ def bl_uv_relax(object: str, select: dict = None, iterations: int = None, pin_bo
     "Relax a Blender mesh's UVs with Blender's Minimize Stretch over chosen faces (default all), island borders or named vertices held. Replies faces relaxed, the largest move and the stretch before and after."
     return _blender("uv_relax", object=object, select=select, iterations=iterations, pinBoundary=pin_boundary,
                     pin=pin, stretch=stretch, uvLayer=uv_layer)
+
+
+@mcp.tool()
+def bl_export_uv_layout(object: str, file: str, layer: str = None, size: int | list = None, fill_color: list = None,
+                        line_color: list = None, background: list = None, overwrite: bool = None) -> dict:
+    "Write a Blender mesh's UV layout to a PNG - faces filled, edges drawn - and report the fill; runs in a background Blender, no edit mode or GPU needed."
+    return _blender("export_uv_layout", object=object, file=file, layer=layer, size=size, fillColor=fill_color,
+                    lineColor=line_color, background=background, overwrite=overwrite)
 
 
 @mcp.tool()
@@ -4345,8 +4687,8 @@ def bl_create_primitive(kind: str, name: str = "", size: float = None, radius: f
                         y_subdivisions: int = None, radius1: float = None, radius2: float = None,
                         major_radius: float = None, minor_radius: float = None,
                         align: str = None, fill_type: str = None,
-                        major_segments: int = None, minor_segments: int = None) -> dict:
-    "Create a Blender primitive mesh - kind cube (size = full edge), sphere, icosphere, cylinder, cone, torus, plane, grid, circle or monkey; align WORLD/VIEW/CURSOR; fill_type NGON/TRIFAN/NOTHING. A sphere (alias uvsphere) takes radius. A CONE takes radius1/radius2 and a TORUS takes major_radius/minor_radius - neither accepts size or radius, and passing the wrong one is refused rather than reinterpreted. align is WORLD/VIEW/CURSOR; fill_type (NGON/TRIFAN/NOTHING) applies to a circle, a cylinder and a cone, whose ends are fans by default, and is refused by name elsewhere."
+                        major_segments: int = None, minor_segments: int = None, collection: str = None) -> dict:
+    "Create a Blender primitive mesh - kind cube (size = full edge), sphere, icosphere, cylinder, cone, torus, plane, grid, circle or monkey; align WORLD/VIEW/CURSOR; fill_type NGON/TRIFAN/NOTHING. A sphere (alias uvsphere) takes radius. A CONE takes radius1/radius2 and a TORUS takes major_radius/minor_radius - neither accepts size or radius, and passing the wrong one is refused rather than reinterpreted. align is WORLD/VIEW/CURSOR; fill_type (NGON/TRIFAN/NOTHING) applies to a circle, a cylinder and a cone, whose ends are fans by default, and is refused by name elsewhere. rotation is radians."
     # radius1/radius2 and majorRadius/minorRadius were accepted by the addon and sent by nothing, so
     # a cone or a torus could only be created at its DEFAULT dimensions over MCP. The op's own
     # docstring is explicit - "A cone takes radius1/radius2 and a torus majorRadius/minorRadius;
@@ -4366,7 +4708,8 @@ def bl_create_primitive(kind: str, name: str = "", size: float = None, radius: f
                     depth=depth, xSubdivisions=x_subdivisions, ySubdivisions=y_subdivisions,
                     radius1=radius1, radius2=radius2,
                     majorRadius=major_radius, minorRadius=minor_radius,
-                    align=align, fillType=fill_type, majorSegments=major_segments, minorSegments=minor_segments)
+                    align=align, fillType=fill_type, majorSegments=major_segments, minorSegments=minor_segments,
+                    collection=collection)
 
 
 @mcp.tool()
@@ -4376,7 +4719,7 @@ def bl_create_light(type: str = "POINT", name: str = "", location: list = None,
                     shape: str = None, spot_angle: float = None, spot_blend: float = None,
                     angle: float = None, shadow: bool = None, diffuse_factor: float = None,
                     specular_factor: float = None, temperature: float = None,
-                    use_temperature: bool = None) -> dict:
+                    use_temperature: bool = None, collection: str = None) -> dict:
     "Create a Blender light: type POINT, SUN, SPOT or AREA; energy in watts (a SUN's is irradiance), color [r,g,b], rotation in RADIANS. Type-specific settings are REFUSED on the wrong type rather than ignored - spot_angle on a POINT light is an error, not a no-op. rotation and spot_angle/angle are RADIANS. The response reports what the light IS, read back off the datablock. COLOUR TEMPERATURE IN KELVIN: temperature is how lighting is actually specified - 3200 tungsten, 6500 daylight - rather than as linear RGB, and it MULTIPLIES the colour rather than replacing it, so colour becomes a tint. Refused by name on a Blender without bpy.types.Light.use_temperature rather than silently ignored."
     # EVERY accepted key is sent. param_reach asks exactly this question of the Blender half, and a
     # capability the addon accepts but no tool forwards is one an MCP caller cannot reach at all -
@@ -4386,7 +4729,7 @@ def bl_create_light(type: str = "POINT", name: str = "", location: list = None,
                     size=size, sizeY=size_y, shape=shape, spotAngle=spot_angle,
                     spotBlend=spot_blend, angle=angle, shadow=shadow,
                     diffuseFactor=diffuse_factor, specularFactor=specular_factor,
-                    temperature=temperature, useTemperature=use_temperature)
+                    temperature=temperature, useTemperature=use_temperature, collection=collection)
 
 
 @mcp.tool()
@@ -4655,10 +4998,12 @@ def bl_set_armature_properties(object: str, pose_mode: str = None, display_type:
 
 @mcp.tool()
 def bl_key_pose(object: str, frame: float, bones: list = None, name_prefix: str = None, all: bool = None,
-                channels: list = None, custom_properties=None, interpolation: str = None, reset: bool = None) -> dict:
-    "Key Blender pose bones at a frame as they stand (bones, name_prefix or all): location, rotation in each bone's own mode, scale, and custom_properties (true or names); reset keys the rest pose."
+                channels: list = None, custom_properties=None, interpolation: str = None, reset: bool = None,
+                easing: str = None) -> dict:
+    "Key Blender pose bones at a frame as they stand (bones, name_prefix or all): location, rotation in each bone's own mode, scale, custom_properties; reset keys the rest pose."
     return _blender("key_pose", object=object, frame=frame, bones=bones, namePrefix=name_prefix, all=all,
-                    channels=channels, customProperties=custom_properties, interpolation=interpolation, reset=reset)
+                    channels=channels, customProperties=custom_properties, interpolation=interpolation, reset=reset,
+                    easing=easing)
 
 
 @mcp.tool()
@@ -5035,14 +5380,14 @@ def bl_create_camera(name: str = "", location: list = None, rotation: list = Non
                      clip_end: float = None, f_stop: float = None, dof_distance: float = None,
                      shift_x: float = None, shift_y: float = None,
                      make_active: bool = None, field_of_view: float = None,
-                     focus_object: str = None) -> dict:
+                     focus_object: str = None, collection: str = None) -> dict:
     "Create a Blender camera, optionally aimed with look_at instead of rotation - passing both is refused, since they are two answers to the same question. A Blender camera faces its local -Z, which is what hand-written aiming gets wrong, so look_at derives the euler for you. f_stop or dof_distance enables depth of field; neither is turned on by default. Call mif_help(\"bl_create_camera\") first. FIELD OF VIEW AND FOCUS: field_of_view is the SAME property as lens in different units - setting 90 degrees moves lens from 50mm to 18mm, measured on all four builds - so passing both is refused rather than resolved by argument order, and it is PERSP only. focus_object racks focus onto an object instead of a fixed distance, and it OVERRIDES dof_distance silently: Blender uses the object's distance and ignores the number, while both fields keep reading back exactly as written. Both were REPORTED by bl_object_info and writable by nothing until 2026-09-04, so a camera could be described in more detail than it could be built."
     return _blender("create_camera", name=name or None, location=location, rotation=rotation,
                     lookAt=look_at, lens=lens, sensorWidth=sensor_width, type=type,
                     orthoScale=ortho_scale, clipStart=clip_start, clipEnd=clip_end,
                     fStop=f_stop, dofDistance=dof_distance, shiftX=shift_x, shiftY=shift_y,
                     makeActive=make_active,
-                    fieldOfView=field_of_view, focusObject=focus_object)
+                    fieldOfView=field_of_view, focusObject=focus_object, collection=collection)
 
 
 @mcp.tool()
@@ -5140,11 +5485,27 @@ def bl_render_still(file_path: str = None, frame: float = None, samples: int = N
 
 
 @mcp.tool()
-def bl_compare_to_reference(image: str, reference: str, compare_px: int = None,
-                            threshold: float = None) -> dict:
+def bl_compare_to_reference(image: str = None, reference: str = None, compare_px: int = None,
+                            threshold: float = None, reference_mask: str = None, image_mask: str = None,
+                            subject_key: dict = None, views: list = None, overlay: str = None,
+                            overwrite: bool = None) -> dict:
     "TURN 'match this reference' INTO A NUMBER. Returns silhouetteIoU (intersection over union of the two subject masks - ignores colour and lighting entirely and asks only whether the subject occupies the same space in frame, which is the number for matching a blockout) and meanAbsDiff (per-pixel luminance difference - sensitive to lighting and materials, so useful for 'is this the same shot' and useless for 'is this the same shape'). Reported separately rather than blended, because one score would hide which of the two moved. RENDER WITH A TRANSPARENT FILM FIRST (bl_set_render_settings film_transparent) - with an opaque background every pixel counts as subject, the mask becomes the whole frame, and IoU is 1.0 by definition; the op detects that and returns null with degenerateMask explaining, rather than a meaningless number. This is PIXEL similarity, not semantic similarity: a render matching a blockout's silhouette exactly with entirely wrong materials scores well and should."
     return _blender("compare_to_reference", image=image, reference=reference,
-                    comparePx=compare_px, threshold=threshold)
+                    comparePx=compare_px, threshold=threshold, referenceMask=reference_mask, imageMask=image_mask,
+                    subjectKey=subject_key, views=views, overlay=overlay, overwrite=overwrite)
+
+
+@mcp.tool()
+def bl_solve_camera_from_reference(object: str = None, objects: list = None, reference: str = None,
+                                   reference_mask: str = None, subject_key: dict = None, threshold: float = None,
+                                   direction: Any = None, views: list = None, lens: Any = None, apply: bool = None,
+                                   camera: str = None, compare_px: int = None, search_degrees: list = None,
+                                   set_resolution: bool = None) -> dict:
+    "Find the camera whose view of a Blender mesh matches a reference picture's silhouette - direction, lens and framing searched near a rough direction, scored, and optionally set - and say when several views disagree."
+    return _blender("solve_camera_from_reference", object=object, objects=objects, reference=reference,
+                    referenceMask=reference_mask, subjectKey=subject_key, threshold=threshold, direction=direction,
+                    views=views, lens=lens, apply=apply, camera=camera, comparePx=compare_px,
+                    searchDegrees=search_degrees, setResolution=set_resolution, _timeout=600.0)
 
 
 @mcp.tool()
@@ -5468,15 +5829,16 @@ def bl_create_empty(name: str = None, location: list = None, rotation: list = No
 
 
 @mcp.tool()
-def bl_create_mesh(vertices: list, faces: list = None, edges: list = None, material_indices: list = None,
+def bl_create_mesh(vertices: list = None, faces: list = None, edges: list = None, material_indices: list = None,
                    materials: list = None, uvs: dict = None, vertex_groups: dict = None, smooth: bool | list = None,
                    name: str = None, location: list = None, rotation: list = None, scale: list = None,
-                   collection: str = None, take_over_name: bool = None) -> dict:
+                   collection: str = None, take_over_name: bool = None, replace_data: bool = None,
+                   file: str = None) -> dict:
     "Build a Blender mesh object from vertex, face and loose-edge lists, with optional per-face material slots, UV layers, vertex groups and smooth flags; bad input is refused before anything exists. Call mif_help(\"bl_create_mesh\") first."
     return _blender("create_mesh", vertices=vertices, faces=faces, edges=edges, materialIndices=material_indices,
                     materials=materials, uvs=uvs, vertexGroups=vertex_groups, smooth=smooth, name=name,
                     location=location, rotation=rotation, scale=scale, collection=collection,
-                    takeOverName=take_over_name)
+                    takeOverName=take_over_name, replaceData=replace_data, file=file)
 
 
 @mcp.tool()
@@ -5657,12 +6019,13 @@ def bl_append_from_file(filepath: str, objects: list = None, collections: list =
                         materials: list = None, node_groups: list = None, actions: list = None,
                         worlds: list = None, fonts: list = None, link: bool | str = None,
                         active_collection: str = None, list_only: bool = None,
-                        instance_empty: bool = None) -> dict:
-    "Bring datablocks IN from another .blend - the half of the Blender file ops that did not exist. bl_save_file wrote and bl_open_file REPLACES the session, so a scene this addon built could be saved and then never reused; every asset-library workflow is this call. APPEND COPIES, LINK REFERENCES, and the difference decides whether you can edit what you just brought in: link=false (the default) copies the datablocks into this file - editable, and they survive the source being moved; link=true leaves them in the source file and points at it, which means NOT editable (a transform on a linked object is refused by Blender, and reads as this addon being broken if you did not know you linked) and the source must exist forever. The response says which happened and what it costs. list_only=true READS THE FILE AND IMPORTS NOTHING, so you can see what is in it before choosing names. A name the file does not contain is REFUSED naming what it does have - Blender's own append silently imports nothing for a missing name and reports no error, which is a call that succeeds and does nothing. Objects and collections are linked into the scene's active collection so they are actually VISIBLE: bpy.data.libraries.load puts them in bpy.data and nothing else, and an object in no collection is invisible, unrendered, and saved anyway. Colliding names get Blender's .001 suffix and the response reports every one under `renamed`, so you know what you actually have. FONTS ARE IN THE LIST because a typeface is the one thing you cannot re-derive from a file you did not build: bl_create_text's `font` takes a PATH, so text set in somebody else's face has no name you can reach - list_only:true now shows you."
+                        instance_empty: bool = None, reuse_data=None) -> dict:
+    "Bring datablocks IN from another .blend - the half of the Blender file ops that did not exist. bl_save_file wrote and bl_open_file REPLACES the session, so a scene this addon built could be saved and then never reused; every asset-library workflow is this call. APPEND COPIES, LINK REFERENCES, and the difference decides whether you can edit what you just brought in: link=false (the default) copies the datablocks into this file - editable, and they survive the source being moved; link=true leaves them in the source file and points at it, which means NOT editable (a transform on a linked object is refused by Blender, and reads as this addon being broken if you did not know you linked) and the source must exist forever. The response says which happened and what it costs. list_only=true READS THE FILE AND IMPORTS NOTHING, so you can see what is in it before choosing names. A name the file does not contain is REFUSED naming what it does have - Blender's own append silently imports nothing for a missing name and reports no error, which is a call that succeeds and does nothing. Objects and collections are linked into the scene's active collection so they are actually VISIBLE: bpy.data.libraries.load puts them in bpy.data and nothing else, and an object in no collection is invisible, unrendered, and saved anyway. Colliding names get Blender's .001 suffix and the response reports every one under `renamed`, so you know what you actually have. FONTS ARE IN THE LIST because a typeface is the one thing you cannot re-derive from a file you did not build: bl_create_text's `font` takes a PATH, so text set in somebody else's face has no name you can reach - list_only:true now shows you. Appending objects ONE CALL AT A TIME copies every material they share (M_Metal.001 ...): append them in one call, or pass reuse_data=true to keep the same-named materials, node groups, images and textures already here; `suffixed` names every datablock that came in suffixed."
     return _blender("append_from_file", filepath=filepath, objects=objects,
                     collections=collections, materials=materials, nodeGroups=node_groups,
                     actions=actions, worlds=worlds, fonts=fonts, link=link,
-                    activeCollection=active_collection, listOnly=list_only, instanceEmpty=instance_empty)
+                    activeCollection=active_collection, listOnly=list_only, instanceEmpty=instance_empty,
+                    reuseData=reuse_data)
 
 
 @mcp.tool()
@@ -5704,7 +6067,7 @@ def _bl_batch_ops(ops):
 
     THE FLAT FORM IS ACCEPTED because the add-on read only `params` and IGNORED every other key of an entry, so
     {op: 'create_primitive', kind: 'cube'} - the shape Unreal's batch takes - ran create_primitive with NO parameters and
-    was refused "'kind' is required" beside the kind it had been given. the benchmark's bracket and grid runs sent exactly
+    was refused "'kind' is required" beside the kind it had been given. A benchmark's bracket and grid runs sent exactly
     that nine times (docs/TOKEN_OPTIMIZATION.md). An entry carrying BOTH params and top-level keys is refused here
     rather than guessed at: the add-on would drop the top-level ones in silence.
 
@@ -5733,6 +6096,12 @@ def _bl_batch_ops(ops):
             params = extra
         if isinstance(params, dict):
             params = _backend_op_params("blender", entry.get("op") or entry.get("endpoint"), params)
+            # ONE KEY FOR THE OBJECT IN EVERY OP OF A BATCH (FOUND 2026-11-09): an entry spelled object_name reached the
+            # add-on as object_name on ops whose tool says object (mesh_stats, set_light) and was refused, so a batch
+            # written in one spelling had ops refused. Every add-on op reads its object as `object`; no op takes
+            # object_name, so the rename cannot shadow a real key.
+            if "object_name" in params and "object" not in params:
+                params = {("object" if k == "object_name" else k): v for k, v in params.items()}
         out.append(dict({k: entry[k] for k in ("op", "endpoint") if k in entry}, params=params))
     return out, None
 
@@ -5740,10 +6109,10 @@ def _bl_batch_ops(ops):
 @mcp.tool()
 def bl_create_texture(name: str = None, type: str = None, image: str = None,
                       intensity: float = None, contrast: float = None, file: str = None,
-                      colorspace: str = None) -> dict:
+                      colorspace: str = None, settings: dict = None) -> dict:
     "Create a legacy Blender TEXTURE datablock - what a DISPLACE modifier reads. Same producer/consumer gap as bl_create_lattice and found in the same pass: bl_add_modifier can point DISPLACE at a texture and bpy.data.textures appeared nowhere else in the addon. THESE ARE NOT SHADER NODES. bpy.data.textures is Blender's older texture system and is what the MODIFIER STACK reads - a DISPLACE modifier cannot take a ShaderNodeTexNoise. Both systems exist, they are not interchangeable, and that is the confusion this is most likely to be met with. The type is validated against this build's own enum (BLEND, CLOUDS, DISTORTED_NOISE, IMAGE, MAGIC, MARBLE, MUSGRAVE, NOISE, STUCCI, VORONOI, WOOD - identical on 3.6, 4.2, 4.4 and 5.0, read off the enum rather than assumed), and `image` is refused for any type but IMAGE rather than accepted and ignored. `file` loads an image from disk as the datablock (type IMAGE implied, colorspace default Non-Color, because a height map is data)."
     return _blender("create_texture", name=name, type=type, image=image,
-                    intensity=intensity, contrast=contrast, file=file, colorspace=colorspace)
+                    intensity=intensity, contrast=contrast, file=file, colorspace=colorspace, settings=settings)
 
 
 @mcp.tool()
@@ -6088,7 +6457,7 @@ def bl_set_view_layer(name: str = None, use: bool = None, enable_passes: list = 
                       samples: int = None, cycles: dict = None, eevee: dict = None,
                       cryptomatte_depth: int = None, lightgroups: list = None, aovs: list = None,
                       material_override: str = None) -> dict:
-    "Turn Blender render passes on or off - what decides WHAT THE COMPOSITOR CAN SEE, since a Render Layers node only offers sockets for passes the layer actually outputs. Ask for a Z-depth composite with the Z pass off and there is nothing to connect. Pass names drop the use_pass_ prefix (\"z\", \"normal\", \"mist\", \"cryptomatte_object\") and are validated against THIS layer rather than a list in the addon, because the set depends on the Blender version and render engine - a hard-coded one would refuse passes that exist. Every requested pass is read back individually: several use_pass_* properties are read-only under a given engine, so the write is accepted and the value does not move. cycles / eevee write view_layer.cycles / .eevee by identifier (denoising_store_passes gives a Denoise node its Albedo and Normal), cryptomatte_depth sets the Cryptomatte levels, lightgroups and aovs ([{name, type}]) are made when missing, and material_override renders the layer with one material (null clears it)."
+    "Turn Blender render passes on or off - what decides WHAT THE COMPOSITOR CAN SEE, since a Render Layers node only offers sockets for passes the layer actually outputs. Ask for a Z-depth composite with the Z pass off and there is nothing to connect. Pass names drop the use_pass_ prefix (\"z\", \"normal\", \"mist\", \"cryptomatte_object\") and are validated against THIS layer rather than a list in the addon, because the set depends on the Blender version and render engine - a hard-coded one would refuse passes that exist. Every requested pass is read back individually: several use_pass_* properties are read-only under a given engine, so the write is accepted and the value does not move. cycles / eevee write view_layer.cycles / .eevee by identifier (denoising_store_passes gives a Denoise node its Albedo and Normal), cryptomatte_depth sets the Cryptomatte levels, lightgroups and aovs ([{name, type}]) are made when missing, and material_override renders the layer with one material (an empty string clears it)."
     return _blender("set_view_layer", name=name, use=use, enablePasses=enable_passes,
                     disablePasses=disable_passes, passes=passes, samples=samples, cycles=cycles, eevee=eevee,
                     cryptomatteDepth=cryptomatte_depth, lightgroups=lightgroups, aovs=aovs,
@@ -6165,8 +6534,8 @@ def bl_add_group_node(group: str, type: str = None, name: str = None, location: 
 
 
 @mcp.tool()
-def bl_link_group_nodes(group: str, to_node: str, from_node: str = None, from_socket: str = None,
-                        to_socket: str = None, remove: bool = None) -> dict:
+def bl_link_group_nodes(group: str, to_node: str, from_node: str = None, from_socket: str | int = None,
+                        to_socket: str | int = None, remove: bool = None) -> dict:
     "Wire one node's output into another's input inside a Blender node group - or, with remove=true, take links OUT. links.new returns a link object even when Blender immediately drops it as invalid (mismatched socket types), so the link is read back and `linked` is a measurement rather than the call's return. A LINK INTO AN INPUT THAT ALREADY HAS ONE REPLACES IT and Blender says nothing: the displaced link comes back in replacedLinks (with replacedNote), in full, so it can be restored; a multi-input socket such as Join Geometry keeps both. remove=true needs to_node plus to_socket and/or from_node (from_socket narrows further), removes every link matching that scope and lists each one in removedLinks - a scope matching nothing is refused rather than reported as a success. Before this a link could only be undone by deleting a node. The `group` argument also addresses trees that are OWNED by something rather than living in bpy.data.node_groups: 'scene:compositor', 'scene:world', 'material:<name>' and 'world:<name>'. That is how a MATERIAL's shader graph is authored."
     return _blender("link_group_nodes", group=group, fromNode=from_node, toNode=to_node,
                     fromSocket=from_socket, toSocket=to_socket, remove=remove)
@@ -6227,7 +6596,7 @@ def bl_group_nodes(group: str, nodes: list, mode: str, label: str = None, name: 
 
 @mcp.tool()
 def bl_remove_node(group: str, node: str, allow_structural: bool = False, dissolve: bool = None) -> dict:
-    "Delete a Blender node and report exactly which links died with it. bl_add_group_node and bl_link_group_nodes had no counterpart, which is what made the bunker showcase's material stage one-way - its own docstring says 'no typed op REMOVES a node ... it cannot take a palette off, and it cannot re-tune one in place'. bl_set_node_property answered the re-tuning half; this is the other. REMOVAL SEVERS LINKS IN SILENCE: measured on 4.4, deleting one middle node took a three-link tree to one and Blender said nothing, so a caller who removed a colour ramp would be looking at an unlinked Base Color with no explanation. Every link touching the node is captured BEFORE the delete and returned as fromNode/fromSocket/toNode/toSocket - enough to rebuild with bl_link_group_nodes. Structural nodes (Material Output, Group Output, Composite and friends) are REFUSED by default: a material with no output renders black and a group with no Group Output evaluates to EMPTY, which makes the object vanish - pass allow_structural=true if that is genuinely what you want. `group` addresses the tree as everywhere else: a node group by name, or 'scene:compositor', 'scene:world', 'material:<name>', 'world:<name>'. dissolve=true keeps the link through it (2026-10-06): the node's first linked output is matched to its first linked input of the same socket type, and that input's source is linked to everything the output fed - keptLinks, read back off the tree; refused with nothing removed when there is no linked input, no linked output, or no input of the output's type."
+    "Delete a Blender node and report exactly which links died with it. bl_add_group_node and bl_link_group_nodes had no counterpart, which is what made a staged scene build's material stage one-way - its own docstring says 'no typed op REMOVES a node ... it cannot take a palette off, and it cannot re-tune one in place'. bl_set_node_property answered the re-tuning half; this is the other. REMOVAL SEVERS LINKS IN SILENCE: measured on 4.4, deleting one middle node took a three-link tree to one and Blender said nothing, so a caller who removed a colour ramp would be looking at an unlinked Base Color with no explanation. Every link touching the node is captured BEFORE the delete and returned as fromNode/fromSocket/toNode/toSocket - enough to rebuild with bl_link_group_nodes. Structural nodes (Material Output, Group Output, Composite and friends) are REFUSED by default: a material with no output renders black and a group with no Group Output evaluates to EMPTY, which makes the object vanish - pass allow_structural=true if that is genuinely what you want. `group` addresses the tree as everywhere else: a node group by name, or 'scene:compositor', 'scene:world', 'material:<name>', 'world:<name>'. dissolve=true keeps the link through it (2026-10-06): the node's first linked output is matched to its first linked input of the same socket type, and that input's source is linked to everything the output fed - keptLinks, read back off the tree; refused with nothing removed when there is no linked input, no linked output, or no input of the output's type."
     return _blender("remove_node", group=group, node=node, allowStructural=allow_structural, dissolve=dissolve)
 
 
@@ -6324,11 +6693,12 @@ def bl_transform_objects(objects: list = None, pivot: list = None, rotation: lis
 def bl_set_parent(object: str, parent: str = None, clear: bool = False, keep_transform: bool = True,
                   type: str = "OBJECT", bone: str = None, fallback: str = None, max_influences: int = None,
                   bones: list = None, include_parents: bool = None, head_tail: float = None,
-                  vertices: list | dict = None) -> dict:
+                  vertices: list | dict = None, memory_budget_gb: float = None) -> dict:
     "Parent a Blender object to another object, or to a bone of an armature (type BONE with bone), or clear its parent with clear:true - the hierarchy a prop on an empty, a camera on a rig or an FBX into Unreal needs. keep_transform (default true) keeps it where it is in the world, and the response MEASURES that: worldBefore / worldAfter and worldMoved. A cycle is refused before anything is written. type VERTEX or VERTEX_3 with vertices [i] / [i, j, k] or {near: [x,y,z]} rides one vertex or a triangle of a mesh parent. Call mif_help(\"bl_set_parent\") first."
     return _blender("set_parent", object=object, parent=parent, clear=clear, keepTransform=keep_transform,
                     type=type, bone=bone, fallback=fallback, maxInfluences=max_influences, bones=bones,
-                    includeParents=include_parents, headTail=head_tail, vertices=vertices)
+                    includeParents=include_parents, headTail=head_tail, vertices=vertices,
+                    memoryBudgetGB=memory_budget_gb, _timeout=900 if type == "ARMATURE_AUTO" else None)
 
 
 @mcp.tool()
@@ -6423,7 +6793,7 @@ def bl_boolean_op(target: str, cutter: str | list, operation: str = "difference"
 def bl_create_material(name: str, reuse: bool = False, base_color: list = None,
                        metallic: float = None, roughness: float = None,
                        skip_linked_inputs: bool = False, copy_from: str = None) -> dict:
-    "Create a Blender material with a Principled BSDF - base_color [r,g,b] or [r,g,b,a], metallic and roughness can be set inline. Before this the addon could assign material slot NAMES and could not create a material or set a single shading value. `reuse` makes it get-or-create and STILL APPLIES the inline values, which is right when you mean to set them and fatal when you are only fetching the material: a Principled input that some node DRIVES ignores its default value completely, so writing one is refused rather than silently doing nothing. `skip_linked_inputs` is for the get-or-create case - a driven input is left alone and NAMED in skippedLinkedInputs alongside the node driving it, while every unlinked value is still written normally. It is off by default so the refusal still catches a caller who meant it. The case this exists for: a pipeline calls create_material with the same literal values in several stages purely to fetch the material, then a later stage wires a procedural pattern into Base Color, and every one of those earlier calls starts failing - which is exactly what made the bunker showcase unrunnable in its own documented stage order until 2026-09-07."
+    "Create a Blender material with a Principled BSDF - base_color [r,g,b] or [r,g,b,a], metallic and roughness can be set inline. Before this the addon could assign material slot NAMES and could not create a material or set a single shading value. `reuse` makes it get-or-create and STILL APPLIES the inline values, which is right when you mean to set them and fatal when you are only fetching the material: a Principled input that some node DRIVES ignores its default value completely, so writing one is refused rather than silently doing nothing. `skip_linked_inputs` is for the get-or-create case - a driven input is left alone and NAMED in skippedLinkedInputs alongside the node driving it, while every unlinked value is still written normally. It is off by default so the refusal still catches a caller who meant it. The case this exists for: a pipeline calls create_material with the same literal values in several stages purely to fetch the material, then a later stage wires a procedural pattern into Base Color, and every one of those earlier calls starts failing - which is exactly what made a staged scene build unrunnable in its own documented stage order until 2026-09-07."
     return _blender("create_material", name=name, reuse=reuse, baseColor=base_color,
                     metallic=metallic, roughness=roughness,
                     skipLinkedInputs=skip_linked_inputs, copyFrom=copy_from)
@@ -6604,7 +6974,7 @@ def bl_set_shading(object: str, smooth: bool = None, indices: list = None,
 @mcp.tool()
 def bl_objects_overlap(a: str, b: str, tolerance: float = None, max_samples: int = None,
                        evaluated: bool = None) -> dict:
-    "Do two Blender objects actually intersect - asked of the GEOMETRY rather than of their bounding boxes, which is what this was being approximated with. An AABB test says two objects overlap when they do not: measured on 3.6, 4.4 and 5.0, a 2m cube rotated 45 degrees about Z and a 1m cube at (1.45,1.45,0) have world AABBs that DO intersect and geometry that never touches. Both answers are returned, so aabbWouldHaveLied shows you the disagreement. FIVE VERDICTS, because 'do they overlap' is several questions: DISJOINT, TOUCHING (surfaces meet, no shared volume), INTERSECTING, A_INSIDE_B and B_INSIDE_A. CONTAINMENT IS THE CASE A SURFACE TEST CANNOT SEE - overlap() reports face-to-face intersection only, so a cube entirely inside another returns ZERO pairs and len(overlap()) alone calls it DISJOINT, the exact opposite of the truth. Trees are built in WORLD space from a transformed bmesh, never BVHTree.FromObject, which silently ignores matrix_world - two cubes FIVE UNITS APART report 2 overlap pairs through it - and which segfaults Blender 3.6 outright on a non-mesh object. facePairs is a yes/no signal and NOT a contact count: two identical coincident cubes return 2 pairs, not 36. An object that draws instances - Geometry Nodes instances, particles, instancing - answers with instancesNote: instances are not part of any evaluated mesh, so this does not see them (measured on 3.6-5.2)."
+    "Do two Blender objects' GEOMETRIES intersect, not their bounding boxes? An AABB test says two objects overlap when they do not: measured on 3.6, 4.4 and 5.0, a 2m cube rotated 45 degrees about Z and a 1m cube at (1.45,1.45,0) have world AABBs that DO intersect and geometry that never touches. Both answers are returned, so aabbWouldHaveLied shows you the disagreement. SIX VERDICTS, because 'do they overlap' is several questions: DISJOINT, NEAR (gap within tolerance), TOUCHING (surfaces meet, no shared volume), INTERSECTING, A_INSIDE_B and B_INSIDE_A. CONTAINMENT IS THE CASE A SURFACE TEST CANNOT SEE - overlap() reports face-to-face intersection only, so a cube entirely inside another returns ZERO pairs and len(overlap()) alone calls it DISJOINT, the exact opposite of the truth. Trees are built in WORLD space from a transformed bmesh, never BVHTree.FromObject, which silently ignores matrix_world - two cubes FIVE UNITS APART report 2 overlap pairs through it - and which segfaults Blender 3.6 outright on a non-mesh object. facePairs is a yes/no signal and NOT a contact count: two identical coincident cubes return 2 pairs, not 36. An object that draws instances - Geometry Nodes instances, particles, instancing - answers with instancesNote: instances are not part of any evaluated mesh, so this does not see them (measured on 3.6-5.2)."
     return _blender("objects_overlap", a=a, b=b, tolerance=tolerance, maxSamples=max_samples,
                     evaluated=evaluated)
 
@@ -6758,7 +7128,7 @@ def bl_spin_mesh(object: str, edges: list = None, faces: list = None, vertices: 
 @mcp.tool()
 def bl_export_actions(armature: str, folder: str, actions: list = None, pattern: str = None, deform_only: bool = None,
                       simplify: float = None, include_mesh: bool = None, overwrite: bool = None) -> dict:
-    "Export each action of a Blender armature to its OWN FBX (deform bones, the action's frame range, named A_{rig}_{action}) - the clips half of a character hand-off; an action keying bones the rig lacks is refused. Per file frames, fps, bones. See mif_help."
+    "Export each action of a Blender armature to its OWN FBX (every bone, its frame range) - the clips half of a character hand-off; an action keying bones the rig lacks is refused. Per file frames, fps, bones. See mif_help."
     return _blender("export_actions", armature=armature, folder=folder, actions=actions, pattern=pattern,
                     deformOnly=deform_only, simplify=simplify, includeMesh=include_mesh, overwrite=overwrite)
 
@@ -6766,10 +7136,11 @@ def bl_export_actions(armature: str, folder: str, actions: list = None, pattern:
 @mcp.tool()
 def bl_export_material_textures(folder: str, objects: Any = None, materials: list = None, pattern: str = None,
                                 normal_convention: str = None, pack_orm: bool = None, format: str = None,
-                                overwrite: bool = None) -> dict:
+                                overwrite: bool = None, profile: str = None) -> dict:
     "Save every image a Blender material's Principled inputs read, with engine names (T_{material}_BC / _N / _ORM / _E), color spaces, the normal map's green flipped for DIRECTX and roughness + metallic packed as ORM; constants and node chains not carried are listed. See mif_help."
     return _blender("export_material_textures", folder=folder, objects=objects, materials=materials, pattern=pattern,
-                    normalConvention=normal_convention, packOrm=pack_orm, format=format, overwrite=overwrite)
+                    normalConvention=normal_convention, packOrm=pack_orm, format=format, overwrite=overwrite,
+                    profile=profile)
 
 
 @mcp.tool()
@@ -6786,6 +7157,16 @@ def bl_export_groom(objects: Any, file: str, frame_range: list = None, scale: fl
     "Export Blender hair - Curves objects (4.2+) or a mesh's hair particles - as an Alembic Unreal's groom importer reads, each object one group, in centimeters; what the exporter drops is listed. See mif_help."
     return _blender("export_groom", objects=objects, file=file, frameRange=frame_range, scale=scale,
                     overwrite=overwrite)
+
+
+@mcp.tool()
+def bl_uefn_check(objects: Any = None, file: str = None, generate_lods: Any = None, asset_folder: str = None,
+                  strict: bool = None, embed_textures: bool = None, include_hulls: bool = None,
+                  overwrite: bool = None, animations: bool = None) -> dict:
+    "Judge Blender meshes, static or skinned, against UEFN's published limits, each cited; with file, write .fbx/.glb/.gltf (a rig's clips too) and read it back. See mif_help."
+    return _blender("uefn_check", objects=objects, file=file, generateLods=generate_lods, assetFolder=asset_folder,
+                    strict=strict, embedTextures=embed_textures, includeHulls=include_hulls, overwrite=overwrite,
+                    animations=animations)
 
 
 @mcp.tool()
@@ -6837,7 +7218,7 @@ def bl_extract_root_motion(armature: str, action: str = None, hips: str = None, 
 def bl_set_freestyle(enabled: bool = None, view_layer: str = None, line_thickness: float = None,
                      thickness_mode: str = None, crease_angle: float = None, line_sets: list = None,
                      remove_line_sets: list = None, edge_marks: Any = None) -> dict:
-    "Blender Freestyle line rendering: on or off, line thickness, line sets by edge type and collection with color, thickness and alpha, and Freestyle edge marks on meshes - read back. Cycles and EEVEE draw it. See mif_help."
+    "Blender Freestyle line rendering: on or off, line thickness, line sets (edge types, collections, color, thickness, alpha) and edge marks - read back. Cycles and EEVEE draw it. See mif_help."
     return _blender("set_freestyle", enabled=enabled, viewLayer=view_layer, lineThickness=line_thickness,
                     thicknessMode=thickness_mode, creaseAngle=crease_angle, lineSets=line_sets,
                     removeLineSets=remove_line_sets, edgeMarks=edge_marks)
@@ -6894,13 +7275,14 @@ def bl_bake_texture_set(object: str = None, types: list = None, folder: str = No
                         max_ray_distance: float = None, cage: str = None, green_channel: str = None,
                         pack_orm: bool = None, out_of_process: bool = None, job_id: str = None,
                         memory_limit_gb: float = None, baked_material: str = None,
-                        assign_baked: bool = None) -> dict:
-    "Bake several maps of one Blender setup (high-to-low or self) in one job, out of process by default - a second Blender bakes a copy of this session - named T_{object}_{suffix}, ORM packed on request; job_id alone polls it. See mif_help."
+                        assign_baked: bool = None, compute_backend: str = None) -> dict:
+    "Bake several maps of one Blender setup (high-to-low or self) in one job, out of process by default (a second Blender bakes a copy) - named T_{object}_{suffix}, ORM on request; job_id alone polls it. See mif_help."
     return _blender("bake_texture_set", object=object, types=types, folder=folder, pattern=pattern, width=width,
                     height=height, samples=samples, margin=margin, uvLayer=uv_layer, source=source,
                     extrusion=extrusion, maxRayDistance=max_ray_distance, cage=cage, greenChannel=green_channel,
                     packOrm=pack_orm, outOfProcess=out_of_process, jobId=job_id, memoryLimitGB=memory_limit_gb,
-                    bakedMaterial=baked_material, assignBaked=assign_baked, _timeout=600.0)
+                    bakedMaterial=baked_material, assignBaked=assign_baked, computeBackend=compute_backend,
+                    _timeout=600.0)
 
 
 @mcp.tool()
@@ -6957,15 +7339,33 @@ def bl_face_info(object: str, material: str = None, slot: int = None, indices: l
 
 @mcp.tool()
 def bl_vertex_info(object: str, indices: list = None, limit: int = None, evaluated: bool = None,
-                   group: str = None) -> dict:
-    "Where a Blender mesh's vertices ARE, and one vertex group's weight on each - bl_face_info's vertex twin. Nothing could read either: bl_list_vertex_groups gives counts and weight ranges, and bl_export_mesh writes FBX, so a position or a weight written through the bridge could be checked only through a render or a bounding box. Each row has index, co (local) and world. indices picks vertices in the order asked; without it the first `limit` come back (default 200, at most 20000) and verticesTruncated says when that is not all. group adds each row's weight - null for a vertex not in the group, 0.0 for one in it at zero - from the base mesh; evaluated reads the modifier result instead, whose vertex indices are its own, so the two are refused together. A read in edit mode is stale and says so. Call mif_help(\"bl_vertex_info\") first. An object that draws instances - Geometry Nodes instances, particles, instancing - answers with instancesNote: instances are not part of any evaluated mesh, so this does not see them (measured on 3.6-5.2)."
-    return _blender("vertex_info", object=object, indices=indices, limit=limit, evaluated=evaluated, group=group)
+                   group: str = None, color=None) -> dict:
+    "A Blender mesh's vertex positions, with one group's weights or a color attribute - bl_face_info's twin. Nothing could read either: bl_list_vertex_groups gives counts and weight ranges, and bl_export_mesh writes FBX, so a position or a weight written through the bridge could be checked only through a render or a bounding box. Each row has index, co (local) and world. indices picks vertices in the order asked; without it the first `limit` come back (default 200, at most 20000) and verticesTruncated says when that is not all. group adds each row's weight - null for a vertex not in the group, 0.0 for one in it at zero - from the base mesh; evaluated reads the modifier result instead, whose vertex indices are its own, so the two are refused together. color (an attribute) adds each row's stored RGBA and per-channel colorStats. A read in edit mode is stale and says so. Call mif_help(\"bl_vertex_info\") first. An object that draws instances - Geometry Nodes instances, particles, instancing - answers with instancesNote: instances are not part of any evaluated mesh, so this does not see them (measured on 3.6-5.2)."
+    return _blender("vertex_info", object=object, indices=indices, limit=limit, evaluated=evaluated, group=group,
+                    color=color)
 
 
 @mcp.tool()
 def bl_export_vertex_positions(object: str, file: str, root: str = None, overwrite: bool = None, shape_key: str = None) -> dict:
     "Write a Blender mesh's vertex positions (or one shape key's, with shape_key) to a .json file in Unreal's mesh frame (cm, Y negated), in its own vertex order - the file set_skeletal_mesh_vertices reads. On an import of export_asset's FBX that order is the export order."
     return _blender("export_vertex_positions", object=object, file=file, root=root, overwrite=overwrite, shapeKey=shape_key)
+
+
+@mcp.tool()
+def bl_read_mesh_data(object: str, file: str, space: str = None, evaluated: bool = None, shape_key: str = None,
+                      uvs: bool | list = None, material_indices: bool = None, loose_edges: bool = None,
+                      overwrite: bool = None) -> dict:
+    "Write a Blender mesh's vertices and faces (and optionally UVs and material indices) to a .json or .npz file for an outside script, local or world space, base or evaluated; bl_create_mesh and bl_set_mesh_vertices read the same file back."
+    return _blender("read_mesh_data", object=object, file=file, space=space, evaluated=evaluated, shapeKey=shape_key,
+                    uvs=uvs, materialIndices=material_indices, looseEdges=loose_edges, overwrite=overwrite)
+
+
+@mcp.tool()
+def bl_set_mesh_vertices(object: str, vertices: list = None, file: str = None, space: str = None, shape_key: str = None,
+                         tolerance: float = None, dry_run: bool = None) -> dict:
+    "Write every vertex of an existing Blender mesh (or one shape key) by array or from bl_read_mesh_data's file, keeping the object; refuses a wrong count or another topology and reports how many vertices moved and how far."
+    return _blender("set_mesh_vertices", object=object, vertices=vertices, file=file, space=space, shapeKey=shape_key,
+                    tolerance=tolerance, dryRun=dry_run)
 
 
 @mcp.tool()
@@ -7005,7 +7405,8 @@ def bl_export_mesh(object_name: str = None, file: str = None, object_types: list
                    bake_anim_simplify: float = None, bake_anim_force_keying: bool = None,
                    animations_only: bool = None, objects: list = None, global_scale: float = None,
                    apply_scale_options: str = None, path_mode: str = None, embed_textures: bool = None,
-                   facing_body=None, split_shape_corners: bool = None) -> dict:
+                   facing_body=None, split_shape_corners: bool = None, lod_groups: bool = None,
+                   profile: str = None) -> dict:
     "Export Blender objects to FBX for reimport into Unreal - object_name, or objects for one file in which every mesh keeps the scene origin as its pivot. The two axis arguments are the whole ballgame and are set for you: axis_up='Z', axis_forward='Y', which are NOT the operator defaults ('Y' / '-Z', the Maya convention) - the defaults"
     # THE FOUR OVERRIDES BELOW WERE UNREACHABLE, and they are the ones that decide what UNREAL
     # receives rather than what Blender thinks it exported. The addon has always mapped them onto
@@ -7037,7 +7438,8 @@ def bl_export_mesh(object_name: str = None, file: str = None, object_types: list
                     bakeAnimNla=bake_anim_nla, bakeAnimSimplify=bake_anim_simplify,
                     bakeAnimForceKeying=bake_anim_force_keying, animationsOnly=animations_only, objects=objects,
                     globalScale=global_scale, applyScaleOptions=apply_scale_options, pathMode=path_mode,
-                    embedTextures=embed_textures, facingBody=facing_body, splitShapeCorners=split_shape_corners)
+                    embedTextures=embed_textures, facingBody=facing_body, splitShapeCorners=split_shape_corners,
+                    lodGroups=lod_groups, profile=profile)
 
 
 @mcp.tool()
@@ -7123,7 +7525,7 @@ def bl_run_python(code: str = "", file: str = "", return_locals: bool = False, f
 
 
 # THE ASSET TOOLS, NAMED AT THE MOMENT AN AGENT DECIDES HOW TO BUILD - in the reply of the session's first Blender Python
-# call that succeeds, once. benchmark round ten (2026-10-01, 69b2e433): 10 of 10 Blender asset runs (a crate, a kit, a
+# call that succeeds, once. Benchmark round ten (2026-10-01, 69b2e433): 10 of 10 Blender asset runs (a crate, a kit, a
 # boulder, a rock family, ground cover, LODs, vertex masks, a tree, two hand-offs to Unreal) built everything with
 # run_python and called no bl_build_*, bl_recipe_game_ready or mif_send_to_unreal. What they saw on the lean default
 # was three tools: run_python's sent text is its first sentence only (the "prefer a typed tool" sentence is past
@@ -7156,7 +7558,7 @@ _ASSET_TOOLS_HINTED = []
 
 def _asset_tools_once(reply):
     # A REFUSAL BECAUSE PYTHON IS OFF CARRIES IT TOO: then the typed tools are the only way to build, and that refusal
-    # is the first thing such a session reads. benchmark round ten's Python-off arm opened all 20 runs with it, never saw
+    # is the first thing such a session reads. Benchmark round ten's Python-off arm opened all 20 runs with it, never saw
     # the note (it rode only a success), and went to find_tools('blender mesh', limit 40) - 14,737 characters replayed
     # on every later request - to find the builders (docs/TOKEN_OPTIMIZATION.md 2.18). Any other failure still does not
     # spend it.
@@ -7614,6 +8016,7 @@ _PICTURE_TOOLS = {
     "capture_camera": ("path",), "capture_viewport": ("file",), "capture_level_map": ("file",),
     "preview_animation": ("frames.file",), "render_thumbnail": ("pngPath",), "preview_widget": ("path",),
     "preview_composite_widget": ("path",), "render_graph_image": ("path",), "mif_view_image": ("file",),
+    "uefn_capture": ("file",),
 }
 _IMAGE_MODE = contextvars.ContextVar("mif_image_mode", default=None)    # None: a handler called outside call_tool
 _IMAGE_DEFAULT_PX = 1024              # mif_media.image says why, and fits to these
@@ -7753,6 +8156,14 @@ def _note_failed_call(backend, endpoint, payload, data):
                           "payload": dict(payload or {}), "error": str(data.get("error") or "")[:2000],
                           "errorCode": data.get("errorCode")})
     del _FAILED_CALLS[:-_FAILED_KEEP]
+
+
+@mcp.tool()
+def mif_view_image(path: str, max_px: int = None, max_bytes: int = None) -> dict:
+    "Look at a PNG, BMP or JPG on disk: it comes back as an image block, scaled to max_px on its longest edge (default 1024, at most 1568) and max_bytes (default 512 KB). For a render a client cannot otherwise open: run_python's, a bl_render_animation frame, a baked map. Encoded here; nothing changes."
+    if not isinstance(path, str) or not os.path.isfile(path):
+        return {"ok": False, "error": "%r is not a file this server can read. Nothing was shown." % (path,)}
+    return {"ok": True, "file": path, "_imageLimits": [max_px, max_bytes]}
 
 # THE ROADMAP (1.3, docs/30_ROADMAP.md). "Help newbs plan every step to make their mod happen" - and the shallow version
 # of that is worse than none: a plan that says "save the map" to a bridge in scratch mode, or names a call that refuses on
@@ -8148,7 +8559,7 @@ def _with_pack_rules(name, out):
     return out
 
 
-# THE DEFAULT IS core, decided on 2026-09-23. the benchmark's core arm (33 runs on 11baf1c7, Claude Code's tool
+# THE DEFAULT IS core, decided on 2026-09-23. A benchmark's core arm (33 runs on 11baf1c7, Claude Code's tool
 # search, 0 wrong) cost 227,116 tokens a task against 259,923 for all 711 tools - cheaper on 9 of 11 tasks - and a
 # client that loads every schema up front pays ~8k tokens a request for core against ~147k for all
 # (docs/TOKEN_OPTIMIZATION.md 3.5). The rest stay reachable: find_tools names a tool's pack, mif_enable_pack loads it
@@ -8190,18 +8601,25 @@ def _apply_tool_packs(selection=None):
         if name not in keep and callable(fn):
             _UNLOADED[name] = fn
             mcp.remove_tool(name)
+    # Unity's tools start held back (_load_unity), so a selection that names their pack is the one case that adds here.
+    if "unity" in known:
+        _UNITY_SESSION["on"] = True
+        _UNITY_SESSION["only"] = not [p for p in known if p not in ("core", "unity")]
+    for name in (packs.get("unity") or {}).get("tools") or []:
+        if name in keep and name in _UNLOADED:
+            mcp.add_tool(_UNLOADED.pop(name))
     if raw == "lean":
         return ("the lean default: %s loaded; %d held back - find_tools finds them, mif_call calls them, "
                 "MIF_TOOL_PACKS=core loads core" % (", ".join(sorted(registry)), len(_UNLOADED)))
     return "packs %s loaded (%d tools); %d held back%s%s" % (
         ",".join(sorted(known)), len(registry), len(_UNLOADED),
-        "; a Blender-only selection, so only core's backend-neutral tools" if lean else "",
+        "; no Unreal-plugin pack (Blender or UEFN only), so only core's backend-neutral tools" if lean else "",
         "; unknown pack name(s) ignored: %s" % ", ".join(unknown) if unknown else "")
 
 
 # A BLENDER SESSION DOES NOT CARRY UNREAL'S CORE TOOLS. Thirteen of core's eighteen talk to Unreal only (find_assets,
 # get/set_property, batch, the saves, ...), and a selection naming nothing but Blender packs paid ~2,300 tokens for
-# them on every request - ~17k a Blender task (the benchmark, 2026-09-22, docs/TOKEN_OPTIMIZATION.md). It was decided then
+# them on every request - ~17k a Blender task (a benchmark, 2026-09-22, docs/TOKEN_OPTIMIZATION.md). It was decided then
 # that such a selection keeps only core's `neutral` tools, whether or not it also names core, since core is loaded
 # either way. The rest stay reachable: find_tools names their pack, mif_call reaches them, and enabling core or any
 # pack that is not Blender's brings them back (mif_enable_pack). A selection with any other pack is unchanged.
@@ -8213,11 +8631,19 @@ def _core_unreal_tools() -> set:
     return (set(core.get("tools") or []) - neutral) if neutral else set()
 
 
+# AND A UEFN SESSION NEITHER (decided 2026-11-16): core's Unreal tools talk to the Unreal plugin, which UEFN cannot load,
+# so a selection whose packs are Blender's and the uefn pack - UEFN alone, or the Blender-to-UEFN hand-off - keeps only
+# core's neutral tools too. uefn_status is in the uefn pack; find_tools and mif_call are neutral.
+# Unity's tools call neither Unreal nor Blender either, so a Unity selection takes only core's neutral tools the same way.
+_NON_UNREAL_BACKENDS = ("blender", "uefn", "unity")
+
+
 def _blender_only(pack_ids) -> bool:
-    """True when every pack but core is a Blender pack, and there is at least one."""
+    """True when every pack but core drives something other than the Unreal plugin (Blender or UEFN), and there is at
+    least one. The name is the original Blender rule's; UEFN joined it."""
     packs = _packs()
     rest = [p for p in pack_ids if p != "core"]
-    return bool(rest) and all((packs.get(p) or {}).get("backend") == "blender" for p in rest)
+    return bool(rest) and all((packs.get(p) or {}).get("backend") in _NON_UNREAL_BACKENDS for p in rest)
 
 
 def _register_pack_prompts():
@@ -8231,18 +8657,22 @@ def _register_pack_prompts():
             continue
         title, desc = p.get("title") or pid, p.get("description") or ""
         blender = p.get("backend") == "blender"
-        where = "in Blender through MifBlender" if blender else "in Unreal Engine through MifBridge"
+        uefn = p.get("backend") == "uefn"
+        where = ("in Blender through MifBlender" if blender else
+                 "in UEFN (Unreal Editor for Fortnite) through MifBridge's UEFN backend, a preview" if uefn else
+                 "in Unreal Engine through MifBridge")
         needs = p.get("requires") or []
         also = (" That also loads %s, which this pack needs." % ", ".join(needs)) if needs else ""
         # THE PACK'S OWN RULES FOLLOW THE SHARED ONES, after the rules of what it loads with it (a Blender workflow
-        # pack brings blender_core) and, for an Unreal pack, core's - the tools every Unreal session has.
+        # pack brings blender_core) and, for an Unreal pack, core's - the tools every Unreal session has. Core's rules
+        # are about the Unreal plugin's tools, so the UEFN pack does not get them.
         own = "".join(_rules_block(q, "Rules for %s, which this pack loads with it:" % q) for q in needs)
-        if not blender:
+        if not blender and not uefn:
             own += _rules_block("core", "Rules for the core tools, in every Unreal session:")
         own += _rules_block(pid, "Rules for this pack (%s):" % pid)
 
-        def make(pid=pid, title=title, desc=desc, where=where, also=also, rules=(
-                (_BLENDER_PACK_RULES if blender else _PACK_RULES) + ("\n" + own if own else ""))):
+        def make(pid=pid, title=title, desc=desc, where=where, also=also, first="uefn_status" if uefn else "self_audit",
+                 rules=((_BLENDER_PACK_RULES if blender else "" if uefn else _PACK_RULES) + ("\n" + own if own else ""))):
             def pack_prompt() -> str:
                 return ("You are working %s, on %s. %s\n\n"
                         "First: if these tools are not in your tool list, call mif_enable_pack('%s') - through "
@@ -8252,8 +8682,8 @@ def _register_pack_prompts():
                         "re-read their list mid-session - so if they still do not appear, call them through "
                         "mif_call(tool, args), which reaches every MifBridge tool without a refresh. A "
                         "restart only helps with MIF_TOOL_PACKS including '%s': restarting without changing "
-                        "it starts the same selection again. Then call self_audit.\n\n%s"
-                        % (where, title, desc, pid, pid, also, pid, rules))
+                        "it starts the same selection again. Then call %s.\n\n%s"
+                        % (where, title, desc, pid, pid, also, pid, first, rules))
             return pack_prompt
         add(name="mif-pack-%s" % pid,
             description="Work on %s with MifBridge - loads the %s pack and its rules." % (title, pid))(make())
@@ -8317,13 +8747,34 @@ class _ExtTransport:
         return _blender_forwarded(op, **params)
 
 
+def _load_unity():
+    """Make the Unity backend's pack one of the server's packs, every tool held back. Never at import, and never on any default: "all" and "lean" leave it out too, because a tool list costs every client on every turn
+    and Unreal and Blender sessions have no use for these. find_tools(backend="unity") finds them, mif_call calls them, MIF_TOOL_PACKS=unity or mif_enable_pack loads them."""
+    try:
+        import unity_backend        # beside this file
+    except Exception as exc:  # noqa: BLE001 - a broken Unity module must not take the other two backends down
+        return "unity backend: not loaded (%s: %s)" % (type(exc).__name__, exc)
+    packs = _packs()
+    if not isinstance(packs, dict) or packs.get("__error__"):
+        return "unity backend: not loaded (packs.json unreadable)"
+    taken = set(getattr(getattr(mcp, "_tool_manager", None), "_tools", None) or {}) | set(_UNLOADED)
+    clash = sorted(n for n in unity_backend.TOOLS if n in taken)
+    if clash:
+        return "unity backend: not loaded (names taken: %s)" % ", ".join(clash)
+    _UNLOADED.update(unity_backend.TOOLS)
+    unity_backend.BLENDER = _blender
+    packs["unity"] = dict(unity_backend.PACK)
+    return "unity backend: %d tools held back" % len(unity_backend.TOOLS)
+
+
 def _load_extensions():
     """Load every installed extension, register its tools and add its pack. Returns a log line."""
     import mifext       # stdlib only, beside this file
     registry = getattr(getattr(mcp, "_tool_manager", None), "_tools", None)
     taken = set(registry or {}) | set(_UNLOADED) | {n for n, f in globals().items() if callable(f)}
     rep = mifext.load_all(_ExtTransport(), taken)
-    _EXT_STATE.update(ran=True, failed=list(rep["failed"]), dirs=list(rep["dirs"]), disabled=rep["disabled"], loaded=[])
+    _EXT_STATE.update(ran=True, failed=list(rep["failed"]), dirs=list(rep["dirs"]), disabled=rep["disabled"], loaded=[],
+                      notEnabled=list(rep.get("notEnabled") or []), unknownEnabled=list(rep.get("unknownEnabled") or []))
     packs = _packs()
     for ext in rep["loaded"]:
         m = ext.manifest
@@ -8351,11 +8802,18 @@ def _load_extensions():
                 "rules": [{"rule": r, "tools": []} for r in pack.get("rules") or []],
                 "extension": ext.name}
         _EXT_STATE["loaded"].append(ext.row())
+    held = _EXT_STATE["notEnabled"]
+    tail = ""
+    if held:
+        tail = "; %d installed but not enabled (%s) - %s" % (len(held), ", ".join(r["name"] for r in held),
+                                                            mifext.enable_hint())
+    if _EXT_STATE["unknownEnabled"]:
+        tail += "; MIF_EXTENSIONS names %s, which is not installed" % ", ".join(_EXT_STATE["unknownEnabled"])
     if rep["disabled"]:
-        return "extensions: off (MIF_EXTENSIONS)"
+        return "extensions: none loaded (MIF_EXTENSIONS unset or off)" + tail
     return "extensions: %d loaded (%s), %d failed, from %s" % (
         len(_EXT_STATE["loaded"]), ", ".join(r["name"] for r in _EXT_STATE["loaded"]) or "-",
-        len(_EXT_STATE["failed"]), os.pathsep.join(rep["dirs"]))
+        len(_EXT_STATE["failed"]), os.pathsep.join(rep["dirs"])) + tail
 
 # ---------------------------------------------------------------------------
 # TEMPLATES - a start that asks the user what they want to make. Added 2026-09-27 (the request: "templates where it like
@@ -8526,6 +8984,8 @@ async def mif_enable_pack(pack: str) -> dict:
     if unknown or not resolved:
         return {"error": "no pack named %r." % pack, "packs": sorted(p for p in packs if p != "__error__"),
                 "aliases": sorted(_pack_aliases())}
+    if "unity" in resolved:
+        _UNITY_SESSION["on"] = True
     # UNREAL WORK IN A SESSION THAT STARTED BLENDER-ONLY needs the Unreal core tools the selection held back (see
     # _core_unreal_tools): core comes along with any pack that is not a Blender pack - and only then, so an ordinary
     # session's enables name exactly the packs they always named.
@@ -8928,6 +9388,11 @@ async def mif_call(tool: str, args: dict | None = None) -> Any:
     if name not in registry:
         fn = _UNLOADED.pop(name, None)
         if fn is None:
+            held = next((r for r in _EXT_STATE.get("notEnabled") or [] if name in (r.get("tools") or [])), None)
+            if held is not None:
+                # AN INSTALLED EXTENSION THAT IS NOT OPTED IN (1.4): its tool is unknown here on purpose, and says why
+                return {"ok": False, "error": "%r is a tool of the extension %r, installed but not loaded - %s"
+                                              % (name, held["name"], held["enable"]), "extension": held["name"]}
             forwarded = _forward_to_newer_editor(name, args)
             if forwarded is not None:
                 return forwarded
@@ -8938,7 +9403,7 @@ async def mif_call(tool: str, args: dict | None = None) -> Any:
     params = (registry[name].parameters or {}).get("properties") or {}
     # A BLIND CALL SPELLS THE OBJECT BOTH WAYS, AND IN THE ADD-ON'S NAMES. mif_call shows no schema, so an agent guesses
     # from the last tool it used: the Blender tools name the object they act on `object` (75 of them) or `object_name`
-    # (22), and the benchmark's core arm - core became the default on 2026-09-23 - failed 10 of its 15 unknown-parameter
+    # (22), and a benchmark's core arm - core became the default on 2026-09-23 - failed 10 of its 15 unknown-parameter
     # mif_call calls on exactly that, and one more in the add-on's camelCase names, as bl_describe_op reports them
     # (ledger CC16). For a bl_ tool each is renamed to the tool's own parameter: the object's other spelling only when
     # the tool takes it, an add-on name only through the map read off the tool's own call (_op_param_names), neither
@@ -9122,6 +9587,7 @@ def main():
          f"probe={BLENDER_PROBE_TIMEOUT}s work={BLENDER_TIMEOUT}s (lazy connect)")
     _log("generative tools: " + _apply_generative_mode())    # first: the packs must never hold a hidden gen tool back
     _log(_load_extensions())                                 # before the packs, so extension tools are held back too
+    _log(_load_unity())
     _log("tool packs: " + _apply_tool_packs())
     _log("docs first: " + _apply_docs_first())
     _log("pack prompts registered: %d" % _register_pack_prompts())
@@ -9252,6 +9718,24 @@ def mif_help(tool: str = "") -> dict:
     return {"error": "no tool named %r. Either the name is wrong, or it is an ENDPOINT name rather "
                      "than an MCP tool name - describe_endpoint {name} answers for those." % name,
             "didYouMean": near}
+
+# --------------------------------------------------------------------------
+# UEFN (preview, 1.4.0) - Unreal Editor for Fortnite through MifBridge's listener inside it, installed through Epic's
+# UEFN MCP. The logic is the mif_uefn package beside this file; these are thin bindings, and the TCP-table reader is
+# handed in so the package keeps no second copy of it.
+# A transform is {location: {x, y, z}, rotation: {pitch, yaw, roll}, scale: {x, y, z}}, every component.
+# --------------------------------------------------------------------------
+_UEFN_BACKEND = []
+
+
+def _uefn():
+    if not _UEFN_BACKEND:
+        import importlib
+        here = os.path.dirname(os.path.abspath(__file__))
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        _UEFN_BACKEND.append(importlib.import_module("mif_uefn.backend").Backend(listening_pid=_listening_pid))
+    return _UEFN_BACKEND[0]
 
 if __name__ == "__main__":
     main()

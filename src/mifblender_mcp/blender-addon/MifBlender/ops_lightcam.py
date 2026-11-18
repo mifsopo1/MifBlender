@@ -28,7 +28,7 @@ import time
 import bpy
 import mathutils
 
-from .ops_common import (remove_objects, INFLUENCE_BOOL, INFLUENCE_INT, INFLUENCE_MAP, MifOpError, PANO_FIELDS, basis_space,
+from .ops_common import (remove_objects, data_name_report, INFLUENCE_BOOL, INFLUENCE_INT, INFLUENCE_MAP, MifOpError, PANO_FIELDS, basis_space,
                          camera_readback, check_axis_dict, exclude_rows, finite_floats,
                          get_object, light_readback, limit_rows, object_info, pano_holder,
                          refuse_unsupported_shadow, reject_unknown, rnd, rotation_euler_values, rotation_mode_note,
@@ -44,6 +44,9 @@ _LIGHT_KEYS = {
     "spotAngle", "spotBlend", "angle", "shadow", "diffuseFactor", "specularFactor",
     "temperature", "useTemperature",
 }
+# collection is the CREATE call's alone: where a new light is linked. set_light changes one that exists and never
+# moves it, so _SET_LIGHT_KEYS builds on _LIGHT_KEYS without it (see _SET_IN_COLLECTION_NOTE).
+_CREATE_LIGHT_KEYS = set(_LIGHT_KEYS) | {"collection"}
 
 _CAMERA_KEYS = {
     "name", "location", "rotation", "lens", "focalLength", "sensorWidth",
@@ -53,6 +56,9 @@ _CAMERA_KEYS = {
     # set either, so a camera could be DESCRIBED in more detail than it could be built.
     "focusObject", "fieldOfView",
 }
+# A COLLECTION, as create_mesh takes (FOUND 2026-11-09: four sheet cameras landed in the scene root and needed a
+# link_objects move each). Resolved before anything exists. create_camera's alone, as for lights.
+_CREATE_CAMERA_KEYS = set(_CAMERA_KEYS) | {"collection"}
 
 
 def _vec3(params, key, default, verb="created"):
@@ -460,7 +466,7 @@ def op_create_light_probe(params):
 
     wanted = str(take(params, "name", default="LightProbe", kind=str))
     data = bpy.data.lightprobes.new(name=wanted, type=resolved)
-    obj = bpy.data.objects.new(data.name, data)
+    obj = bpy.data.objects.new(wanted, data)
     coll.objects.link(obj)
     obj.location = want_loc
     obj.rotation_euler = want_rot
@@ -537,6 +543,8 @@ def op_create_light_probe(params):
             out[label] = v if isinstance(v, str) else round(float(v), 6)
     out["settingsOnThisType"] = sorted(k for k in ("influenceType", "influenceDistance", "falloff",
                                                    "clipStart", "clipEnd") if k in out)
+    out.setdefault("collection", coll.name)
+    out.update(data_name_report(data, wanted))
     return out
 
 
@@ -555,7 +563,9 @@ def op_create_light(params):
       spotAngle / spotBlend  SPOT only, spotAngle in RADIANS
       angle (float)          SUN only, angular diameter in radians
     """
-    reject_unknown(params, _LIGHT_KEYS, "create_light")
+    reject_unknown(params, _CREATE_LIGHT_KEYS, "create_light")
+    from .ops_create import _resolve_collection   # noqa: PLC0415 - the one resolver every create op uses
+    coll = _resolve_collection(params)
     kind = str(take(params, "type", "lightType", "kind", default="POINT", kind=str)).upper()
     valid = _valid_light_types()
     if kind not in valid:
@@ -589,8 +599,8 @@ def op_create_light(params):
         wanted = str(take(params, "name", default="Light", kind=str))
         data = bpy.data.lights.new(name=wanted,
                                    type=kind)
-        obj = bpy.data.objects.new(data.name, data)
-        bpy.context.scene.collection.objects.link(obj)
+        obj = bpy.data.objects.new(wanted, data)
+        coll.objects.link(obj)
 
         # Checked BEFORE the object is placed, for the same reason op_set_light does it: the only
         # thing in the property block that can refuse is the temperature, and refusing after the
@@ -629,12 +639,20 @@ def op_create_light(params):
         out["nameWasSuffixed"] = obj.name != wanted
         out["nameNote"] = ("Blender renames on collision rather than failing, so `name` is what the "
                            "object ACTUALLY got - check nameWasSuffixed rather than assuming.")
+        out.setdefault("collection", coll.name)
+        out.update(data_name_report(data, wanted))
         return out
     finally:
         selection_restore(snap)
 
 
+# NOT collection. It is where create_light LINKS a new light, and set_light never read it: while it sat in
+# _LIGHT_KEYS, it passed set_light's reject_unknown and the light stayed where it was under ok:true (FOUND 2026-11-15 by
+# param_reach - no MCP tool sent it). Refused with the route instead (_SET_IN_COLLECTION_NOTE).
 _SET_LIGHT_KEYS = set(_LIGHT_KEYS) | {"object", "light", "energyScale", "stops"}
+_SET_IN_COLLECTION_NOTE = {"collection": "collection is where a create call links a NEW object; this call changes one "
+                                         "that exists and never moves it. Move it with link_objects (move=true takes it "
+                                         "out of the collections it was in). NOTHING was changed."}
 
 
 def _energy_factor(params):
@@ -711,7 +729,7 @@ def op_set_light(params):
     Every refusal fires before any write. A caller who names one bad key gets a light in exactly
     the state it was in before the call.
     """
-    reject_unknown(params, _SET_LIGHT_KEYS, "set_light")
+    reject_unknown(params, _SET_LIGHT_KEYS, "set_light", notes=_SET_IN_COLLECTION_NOTE)
     want = take(params, "object", "light", "name", default=None, kind=str)
     if not want:
         raise MifOpError("'object' is required - the name of the light to change "
@@ -975,7 +993,9 @@ def op_create_camera(params):
       shiftX / shiftY
       makeActive (bool)      also set scene.camera, default True
     """
-    reject_unknown(params, _CAMERA_KEYS, "create_camera")
+    reject_unknown(params, _CREATE_CAMERA_KEYS, "create_camera")
+    from .ops_create import _resolve_collection   # noqa: PLC0415 - the one resolver every create op uses
+    coll = _resolve_collection(params)
     if "lookAt" in params and "rotation" in params:
         raise MifOpError("pass lookAt OR rotation, not both - they are two answers to the same "
                          "question and there is no sensible way to combine them. NOTHING was "
@@ -1033,8 +1053,8 @@ def op_create_camera(params):
     try:
         wanted = str(take(params, "name", default="Camera", kind=str))
         data = bpy.data.cameras.new(name=wanted)
-        obj = bpy.data.objects.new(data.name, data)
-        bpy.context.scene.collection.objects.link(obj)
+        obj = bpy.data.objects.new(wanted, data)
+        coll.objects.link(obj)
 
         obj.location = loc
         obj.rotation_euler = want_rot
@@ -1108,11 +1128,14 @@ def op_create_camera(params):
         if "lookAt" in params:
             out["aimNote"] = ("rotation was DERIVED from lookAt - a Blender camera faces its local "
                               "-Z, which is the thing hand-written aiming gets wrong first.")
+        out.setdefault("collection", coll.name)
+        out.update(data_name_report(data, wanted))
         return out
     finally:
         selection_restore(snap)
 
 
+# not collection, as _SET_LIGHT_KEYS: set_camera never read it and left the camera where it was under ok:true
 _SET_CAMERA_KEYS = set(_CAMERA_KEYS) | {"object", "camera"}
 
 
@@ -1144,7 +1167,7 @@ def op_set_camera(params):
     before/after carry the camera's world location and rotationEuler, so a rotation that did not land shows in
     changedFields. Every refusal fires before any write.
     """
-    reject_unknown(params, _SET_CAMERA_KEYS | {"sensorHeight", "sensorFit"}, "set_camera")
+    reject_unknown(params, _SET_CAMERA_KEYS | {"sensorHeight", "sensorFit"}, "set_camera", notes=_SET_IN_COLLECTION_NOTE)
     want = take(params, "object", "camera", "name", default=None, kind=str)
     if not want:
         raise MifOpError("'object' is required - the name of the camera to change (list them with "

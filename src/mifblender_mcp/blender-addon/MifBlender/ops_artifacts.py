@@ -171,7 +171,8 @@ def op_artifact_inventory(params):
     exact, patterns, libraries = _session_references()
     blend = bpy.data.filepath
     open_blend = artifacts.canonical(blend) if blend else None
-    dirty = bool(bpy.data.is_dirty)
+    from .ops_file import _is_dirty                             # noqa: PLC0415 - the bridge's count, not the flag
+    dirty = _is_dirty()          # Blender's flag is true in any background session (FOUND 2026-11-09)
 
     canonical_roots = [artifacts.canonical(r) for r in resolved]
     in_scope = {p: r for p, r in records.items() if not resolved or any(_inside(p, c) for c in canonical_roots)}

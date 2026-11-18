@@ -234,6 +234,8 @@ def _builtin_op_table():
     table.update(ops_nature.OPS)
     from . import ops_kit
     table.update(ops_kit.OPS)
+    from . import ops_road
+    table.update(ops_road.OPS)
     from . import ops_undo
     table.update(ops_undo.OPS)
     from . import ops_topology
@@ -583,6 +585,7 @@ READBACK_SUPPRESSES = {
     "transfer_by_uv":          ("counts",),
     "transform_object":        ("object",),
     "trim_to_outline":         ("after",),
+    "uv_unwrap":               ("layout",),
     "wrap_to_target":          ("counts",),
     "draw_grease_pencil_strokes": ("layerFrames",),
 }
@@ -794,7 +797,7 @@ def _dispatch(request, started):
             cap.gate(endpoint, params)
         result = fn(params)
     except MifOpError as exc:
-        ops_undo.after_write(endpoint)
+        ops_undo.after_write(endpoint, refused=True)
         # A deliberate, actionable refusal from an op. Not a bug -- do not
         # print a traceback for these, the message IS the diagnosis. A capped call's preview rides in its payload.
         return jsonable(dict(getattr(exc, "payload", None) or {}, ok=False, endpoint=endpoint, error=str(exc),
@@ -841,11 +844,12 @@ def _dispatch(request, started):
 # ---------------------------------------------------------------------------
 
 class MifBlenderServer:
-    def __init__(self, port=DEFAULT_PORT, token="dev", job_timeout=DEFAULT_JOB_TIMEOUT,
+    def __init__(self, port=DEFAULT_PORT, token="dev", job_timeout=DEFAULT_JOB_TIMEOUT, token_source="argument",
                  verbose=True):
         self.host = HOST
         self.port = int(port)
         self.token = token or ""
+        self.token_source = token_source      # argument | per-install | custom | none | default (...): ping says which
         self.job_timeout = float(job_timeout)
         self.verbose = bool(verbose)
         self.running = False
@@ -1047,10 +1051,7 @@ class MifBlenderServer:
                     continue
 
                 if not self._auth_ok(request):
-                    self._reply(client, {"ok": False,
-                                         "error": "bad or missing token (send it as the "
-                                                  "'token' field; it is set in the addon "
-                                                  "preferences)"})
+                    self._reply(client, self._auth_refusal(request))
                     break
 
                 if background:
@@ -1098,6 +1099,22 @@ class MifBlenderServer:
                          "had, it may still complete -- check the scene before "
                          "retrying. A job known to be long can send 'jobTimeout' "
                          "(seconds) beside its endpoint." % wait}
+
+    def _auth_refusal(self, request):
+        """The refusal of a frame whose token is wrong. code bad_token tells a client the op never ran, so it may
+        resend with another token (the MCP server does, once: the file's token, then the old default). A client still
+        sending the old default "dev" to a per-install Blender is told where the token is now (1.4)."""
+        out = {"ok": False, "code": "bad_token",
+               "error": "bad or missing token (send it as the 'token' field; it is set in the addon preferences)"}
+        if request.get("token") == "dev" and self.token_source == "per-install":
+            from . import token_store
+            out["error"] = (
+                "bad or missing token: this client sends 'dev', the default before MifBlender 1.4. This Blender now uses "
+                "a token made for this install, kept in %s. The MifBridge MCP server reads that file by itself - remove "
+                "MIF_BLENDER_TOKEN=dev from its config (or set MIF_BLENDER_TOKEN to the file's contents). Any other "
+                "client sends the file's contents (Copy Token in the add-on preferences). To keep a token of your own, "
+                "set Token to Custom there. Nothing was run." % token_store.token_path())
+        return out
 
     def _auth_ok(self, request):
         if not self.token:
@@ -1159,5 +1176,6 @@ class MifBlenderServer:
             "jobTimeout": self.job_timeout,
             "background": bpy.app.background,
             "authRequired": bool(self.token),
+            "tokenSource": self.token_source,
             "protocolVersion": PROTOCOL_VERSION,
         }

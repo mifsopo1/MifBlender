@@ -60,7 +60,50 @@ _FACE_KEYS = {"object", "name", "material", "slot", "indices", "limit", "withFac
               "evaluated"}
 
 _DEFAULT_FACE_LIMIT = 200
-_VERTEX_KEYS = {"object", "name", "indices", "limit", "evaluated", "group"}
+_VERTEX_KEYS = {"object", "name", "indices", "limit", "evaluated", "group", "color"}
+
+
+def _color_readback(mesh, attr_name):
+    """(per-vertex [r, g, b, a] list, per-vertex 'corners differ' flags, stats) for a color attribute, as STORED - the
+    sRGB-encoded value a BYTE_COLOR keeps (value x 255), which is what Unreal's VertexColor node reads. A CORNER
+    attribute's vertex value is the mean of its corners. stats covers every element of the attribute: per channel min,
+    max, mean and a 10-bin histogram over 0-1."""
+    attr = mesh.color_attributes.get(attr_name)
+    n_el = len(attr.data)
+    buf = [0.0] * (4 * n_el)
+    prop = "color_srgb" if hasattr(attr.data[0] if n_el else None, "color_srgb") else "color"
+    attr.data.foreach_get(prop, buf)
+    nv = len(mesh.vertices)
+    if attr.domain == "POINT":
+        per_v = [buf[4 * i:4 * i + 4] for i in range(nv)]
+        varies = [False] * nv
+    else:
+        loop_v = [0] * len(mesh.loops)
+        mesh.loops.foreach_get("vertex_index", loop_v)
+        acc = [[0.0, 0.0, 0.0, 0.0, 0] for _ in range(nv)]
+        lo = [[9.0] * 4 for _ in range(nv)]
+        hi = [[-9.0] * 4 for _ in range(nv)]
+        for li, v in enumerate(loop_v):
+            c = buf[4 * li:4 * li + 4]
+            a = acc[v]
+            for k in range(4):
+                a[k] += c[k]
+                lo[v][k] = min(lo[v][k], c[k])
+                hi[v][k] = max(hi[v][k], c[k])
+            a[4] += 1
+        per_v = [[a[k] / a[4] for k in range(4)] if a[4] else [0.0, 0.0, 0.0, 0.0] for a in acc]
+        varies = [any(hi[v][k] - lo[v][k] > 0.5 / 255 for k in range(4)) if acc[v][4] else False for v in range(nv)]
+    stats = {}
+    for k, ch in enumerate("RGBA"):
+        vals = buf[k::4]
+        hist = [0] * 10
+        for x in vals:
+            hist[min(9, max(0, int(x * 10)))] += 1
+        stats[ch] = {"min": round(min(vals), 4) if vals else None, "max": round(max(vals), 4) if vals else None,
+                     "mean": round(sum(vals) / len(vals), 4) if vals else None, "histogram10": hist}
+    return per_v, varies, {"attribute": attr.name, "domain": attr.domain, "dataType": attr.data_type,
+                           "elements": n_el, "encoding": "sRGB as stored" if prop == "color_srgb" else "linear",
+                           "channels": stats}
 _DEFAULT_VERTEX_LIMIT = 200
 _MAX_VERTEX_ROWS = 20000
 
@@ -773,6 +816,11 @@ def op_vertex_info(params):
       evaluated (bool)      the MODIFIER RESULT instead of the base mesh - its vertex indices are its own. Default false.
       group (str)           add each row's `weight` in this vertex group: null for a vertex not in it, 0.0 for one in
                             it at zero. Base mesh only.
+      color (str | true)    add each row's `color` [r, g, b, a] from this color attribute (true: the active one), as
+                            stored (a corner attribute's vertex value is its corners' mean; colorVaries when they
+                            differ), and colorStats over the whole attribute - per channel min, max, mean and a 10-bin
+                            histogram - so a painted mask, alpha included, can be checked (FOUND 2026-11-11: nothing
+                            read vertex colors back, and a Workbench vertex-color render shows no alpha). Base mesh only.
     """
     reject_unknown(params, _VERTEX_KEYS, "vertex_info")
     obj = get_object(take(params, "object", "name", required=True, kind=str))
@@ -792,6 +840,21 @@ def op_vertex_info(params):
     if group_name is not None and use_eval:
         raise MifOpError("'group' weights are read from the base mesh, and evaluated:true reads the modifier result, "
                          "whose vertex indices are its own - ask for one or the other.")
+    color_name = params.get("color")
+    if color_name is not None:
+        if use_eval:
+            raise MifOpError("'color' is read from the base mesh's attribute, and evaluated:true reads the modifier "
+                             "result - ask for one or the other.")
+        cattrs = obj.data.color_attributes
+        if color_name is True:
+            act = cattrs.active_color if hasattr(cattrs, "active_color") else None
+            if act is None:
+                raise MifOpError("'%s' has no active color attribute. Its color attributes: %s."
+                                 % (obj.name, ", ".join(a.name for a in cattrs) or "<none>"))
+            color_name = act.name
+        elif not isinstance(color_name, str) or cattrs.get(color_name) is None:
+            raise MifOpError("'%s' has no color attribute %r. Its color attributes: %s."
+                             % (obj.name, color_name, ", ".join(a.name for a in cattrs) or "<none>"))
     group = None
     if group_name is not None:
         group = obj.vertex_groups.get(str(group_name))
@@ -814,12 +877,19 @@ def op_vertex_info(params):
     else:
         wanted = list(range(min(count, limit)))
 
+    col_v = col_varies = col_stats = None
+    if color_name is not None:
+        col_v, col_varies, col_stats = _color_readback(mesh, color_name)
     rows = []
     for i in wanted:
         vert = mesh.vertices[i]
         row = {"index": i, "co": rnd(list(vert.co)), "world": rnd(list(mw @ vert.co))}
         if group is not None:
             row["weight"] = next((round(float(ge.weight), 6) for ge in vert.groups if ge.group == group.index), None)
+        if col_v is not None:
+            row["color"] = [round(float(x), 4) for x in col_v[i]]
+            if col_varies[i]:
+                row["colorVaries"] = True
         rows.append(row)
 
     out = {"object": obj.name, "geometry": "evaluated" if use_eval else "base", "vertexCount": count,
@@ -833,6 +903,8 @@ def op_vertex_info(params):
     if group is not None:
         out["group"] = group.name
         out["rowsNotInGroup"] = sum(1 for r in rows if r["weight"] is None)
+    if col_stats is not None:
+        out["colorStats"] = col_stats
     if use_eval and source.data is obj.data:
         # evaluated_get hands back the ORIGINAL object when it is not in the active view layer - see mesh_stats.
         out["evaluatedNote"] = ("the object is not in the active view layer's depsgraph, so this is the BASE mesh - "
@@ -942,7 +1014,7 @@ def op_select_faces(params):
                          "slot, so the two can disagree.")
     axis = take(params, "axis", kind=str)
     if isinstance(params.get("direction"), str):
-        # benchmark round ten (A3): axis 'Z' with direction 'positive', read as the axis's sign
+        # A benchmark round ten (A3): axis 'Z' with direction 'positive', read as the axis's sign
         raise MifOpError("direction is a world VECTOR [x,y,z], e.g. [0,0,1] for up - got %r. For a world axis pass "
                          "axis alone: 'Z' is up, '-Z' down. NOTHING was searched." % params.get("direction"))
     direction = _vec(params, "direction")
@@ -977,7 +1049,7 @@ def op_select_faces(params):
     box_min = _vec(params, "boxMin")
     box_max = _vec(params, "boxMax")
     inside = params.get("insideBox")
-    # insideBox:true WITH boxMin and boxMax is that box - the name reads as the switch that turns the box on, and the benchmark
+    # insideBox:true WITH boxMin and boxMax is that box - the name reads as the switch that turns the box on, and a benchmark
     # round ten's agents passed it that way (A3, A8). On its own true has no box to mean, and false is no mode at all (a
     # box always keeps the faces whose centre is inside it), so both are refused with the shape.
     if inside is True and box_min is not None and box_max is not None:
@@ -1836,6 +1908,54 @@ def _is_inside(tree, point, tol):
     return (point - location).dot(normal) < -tol
 
 
+# THREE SKEWED DIRECTIONS, none along an axis or a diagonal, so a ray from a grid-aligned sample does not run down an
+# edge or through a vertex of a grid-aligned mesh, where one crossing can count twice or not at all.
+_PARITY_DIRS = (mathutils.Vector((0.5773, 0.6123, 0.5401)).normalized(),
+                mathutils.Vector((-0.6311, 0.2791, 0.7237)).normalized(),
+                mathutils.Vector((0.3107, -0.8853, 0.3459)).normalized())
+
+
+def _crossings(tree, point, direction):
+    """How many times a ray from `point` along `direction` crosses the surface. The step past each hit grows with the
+    coordinates' size, so it does not vanish into float32 far from the origin (the fixed offset _is_inside's docstring
+    measured failing at z=200)."""
+    origin = point.copy()
+    count, last = 0, None
+    for _ in range(512):
+        loc, _nrm, index, _dist = tree.ray_cast(origin, direction)
+        if loc is None:
+            break
+        if index != last:
+            count += 1
+        last = index
+        step = max(1e-5, 2e-6 * max(abs(loc.x), abs(loc.y), abs(loc.z)))
+        origin = loc + direction * step
+    return count
+
+
+def _inside_parity(tree, point, tol, box):
+    """Is `point` inside the closed surface `tree` - asked by ray parity, which needs no face normal, so a mesh with
+    flipped or mixed winding answers the same as a clean one (FOUND 2026-11-10: _is_inside, which trusts the nearest
+    face's normal, put 1656 of 1656 points of one part INSIDE another 1.5 m away). Never inside outside the surface's
+    own box; a majority of three rays settles a crossing that grazes an edge; and the point must sit deeper than `tol`
+    from the surface, as before."""
+    lo, hi = box
+    if any(point[i] < lo[i] - tol or point[i] > hi[i] + tol for i in range(3)):
+        return False
+    votes = sum(1 for d in _PARITY_DIRS if _crossings(tree, point, d) % 2 == 1)
+    if votes < 2:
+        return False
+    if tol > 0.0:
+        _loc, _nrm, _index, dist = tree.find_nearest(point)
+        if dist is not None and dist <= tol:
+            return False
+    return True
+
+
+def _points_box(points):
+    return ([min(p[i] for p in points) for i in range(3)], [max(p[i] for p in points) for i in range(3)])
+
+
 def op_objects_overlap(params):
     """Do two objects actually intersect - asked of the GEOMETRY, not of their bounding boxes.
 
@@ -1847,9 +1967,10 @@ def op_objects_overlap(params):
     the truth is DISJOINT. This op reports BOTH, so the caller can see when the approximation would
     have lied.
 
-    FIVE ANSWERS, because "do they overlap" is really several questions:
+    SIX ANSWERS, because "do they overlap" is really several questions:
 
-      DISJOINT       no shared volume and no contact
+      DISJOINT       no shared volume and no contact; `gap` says how far apart (sampled)
+      NEAR           no contact, but the gap is at or under `tolerance` - overlapping stays false
       TOUCHING       surfaces meet, no shared volume - two boxes flush against each other
       INTERSECTING   surfaces cross and volume is shared
       A_INSIDE_B     A is wholly within B, with no surface contact at all
@@ -1868,7 +1989,9 @@ def op_objects_overlap(params):
     params:
       a (str), b (str)      the two objects. Both must be MESH.
       objects [a, b]        an alternative spelling of the same pair
-      tolerance (float)     how far inside a point must be to count. Default 1e-5.
+      tolerance (float)     how far inside a point must be to count, and the gap at or under which a
+                            disjoint pair is NEAR. Default 1e-5. The inside test is ray parity, so a
+                            mesh with flipped faces answers as a clean one does (windingWarning names it).
       maxSamples (int)      cap on containment sample points per object. Default 2000.
       evaluated (bool)      use the MODIFIER RESULT rather than the base mesh. Default true - what
                             renders and what collides is the evaluated geometry.
@@ -1927,15 +2050,34 @@ def op_objects_overlap(params):
     sam_a, stride_a = _stride(pts_a)
     sam_b, stride_b = _stride(pts_b)
 
-    pairs = tree_a.overlap(tree_b)
-    a_in = sum(1 for p in sam_a if _is_inside(tree_b, p, tol))
-    b_in = sum(1 for p in sam_b if _is_inside(tree_a, p, tol))
+    # THE GEOMETRY'S OWN BOXES, from the world-space points the trees were built from: two surfaces whose boxes do not
+    # meet cannot share a point, so no inside verdict is possible without them meeting (FOUND 2026-11-10).
+    box_a, box_b = _points_box(pts_a), _points_box(pts_b)
+    boxes_meet = all(box_a[0][i] <= box_b[1][i] + tol and box_b[0][i] <= box_a[1][i] + tol for i in range(3))
+    pairs = tree_a.overlap(tree_b) if boxes_meet else []
+    if boxes_meet:
+        a_in = sum(1 for p in sam_a if _inside_parity(tree_b, p, tol, box_b))
+        b_in = sum(1 for p in sam_b if _inside_parity(tree_a, p, tol, box_a))
+    else:
+        a_in = b_in = 0
+    # THE OLD NORMAL-SIGN ANSWER, kept only to name a mesh whose winding would have misled it: a mesh with flipped
+    # faces reads "inside" from outside under that test, and the caller should hear which one it is.
+    winding = []
+    if boxes_meet:
+        a_in_n = sum(1 for p in sam_a if _is_inside(tree_b, p, tol))
+        b_in_n = sum(1 for p in sam_b if _is_inside(tree_a, p, tol))
+        if a_in_n != a_in:
+            winding.append({"object": obj_b.name, "pointsOfOther": len(sam_a), "insideByParity": a_in,
+                            "insideByFaceNormals": a_in_n})
+        if b_in_n != b_in:
+            winding.append({"object": obj_a.name, "pointsOfOther": len(sam_b), "insideByParity": b_in,
+                            "insideByFaceNormals": b_in_n})
 
     if pairs:
         verdict = "INTERSECTING" if (a_in or b_in) else "TOUCHING"
-    elif b_in == len(sam_b):
+    elif sam_b and b_in == len(sam_b):
         verdict = "B_INSIDE_A"
-    elif a_in == len(sam_a):
+    elif sam_a and a_in == len(sam_a):
         verdict = "A_INSIDE_B"
     elif a_in or b_in:
         # NO FACE PAIRS AND YET POINTS INSIDE. A shallow intersection whose faces cross outside the
@@ -1943,6 +2085,20 @@ def op_objects_overlap(params):
         verdict = "INTERSECTING"
     else:
         verdict = "DISJOINT"
+    # THE GAP, AND CONTACT WITHIN THE TOLERANCE (FOUND 2026-11-10): tolerance 0.02 answered DISJOINT for two parts
+    # 0.0169 apart. A disjoint pair is measured - each sample of one to the nearest point of the other's surface, both
+    # ways - and a gap at or under the tolerance is NEAR.
+    gap = None
+    if verdict == "DISJOINT":
+        best = None
+        for pts, tree in ((sam_a, tree_b), (sam_b, tree_a)):
+            for p in pts:
+                hit = tree.find_nearest(p)
+                if hit[0] is not None and (best is None or hit[3] < best):
+                    best = hit[3]
+        gap = best
+        if gap is not None and gap <= tol:
+            verdict = "NEAR"
 
     # THE CHEAP TEST, REPORTED ALONGSIDE. This is the answer an AABB implementation would have
     # given, so a caller can see the disagreement rather than take it on faith that the expensive
@@ -1955,9 +2111,25 @@ def op_objects_overlap(params):
     lo_a, hi_a = _aabb(obj_a)
     lo_b, hi_b = _aabb(obj_b)
     aabb_overlap = all(lo_a[i] <= hi_b[i] and lo_b[i] <= hi_a[i] for i in range(3))
-    truth = verdict != "DISJOINT"
+    truth = verdict not in ("DISJOINT", "NEAR")
+
+    extra = {"insideTest": "ray parity (3 rays, majority), no inside answer outside the other's own box"}
+    if gap is not None:
+        extra["gap"] = round(gap, 6)
+        extra["gapNote"] = ("the smallest distance from either object's sampled vertices and face centers to the other's "
+                            "surface, world units; NEAR when it is at or under tolerance (%g)" % tol)
+    if verdict == "NEAR":
+        extra["withinTolerance"] = True
+    if winding:
+        extra["windingWarning"] = winding
+        extra["windingNote"] = (
+            "%s gave a different inside count by face normals than by ray parity - its faces point inconsistently "
+            "(flipped or mixed winding), which makes a normals-based inside test read points outside it as inside. "
+            "The verdict uses parity; recalculate the normals (clean_mesh) before trusting other normal-based reads."
+            % ", ".join("'%s'" % w["object"] for w in winding))
 
     return {
+        **extra,
         "ok": True,
         "a": obj_a.name,
         "b": obj_b.name,

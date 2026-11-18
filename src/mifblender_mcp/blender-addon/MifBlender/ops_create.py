@@ -48,7 +48,7 @@ import re
 import bmesh
 import bpy
 
-from .ops_common import (remove_objects, MifOpError, assign_id_name, check_axis_dict, finite_float, finite_floats,
+from .ops_common import (remove_objects, data_name_report, write_rna_property, MifOpError, assign_id_name, check_axis_dict, finite_float, finite_floats,
                          finite_int, get_object, mesh_counts, mesh_shape, object_info,
                          reject_unknown, require_editable, rnd, selection_restore,
                          selection_snapshot, select_only, take, take_bool, take_float, take_int, drawn_instances,
@@ -103,7 +103,7 @@ CREATE_PRIMITIVE_PARAMS = (
     "kind", "type", "name", "size", "radius", "location", "rotation", "align",
     "segments", "ringCount", "subdivisions", "vertices", "depth",
     "radius1", "radius2", "xSubdivisions", "ySubdivisions", "fillType",
-    "majorRadius", "minorRadius", "majorSegments", "minorSegments",
+    "majorRadius", "minorRadius", "majorSegments", "minorSegments", "collection",
 )
 
 
@@ -153,6 +153,9 @@ def op_create_primitive(params):
     takes, rather than silently reinterpreted - an earlier version remapped one onto the other and
     made four kinds come out at twice the requested size with nothing in the response to say so. A
     cone takes radius1/radius2 and a torus majorRadius/minorRadius; neither takes size or radius.
+
+    rotation IS RADIANS (Euler XYZ), said in the reply as rotationUnit; a component past a full turn (2*pi) is refused as
+    a degrees value, with the radians it would be.
 
     REFUSED IN EDIT MODE, because primitive_*_add welds into the edited mesh there - a destructive
     outcome dressed up as a failure.
@@ -221,12 +224,21 @@ def op_create_primitive(params):
         kwargs[spec["capKw"]] = kwargs.pop("fill_type", "TRIFAN")
     kwargs["location"] = _vec3(params, "location", (0.0, 0.0, 0.0))
     kwargs["rotation"] = _vec3(params, "rotation", (0.0, 0.0, 0.0))
+    # RADIANS, AND A DEGREES-LOOKING VALUE IS REFUSED (FOUND 2026-11-11): rotation [90, 0, 0] was taken silently as 90
+    # radians, about 5,157 degrees. A placement never needs more than a full turn, so a component past 2*pi is refused
+    # with the radians it would be as degrees.
+    big = [v for v in kwargs["rotation"] if abs(v) > 2 * math.pi + 1e-6]
+    if big:
+        raise MifOpError("rotation %s is in RADIANS, and a value past a full turn (2*pi = 6.2832) looks like degrees. "
+                         "Read as degrees it is %s radians; pass those. NOTHING was created."
+                         % (rnd(kwargs["rotation"]), rnd([math.radians(v) for v in kwargs["rotation"]])))
     if align is not None:
         kwargs["align"] = align
     if not spec.get("noEnterEditmode"):
         kwargs["enter_editmode"] = False
 
     _require_object_mode("create_primitive")
+    coll = _resolve_collection(params) if params.get("collection") is not None else None
 
     snapshot = selection_snapshot()
     before = set(bpy.data.objects.keys())
@@ -248,6 +260,11 @@ def op_create_primitive(params):
             assign_id_name(obj.data, obj.name, bpy.data.meshes)
         if kind == "monkey":
             open_collapsed_uvs_of(obj)
+        if coll is not None:
+            # INTO THE COLLECTION ASKED FOR (FOUND 2026-11-09): the operator links into the active collection
+            for c in list(obj.users_collection):
+                c.objects.unlink(obj)
+            coll.objects.link(obj)
     except TypeError as exc:
         raise MifOpError("Blender refused the %s parameters: %s" % (kind, exc))
     finally:
@@ -258,7 +275,7 @@ def op_create_primitive(params):
     # NESTED UNDER "object", matching op_object_info (ops_scene.py:177-180). The same payload flat
     # here and nested there would be two shapes for one thing, and an agent that creates a
     # primitive and then re-reads it would get different keys for identical data.
-    out = {"object": object_info(obj), "created": True, "kind": kind}
+    out = {"object": object_info(obj), "created": True, "kind": kind, "rotationUnit": "radians"}
     # ECHOED FROM THE OBJECT. Blender appends .001 on a collision and never says so. Duplicated at
     # top level because the name is the identity every op reports, not just a geometry fact.
     out["name"] = obj.name
@@ -268,6 +285,7 @@ def op_create_primitive(params):
     # op cannot write one check. nameWasSuffixed is now answerable on all five builds: before
     # assign_id_name it was silently False on 3.6 whatever happened (ledger B12).
     out["requestedName"] = name or None
+    out["collections"] = [c.name for c in obj.users_collection]
     out["nameWasSuffixed"] = bool(name and obj.name != name)
     if name and obj.name != name:
         out["nameNote"] = ("Blender renamed this to '%s' because '%s' was already taken - it "
@@ -546,7 +564,8 @@ def op_set_parent(params):
                              hand rather than doubling it
     """
     reject_unknown(params, ("object", "name", "parent", "clear", "keepTransform", "type", "bone", "fallback",
-                            "maxInfluences", "bones", "includeParents", "headTail", "vertices"), "set_parent")
+                            "maxInfluences", "bones", "includeParents", "headTail", "vertices", "memoryBudgetGB"),
+                   "set_parent")
     # HEAD TO TAIL (2026-10-06; 5.2 adds the slider): a bone parent's space sits at the bone's tail; headTail 0 puts
     # it at the head, 0.5 at the middle - through the parent inverse, on every build.
     head_tail = take_float(params, "headTail", default=None)
@@ -569,6 +588,9 @@ def op_set_parent(params):
             params.get("type") or "").upper() != "ARMATURE_AUTO":
         raise MifOpError("fallback and maxInfluences fill what automatic weights left empty - they go with type "
                          "ARMATURE_AUTO. NOTHING was changed.")
+    if params.get("memoryBudgetGB") is not None and str(params.get("type") or "").upper() != "ARMATURE_AUTO":
+        raise MifOpError("memoryBudgetGB bounds heat weighting's memory - it goes with type ARMATURE_AUTO. NOTHING was "
+                         "changed.")
     if params.get("maxInfluences") is not None and fallback == "NONE":
         raise MifOpError("maxInfluences caps the fallback's bones per vertex; pass fallback NEAREST or DIFFUSE. NOTHING "
                          "was changed.")
@@ -634,14 +656,23 @@ def op_set_parent(params):
         if ptype not in ("ARMATURE_AUTO", "ARMATURE_NAME"):
             raise MifOpError("bones weights chosen bones of an armature parent - it goes with type ARMATURE_AUTO or "
                              "ARMATURE_NAME. NOTHING was changed.")
-        if fallback != "NONE":
-            raise MifOpError("fallback fills what a whole-rig heat run left empty; with bones only the named bones are "
-                             "weighted - pass one or the other. NOTHING was changed.")
+        if fallback != "NONE" and ptype != "ARMATURE_AUTO":
+            raise MifOpError("fallback fills what heat weighting left empty - it goes with ARMATURE_AUTO. NOTHING was "
+                             "changed.")
         include = take_bool(params, "includeParents", default=ptype == "ARMATURE_AUTO")
+        if ptype == "ARMATURE_AUTO":
+            _heat_memory_guard(obj, params)
         parent_before = parent_of(obj)
-        return _weights_from_bones(obj, new_parent, ptype, some_bones, include, keep, parent_before)
+        out = _weights_from_bones(obj, new_parent, ptype, some_bones, include, keep, parent_before)
+        if fallback != "NONE" and out.get("verticesUnweighted"):
+            # WITH BONES TOO (FOUND 2026-11-09): the fallback was refused beside bones, so a heat run that failed on a
+            # large mesh left no typed way on; it fills the unweighted vertices from the named bones (and their parents)
+            out.update(_fill_unweighted(obj, new_parent, fallback, max_inf, only=set(out.get("groupsWritten") or [])))
+        return out
     import mathutils
     bpy.context.view_layer.update()
+    if ptype == "ARMATURE_AUTO":
+        _heat_memory_guard(obj, params)
     if ptype in ("ARMATURE_AUTO", "ARMATURE_NAME"):
         parent_before = parent_of(obj)
         out = _parent_to_armature(obj, new_parent, ptype, keep, parent_before)
@@ -730,6 +761,64 @@ def _parent_vertices(parent, ptype, raw):
     if len(set(raw)) != len(raw):
         raise MifOpError("VERTEX_3 needs three different vertices, got %r. NOTHING was changed." % (raw,))
     return list(raw)
+
+
+# BONE HEAT'S MEMORY (FOUND 2026-11-09: heat on a 910,104 vertex mesh peaked at 11 GB and then failed). Measured on
+# 5.0.1, the peak private commit of set_parent ARMATURE_AUTO on closed cylinders: 10,752 bytes a vertex at 10,000 and
+# 10,090 at 40,000 - about 11 KB a vertex, as the large case's 12 KB. The estimate takes 12 KB; over available memory
+# less a 4 GB reserve, or memoryBudgetGB, the heat run is refused before it starts.
+_HEAT_BYTES_PER_VERTEX = 12 * 1024
+_HEAT_RESERVE = 4 * 1024 ** 3
+
+
+def _heat_memory_guard(obj, params):
+    if obj.type != "MESH":
+        return
+    budget_gb = take_float(params, "memoryBudgetGB", default=None)
+    if budget_gb is not None and (not math.isfinite(budget_gb) or budget_gb <= 0):
+        raise MifOpError("memoryBudgetGB is a size in GB above 0, got %r. NOTHING was changed." % budget_gb)
+    from . import childproc                                     # noqa: PLC0415
+    avail = childproc.available_memory_bytes()
+    budget = int(budget_gb * 1024 ** 3) if budget_gb is not None else (
+        None if avail is None else max(0, avail - _HEAT_RESERVE))
+    estimate = len(obj.data.vertices) * _HEAT_BYTES_PER_VERTEX
+    if budget is not None and estimate > budget:
+        raise MifOpError(
+            "heat weighting '%s' (%d vertices) is estimated to take %.1f GB at its peak (about 12 KB a vertex, "
+            "measured), over the %.1f GB %s. Weight a decimated copy and transfer the weights (transfer_mesh_data), "
+            "use type ARMATURE_NAME with a fallback, or pass memoryBudgetGB if the machine can spare it. NOTHING was "
+            "changed." % (obj.name, len(obj.data.vertices), estimate / 1024 ** 3, budget / 1024 ** 3,
+                          "budget you gave" if budget_gb is not None else "of memory free now less a 4 GB reserve"))
+
+
+def _vertices_nearest(obj, rig, names):
+    """How many of obj's vertices lie nearer to a bone in `names` than to any other deform bone (bone segments, world
+    space) - where heat weighting would have given those bones weight had it found a solution."""
+    segs = [(b.name, rig.matrix_world @ b.head_local, rig.matrix_world @ b.tail_local)
+            for b in rig.data.bones if b.use_deform]
+    if not segs or not names:
+        return 0
+    mw = obj.matrix_world
+    count = 0
+    for v in obj.data.vertices:
+        p = mw @ v.co
+        best, best_d = None, None
+        for nm, a, b in segs:
+            t = (p - a).dot(b - a) / max((b - a).length_squared, 1e-12)
+            q = a + (b - a) * min(1.0, max(0.0, t))
+            d = (p - q).length_squared
+            if best_d is None or d < best_d:
+                best, best_d = nm, d
+        if best in names:
+            count += 1
+    return count
+
+
+def _heat_failed_note(n_bones):
+    return ("Bone Heat Weighting found no solution: %s got no vertex. Blender prints 'failed to find solution for one or "
+            "more bones' and raises nothing, so this is read from the weights. It happens on a non-manifold or "
+            "self-intersecting mesh, or a large one; fallback NEAREST or DIFFUSE fills the vertices, or weight a "
+            "decimated copy and transfer the weights." % ("the named bone" if n_bones == 1 else "every named bone"))
 
 
 def _weights_from_bones(obj, rig, ptype, names, include_parents, keep, before_parent):
@@ -845,7 +934,15 @@ def _weights_from_bones(obj, rig, ptype, names, include_parents, keep, before_pa
     skipped = [n for n in names if n not in named]
     if skipped:
         out["notDeforming"] = skipped
-    if ptype == "ARMATURE_AUTO" and no_weights:
+    nearest_run = _vertices_nearest(obj, rig, set(run)) if (
+        ptype == "ARMATURE_AUTO" and no_weights and len(no_weights) == len(run) and not changed) else 0
+    if nearest_run:
+        # HEAT FOUND NO SOLUTION, told apart from "another bone is nearer" (FOUND 2026-11-09: 910,104 vertices answered
+        # ok with verticesChanged 0 and nothing said): vertices lie nearest to the named bones and still none got weight.
+        out["heatFailed"] = True
+        out["verticesNearestTheNamedBones"] = nearest_run
+        out["warning"] = _heat_failed_note(len(run))
+    elif ptype == "ARMATURE_AUTO" and no_weights:
         out["warning"] = ("%s got no vertex: heat weighting gives a vertex to the bone nearest it among ALL deform bones, "
                           "so a bone with nothing of the mesh nearer to it than to another bone stays empty."
                           % ", ".join(no_weights))
@@ -855,9 +952,10 @@ def _weights_from_bones(obj, rig, ptype, names, include_parents, keep, before_pa
     return out
 
 
-def _fill_unweighted(obj, rig, how, max_inf):
-    """set_parent's fallback: weights for the vertices automatic weighting left with no deform-bone weight."""
-    deform = [b for b in rig.data.bones if b.use_deform]
+def _fill_unweighted(obj, rig, how, max_inf, only=None):
+    """set_parent's fallback: weights for the vertices automatic weighting left with no deform-bone weight. `only`: the
+    bones a fill may give weight to (set_parent bones); None, every deform bone."""
+    deform = [b for b in rig.data.bones if b.use_deform and (only is None or b.name in only)]
     names = {b.name for b in deform}
     gidx = {vg.name: vg.index for vg in obj.vertex_groups}
     me = obj.data
@@ -987,7 +1085,10 @@ def _parent_to_armature(obj, rig, ptype, keep, before_parent):
            "vertices": len(obj.data.vertices)}
     if ptype == "ARMATURE_AUTO":
         out["bonesWithNoWeights"] = empty[:100]
-        if unweighted:
+        if not weighted_by and deform:
+            out["heatFailed"] = True
+            out["warning"] = _heat_failed_note(len(deform))
+        elif unweighted:
             out["warning"] = ("%d of %d vertices got no bone weight - heat weighting found no solution there (a "
                               "non-manifold or self-intersecting mesh, or one far from the bones). They bind to "
                               "nothing." % (unweighted, len(obj.data.vertices)))
@@ -1848,7 +1949,7 @@ def op_join_objects(params):
         result = bpy.ops.object.join()
         if "FINISHED" not in result:
             if copy_names:
-                remove_objects([bpy.data.objects[n] for n in copy_names if n in bpy.data.objects])
+                remove_objects([o for o in (bpy.data.objects.get(n) for n in copy_names) if o is not None])
             raise MifOpError("bpy.ops.object.join() returned %s rather than FINISHED - nothing was "
                              "merged. NOTHING usable was produced." % set(result))
     finally:
@@ -2911,7 +3012,8 @@ def _created(obj, coll, want_type, verb, requested=None):
     return {"ok": True, "name": obj.name, "type": obj.type, "collection": coll.name,
             "requestedName": requested,
             "nameWasSuffixed": bool(requested is not None and obj.name != requested),
-            "location": rnd(list(obj.location)), "rotation": rnd(list(obj.rotation_euler))}
+            "location": rnd(list(obj.location)), "rotation": rnd(list(obj.rotation_euler)),
+            **(data_name_report(obj.data, requested) if requested and obj.type != "MESH" else {})}
 
 
 def op_create_empty(params):
@@ -3488,7 +3590,7 @@ def op_create_curve(params):
     # off, with the constraint and the curve both reading back perfectly.
     data.use_path = use_path
 
-    obj = bpy.data.objects.new(data.name, data)
+    obj = bpy.data.objects.new(wanted, data)
     _link_new(obj, coll)
     _place(obj, _placed)
 
@@ -3588,7 +3690,7 @@ def op_create_text(params):
     data.resolution_u = _TEXT_RESOLUTION
     data.bevel_resolution = _TEXT_BEVEL_RESOLUTION
 
-    obj = bpy.data.objects.new(data.name, data)
+    obj = bpy.data.objects.new(wanted, data)
     _link_new(obj, coll)
     _place(obj, _placed)
 
@@ -3809,7 +3911,7 @@ def op_create_armature(params):
     data = bpy.data.armatures.new(wanted)
     if disp:
         data.display_type = str(disp).upper()
-    obj = bpy.data.objects.new(data.name, data)
+    obj = bpy.data.objects.new(wanted, data)
     _link_new(obj, coll)
     _place(obj, _placed)
     obj.show_in_front = show_front
@@ -3914,7 +4016,10 @@ def _lattice_fit(params):
 # passing it now gets a refusal naming what this op does take.
 _TEXTURE_KEYS = {"name", "type", "image", "intensity", "contrast",
                  # an image FILE loaded as the datablock (2026-10-04), and the colour space it is read in
-                 "file", "colorspace"}
+                 "file", "colorspace",
+                 # (2026-11-15) any writable property of the texture's type: a CLOUDS texture's noise_scale and
+                 # noise_depth, a VORONOI's distance_metric - met writing a kit generator that could not set either
+                 "settings"}
 
 
 _GN_KEYS = {"name", "location", "rotation", "scale", "collection"}
@@ -3977,7 +4082,7 @@ def _gn_object(params, kind, verb, default_name):
 
     wanted = str(take(params, "name", default=default_name, kind=str))
     data = collection.new(name=wanted)
-    obj = bpy.data.objects.new(data.name, data)
+    obj = bpy.data.objects.new(wanted, data)
     _link_new(obj, coll)
     _place(obj, _placed)
     if want_scale is not None:
@@ -4921,7 +5026,7 @@ def op_create_metaball(params):
         if "rotation" in row:
             el.rotation = row["rotation"]
         el.use_negative = row["negative"]
-    obj = bpy.data.objects.new(mb.name, mb)
+    obj = bpy.data.objects.new(wanted, mb)
     _link_new(obj, coll)
     _place(obj, placed)
     if scale is not None:
@@ -5039,7 +5144,7 @@ def op_create_lattice(params):
     # 2026-09-13 on 4.4: data-only 3x5x3 first point (-1, -2, -1), object-first (-0.5, -0.5, -0.5).
     # Found by the fivekinds showcase, whose pinch squeezed a capsule to a quarter of its size. With
     # the object in place every resolution rests at -0.5..0.5, as Blender's own UI gives.
-    obj = bpy.data.objects.new(data.name, data)
+    obj = bpy.data.objects.new(wanted, data)
     # RESOLUTION NEXT, before anything else touches the lattice: changing points_u resets the
     # point positions, so writing it after any edit would silently discard the edit.
     data.points_u, data.points_v, data.points_w = pts
@@ -5107,6 +5212,14 @@ def op_create_lattice(params):
     return out
 
 
+def _texture_type_of(cls):
+    """The Texture.type identifier a texture subclass is, from a datablock of it - CloudsTexture is CLOUDS."""
+    return {"BlendTexture": "BLEND", "CloudsTexture": "CLOUDS", "DistortedNoiseTexture": "DISTORTED_NOISE",
+            "ImageTexture": "IMAGE", "MagicTexture": "MAGIC", "MarbleTexture": "MARBLE", "MusgraveTexture": "MUSGRAVE",
+            "NoiseTexture": "NOISE", "StucciTexture": "STUCCI", "VoronoiTexture": "VORONOI",
+            "WoodTexture": "WOOD"}.get(cls.__name__)
+
+
 def op_create_texture(params):
     """A legacy texture datablock - what a DISPLACE modifier reads, and nothing could create one.
 
@@ -5129,6 +5242,9 @@ def op_create_texture(params):
       colorspace (str)   the image's colour space with `file`. Default Non-Color: a displacement map
                          is data, and sRGB decoding would bend every height.
       intensity / contrast (float)
+      settings (dict)    any writable property of the type, by its Blender name - noise_scale, noise_depth,
+                         noise_basis, noise_type on CLOUDS - checked against the type's own properties before the
+                         texture exists, each written by its declared type and read back in settingsApplied
     """
     reject_unknown(params, _TEXTURE_KEYS, "create_texture")
     name = str(take(params, "name", default="Texture", kind=str))
@@ -5188,7 +5304,35 @@ def op_create_texture(params):
             cs_note = ("'%s' was already loaded, so the existing datablock is used and its colour space is now %s - "
                        "that applies everywhere it is used." % (img.name, img.colorspace_settings.name))
 
+    settings = params.get("settings")
+    if settings is not None:
+        if not isinstance(settings, dict) or not settings:
+            raise MifOpError("settings is {property: value} - a %s texture's own properties. NOTHING was created."
+                             % kind)
+        struct = next((t for t in (getattr(bpy.types, c, None) for c in dir(bpy.types))
+                       if isinstance(t, type) and issubclass(t, bpy.types.Texture)
+                       and getattr(t, "bl_rna", None) is not None and t is not bpy.types.Texture
+                       and _texture_type_of(t) == kind), None)
+        props = struct.bl_rna.properties if struct is not None else bpy.types.Texture.bl_rna.properties
+        writable = {pr.identifier for pr in props if not pr.is_readonly and pr.identifier not in ("rna_type", "name",
+                                                                                                    "type")}
+        unknown = sorted(k for k in settings if k not in writable)
+        if unknown:
+            raise MifOpError("a %s texture has no writable %s. It has: %s. NOTHING was created."
+                             % (kind, ", ".join(unknown), ", ".join(sorted(writable))))
     tex = bpy.data.textures.new(name, type=kind)
+    applied = {}
+    if settings:
+        try:
+            for k, v in settings.items():
+                write_rna_property(tex, k, v, "NOTHING was created.", "texture '%s' (%s)" % (tex.name, kind), kind,
+                                   ())
+                got = getattr(tex, k)
+                applied[k] = round(got, 6) if isinstance(got, float) else (list(got) if hasattr(got, "__len__")
+                                                                           and not isinstance(got, str) else got)
+        except MifOpError:
+            bpy.data.textures.remove(tex)
+            raise
     if img is not None:
         tex.image = img
     if intensity is not None:
@@ -5210,6 +5354,7 @@ def op_create_texture(params):
         "colorSpaceNote": cs_note,
         "intensity": round(float(tex.intensity), 6),
         "contrast": round(float(tex.contrast), 6),
+        "settingsApplied": applied or None,
         "users": tex.users,
         "note": ("this is a bpy.data.textures datablock, which is the OLD texture system and the "
                  "one the modifier stack reads - a DISPLACE modifier cannot take a shader node. "
@@ -5223,7 +5368,101 @@ def op_create_texture(params):
 # ---------------------------------------------------------------------------
 
 _CREATE_MESH_KEYS = {"name", "vertices", "faces", "edges", "materialIndices", "materials", "uvs", "vertexGroups",
-                     "smooth", "location", "rotation", "scale", "collection", "takeOverName"}
+                     "smooth", "location", "rotation", "scale", "collection", "takeOverName", "file", "replaceData"}
+# The keys a geometry file may hold: the same names the call takes inline.
+# read_mesh_data's file (ops_meshdata, 2026-11-15) adds metadata beside them, which the reader drops by this format tag
+_MESH_FILE_FORMAT = "mifbridge.mesh/1"
+_MESH_FILE_META = ("format", "object", "space", "evaluated", "shapeKey", "units", "vertexCount", "faceCount")
+_CREATE_MESH_FILE_KEYS = ("vertices", "faces", "edges", "materialIndices", "uvs", "vertexGroups", "smooth")
+
+
+def _create_mesh_file(params, tail):
+    """params with the geometry read from params['file'] (FOUND 2026-11-09: a mesh of about a million faces was over the
+    MCP server's 64 MB frame cap, and the refusal told the caller to pass a file path to an op that took none).
+
+    A .json file holds an object with any of _CREATE_MESH_FILE_KEYS, spelled as the call spells them. A .npz holds
+    arrays: vertices (N, 3), and faces either as one (M, k) array of equal-sided faces or as faceSizes (M,) with
+    faceIndices (the corners of every face in order, summing to faceSizes); edges (E, 2), materialIndices (M,) and
+    smooth (M,) are optional. A key given both in the file and inline is refused rather than one silently winning."""
+    import os
+    path = params.get("file")
+    if not isinstance(path, str) or not path.strip():
+        raise MifOpError("'file' is a path to a .json or .npz holding the geometry, got %r. %s" % (path, tail))
+    path = bpy.path.abspath(path.strip())
+    if not os.path.isfile(path):
+        raise MifOpError("'file' %s does not exist. %s" % (path, tail))
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".json":
+        import json
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError) as exc:
+            raise MifOpError("'file' %s could not be read as JSON: %s. %s" % (path, exc, tail))
+        if not isinstance(data, dict):
+            raise MifOpError("'file' %s must hold an object of {vertices, faces, ...}, got a %s. %s"
+                             % (path, type(data).__name__, tail))
+        if data.get("format") == _MESH_FILE_FORMAT:
+            for k in _MESH_FILE_META:
+                data.pop(k, None)
+    elif ext == ".npz":
+        import json
+        import numpy as np
+        try:
+            with np.load(path, allow_pickle=False) as npz:
+                arrays = {k: npz[k] for k in npz.files}
+        except (OSError, ValueError) as exc:
+            raise MifOpError("'file' %s could not be read as .npz: %s. %s" % (path, exc, tail))
+        data = {}
+        meta = arrays.pop("meta", None)
+        uv_names = sorted(k for k in arrays if k.startswith("uv:"))
+        uv_flat = {k[3:]: arrays.pop(k).tolist() for k in uv_names}
+        if meta is not None:
+            try:
+                json.loads(str(meta))
+            except ValueError:
+                raise MifOpError("'file' %s has a meta array that is not JSON - not read_mesh_data's shape. %s"
+                                 % (path, tail))
+        for key in ("vertices", "edges", "materialIndices", "smooth"):
+            if key in arrays:
+                data[key] = arrays.pop(key).tolist()
+        if "faces" in arrays:
+            data["faces"] = arrays.pop("faces").tolist()
+        elif "faceSizes" in arrays or "faceIndices" in arrays:
+            sizes = arrays.pop("faceSizes", None)
+            flat = arrays.pop("faceIndices", None)
+            if sizes is None or flat is None:
+                raise MifOpError("'file' %s has one of faceSizes and faceIndices; ragged faces need both. %s"
+                                 % (path, tail))
+            sizes, flat = sizes.astype("int64").ravel(), flat.astype("int64").ravel()
+            if int(sizes.sum()) != flat.size:
+                raise MifOpError("'file' %s: faceSizes sum to %d corners but faceIndices has %d. %s"
+                                 % (path, int(sizes.sum()), flat.size, tail))
+            ends = np.cumsum(sizes)
+            data["faces"] = [flat[e - s:e].tolist() for s, e in zip(sizes.tolist(), ends.tolist())]
+        if uv_flat:
+            # read_mesh_data's uv:<layer> arrays hold one [u, v] per corner in face order; the call takes one row per face
+            starts = [0]
+            for f in data.get("faces") or []:
+                starts.append(starts[-1] + len(f))
+            data["uvs"] = {n: [rows[a:b] for a, b in zip(starts, starts[1:])] for n, rows in uv_flat.items()}
+        if arrays:
+            raise MifOpError("'file' %s holds arrays this op does not read: %s. It reads vertices, faces (or faceSizes "
+                             "with faceIndices), edges, materialIndices and smooth. %s"
+                             % (path, ", ".join(sorted(arrays)), tail))
+    else:
+        raise MifOpError("'file' must be a .json or .npz, got %s. %s" % (path, tail))
+    extra = sorted(set(data) - set(_CREATE_MESH_FILE_KEYS))
+    if extra:
+        raise MifOpError("'file' %s holds keys this op does not read from a file: %s. A file carries %s; name, "
+                         "materials and placement go on the call. %s"
+                         % (path, ", ".join(extra), ", ".join(_CREATE_MESH_FILE_KEYS), tail))
+    both = sorted(k for k in data if k in params)
+    if both:
+        raise MifOpError("%s given both in 'file' and on the call. Give each once. %s" % (", ".join(both), tail))
+    out = {k: v for k, v in params.items() if k != "file"}
+    out.update(data)
+    return out, path
 
 
 def _name_holders(wanted):
@@ -5466,13 +5705,45 @@ def op_create_mesh(params):
                                          (no users, no fake user) so both get it exactly, listed in nameTakenOverFrom;
                                          a holder in use is refused by name and nothing is created or removed
       location / rotation / scale / collection
+      file (str)                         a .json or .npz holding vertices, faces and the other geometry keys, for a
+                                         mesh too big to send inline (_create_mesh_file says the layout), or the file
+                                         read_mesh_data writes; fromFile in the reply names it
+      replaceData (bool)                 (2026-11-15) default false. true with an existing MESH object named `name`:
+                                         keep the object - its modifiers, parent, children, constraints, collections and
+                                         transform - and swap in the new mesh. Vertex-group weights and shape keys carry
+                                         over by vertex index when the count is unchanged (keys as offsets from the
+                                         basis), and are dropped and listed otherwise; material slots carry over unless
+                                         materials or materialIndices are given; the old mesh is removed when nothing
+                                         else uses it. With no such object the mesh is created as usual (replaced false)
 
     The reply reads every count back off the built mesh, and reports zeroAreaFaces (area under 1e-12 m2) - legal, but
     the Unreal hand-off refuses them.
     """
     tail = "NOTHING was created."
-    _placed = _place_values(params)
     reject_unknown(params, _CREATE_MESH_KEYS, "create_mesh", _CREATE_MESH_NOTES)
+    from_file = None
+    if "file" in params:
+        params, from_file = _create_mesh_file(params, tail)
+    replace = params.get("replaceData")
+    if replace is not None and not isinstance(replace, bool):
+        raise MifOpError("'replaceData' must be true or false, got %r. %s" % (replace, tail))
+    target = None
+    if replace:
+        if params.get("takeOverName"):
+            raise MifOpError("replaceData keeps the object holding the name and takeOverName removes it - pass one. %s"
+                             % tail)
+        target = bpy.data.objects.get(str(params.get("name") or "Mesh"))
+        if target is not None:
+            if target.type != "MESH":
+                raise MifOpError("replaceData swaps a MESH object's mesh, and '%s' is a %s. %s"
+                                 % (target.name, target.type, tail))
+            if target.mode != "OBJECT":
+                raise MifOpError("'%s' is in %s mode - leave it first. %s" % (target.name, target.mode, tail))
+            require_editable(target, "changed")
+            if params.get("collection") is not None:
+                raise MifOpError("replaceData keeps '%s' in its own collections, so collection does not apply. %s"
+                                 % (target.name, tail))
+    _placed = _place_values(params)
     try:
         want_scale = _vec3(params, "scale", (1.0, 1.0, 1.0)) if "scale" in params else None
     except MifOpError as exc:
@@ -5485,7 +5756,7 @@ def op_create_mesh(params):
     take_over = params.get("takeOverName")
     if take_over is not None and not isinstance(take_over, bool):
         raise MifOpError("'takeOverName' must be true or false, got %r. %s" % (take_over, tail))
-    holders = _name_holders(wanted)
+    holders = _name_holders(wanted) if target is None else []
     if take_over:
         live = [row for row, _ in holders if not row["orphan"]]
         if live:
@@ -5523,6 +5794,11 @@ def op_create_mesh(params):
         for _ in range(max(mat_idx) + 1):
             mesh.materials.append(None)
     mesh.update()
+    if target is not None:
+        out = _replace_mesh_data(target, mesh, groups, materials is not None or mat_idx is not None, params, _placed,
+                                 want_scale)
+        out["fromFile"] = from_file
+        return out
 
     # TAKING THE NAME OVER happens last, once nothing below can refuse: the orphans go (the object first - it may be
     # the orphan mesh's only user), then the new mesh takes the freed name.
@@ -5578,8 +5854,127 @@ def op_create_mesh(params):
                          "zero-area faces" % (len(zero), _ZERO_AREA_M2)) if zero else None,
         "bboxLocal": {"min": rnd([min(v[a] for v in verts) for a in range(3)]),
                       "max": rnd([max(v[a] for v in verts) for a in range(3)])},
+        "fromFile": from_file,
     })
+    if replace:
+        out["replaced"] = False
+        out["replaceNote"] = "no object named '%s' existed, so the mesh was created as a new object" % wanted
     return out
+
+
+def _replace_mesh_data(obj, mesh, groups, slots_given, params, placed, want_scale):
+    """Swap `mesh` in as `obj`'s data, keeping the object and what hangs off it; say what carried over."""
+    old = obj.data
+    n_old, n_new = len(old.vertices), len(mesh.vertices)
+    same_count = n_old == n_new
+    # VERTEX-GROUP WEIGHTS live in the mesh (its deform verts); the group NAMES live on the object and stay.
+    kept_weights, dropped_weights = [], []
+    old_weights = {}
+    if obj.vertex_groups:
+        for v in old.vertices:
+            for g in v.groups:
+                old_weights.setdefault(g.group, []).append((v.index, g.weight))
+    # SHAPE KEYS live in the mesh too: read before the swap, as offsets from the old basis.
+    keys = getattr(old, "shape_keys", None)
+    key_rows = []
+    if keys is not None and len(keys.key_blocks):
+        basis = keys.key_blocks[0]
+        b = [tuple(d.co) for d in basis.data]
+        for kb in keys.key_blocks:
+            key_rows.append((kb.name, kb.value, kb.relative_key.name, kb.mute, kb.slider_min, kb.slider_max,
+                             [tuple(c - o for c, o in zip(d.co, b[i])) for i, d in enumerate(kb.data)]))
+    old_mats = list(old.materials)
+    old_name = old.name
+    # THE GROUP NAMES ARE THE MESH'S TOO since Blender 3.0 (Mesh.vertex_group_names): swapping the data empties
+    # obj.vertex_groups, so they are recorded here, in order and with their locks, and made again on the new mesh.
+    old_groups = [(vg.name, vg.index, bool(vg.lock_weight)) for vg in obj.vertex_groups]
+    obj.data = mesh
+    if not slots_given and old_mats and not mesh.materials:
+        for m in old_mats:
+            mesh.materials.append(m)
+    by_old_index = {}
+    for gname, gi, locked in old_groups:
+        vg = obj.vertex_groups.get(gname) or obj.vertex_groups.new(name=gname)
+        vg.lock_weight = locked
+        by_old_index[vg.name] = gi
+    for vg in obj.vertex_groups:
+        old_gi = by_old_index.get(vg.name)
+        if vg.name in groups:
+            by_weight = {}
+            for vi, w in groups[vg.name].items():
+                by_weight.setdefault(w, []).append(vi)
+            for w, idx in by_weight.items():
+                vg.add(idx, w, "REPLACE")
+            kept_weights.append(vg.name + " (from the call)")
+        elif same_count and old_gi in old_weights:
+            for vi, w in old_weights[old_gi]:
+                vg.add([vi], w, "REPLACE")
+            kept_weights.append(vg.name)
+        elif old_gi in old_weights:
+            dropped_weights.append(vg.name)
+    for gname, entries in groups.items():
+        if obj.vertex_groups.get(gname) is None:
+            vg = obj.vertex_groups.new(name=gname)
+            for vi, w in entries.items():
+                vg.add([vi], w, "REPLACE")
+            kept_weights.append(gname + " (new, from the call)")
+    kept_keys, dropped_keys = [], []
+    if key_rows and same_count:
+        base_co = [tuple(v.co) for v in mesh.vertices]
+        made = {}
+        for name, value, rel, mute, smin, smax, offs in key_rows:
+            kb = obj.shape_key_add(name=name, from_mix=False)
+            kb.data.foreach_set("co", [c + o for i, off in enumerate(offs) for c, o in zip(base_co[i], off)])
+            kb.slider_min, kb.slider_max = smin, smax
+            kb.value, kb.mute = value, mute
+            made[name] = (kb, rel)
+            kept_keys.append(kb.name)
+        for kb, rel in made.values():
+            if rel in made and made[rel][0] is not kb:
+                kb.relative_key = made[rel][0]
+    elif key_rows:
+        dropped_keys = [r[0] for r in key_rows]
+    old_removed = False
+    old_left = old.users
+    if old.users == 0:
+        bpy.data.meshes.remove(old)
+        old_removed = True
+        assign_id_name(mesh, old_name, bpy.data.meshes)
+    loc, rot = placed
+    if params.get("location") is not None:
+        obj.location = loc
+    if params.get("rotation") is not None:
+        obj.rotation_euler = rot
+    if want_scale is not None:
+        obj.scale = want_scale
+    mesh.update()
+    bpy.context.view_layer.update()
+    counts = {}
+    for v in mesh.vertices:
+        for g in v.groups:
+            counts[g.group] = counts.get(g.group, 0) + 1
+    zero = [p.index for p in mesh.polygons if p.area < _ZERO_AREA_M2]
+    return {
+        "ok": True, "name": obj.name, "type": obj.type, "replaced": True, "meshName": mesh.name,
+        "oldMesh": old_name, "oldMeshRemoved": old_removed,
+        "oldMeshKeptBecause": None if old_removed else "%d other user(s) still use it" % old_left,
+        "oldVertexCount": n_old, "vertexCount": n_new, "edgeCount": len(mesh.edges), "faceCount": len(mesh.polygons),
+        "vertexCountChanged": not same_count,
+        "kept": {"modifiers": [m.name for m in obj.modifiers], "parent": obj.parent.name if obj.parent else None,
+                 "children": sorted(c.name for c in obj.children), "constraints": [c.name for c in obj.constraints],
+                 "collections": sorted(c.name for c in obj.users_collection)},
+        "vertexGroupWeightsCarried": kept_weights, "vertexGroupWeightsDropped": dropped_weights,
+        "shapeKeysCarried": kept_keys, "shapeKeysDropped": dropped_keys,
+        "carryNote": (None if same_count or not (dropped_weights or dropped_keys) else
+                      "the vertex count changed (%d -> %d), so weights and shape keys could not be carried by index: "
+                      "the group names stay on the object, empty" % (n_old, n_new)),
+        "materialSlots": [m.name if m else None for m in mesh.materials],
+        "materialsCarried": (not slots_given) and bool(old_mats),
+        "uvLayers": [u.name for u in mesh.uv_layers],
+        "vertexGroups": [{"name": g.name, "vertexCount": counts.get(g.index, 0)} for g in obj.vertex_groups],
+        "zeroAreaFaceCount": len(zero),
+        "location": rnd(list(obj.location)), "rotation": rnd(list(obj.rotation_euler)),
+    }
 
 
 # ---------------------------------------------------------------------------

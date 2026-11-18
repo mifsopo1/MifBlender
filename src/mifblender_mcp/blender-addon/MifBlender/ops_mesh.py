@@ -134,6 +134,62 @@ FBX_EXPORT_ARGS = {
     "path_mode": "AUTO",
 }
 
+# THE UNITY PROFILE, measured by importing the file into batch-mode Unity 6000.0.31f1 and 6000.5.0f1 and reading it back. The Unreal pins land every vertex in the right place there too; what they
+# leave is a -90 X rotation and a scale of 100 on every node, which a child attached to a bone inherits. These four give
+# rotation 0 and scale 1 on every mesh node, with no importer setting changed. U = (-bx, bz, -by), so Blender's front (-Y)
+# faces Unity's +Z. Bake Axis Conversion stays off: it writes U = (bx, bz, by) instead, the piece turned 180 degrees.
+FBX_UNITY_ARGS = {
+    "axis_up": "Y",
+    "axis_forward": "-Z",
+    "apply_scale_options": "FBX_SCALE_ALL",
+    "bake_space_transform": True,
+}
+# The names export_mesh takes for `profile`, unreal being today's behavior.
+EXPORT_PROFILES = ("unreal", "unity")
+# What Unity's importer does with a hull named for Unreal: a plain visible MeshRenderer, no collider (measured).
+_UNITY_HULL = re.compile(r"^(UCX|UBX|USP|UCP)_")
+_UNITY_LOD = re.compile(r"^(.+)_LOD(\d+)(\.\d+)?$")
+
+
+def export_profile(params, tail):
+    """The engine a file or a check is for: None when not asked (nothing in the reply changes), else unreal or unity."""
+    raw = params.get("profile")
+    if raw is None:
+        return None
+    value = str(raw).lower() if isinstance(raw, str) else None
+    if value not in EXPORT_PROFILES:
+        raise MifOpError("profile is %s, got %r. %s" % (" or ".join(EXPORT_PROFILES), raw, tail))
+    return value
+
+
+def _unity_lod_plan(targets):
+    """(renames, notes) for a Unity file: each base with _LODn siblings and no _LOD0 gets its own object written as
+    <base>_LOD0, since Unity groups by the suffix and build_lod_chain leaves LOD0 under its own name. Unity makes ONE LOD
+    Group per file, on the root, so two bases in a file land in one group; a lower-case _lod makes none (both measured)."""
+    by_base = {}
+    for o in targets:
+        m = _UNITY_LOD.match(o.name)
+        if m:
+            by_base.setdefault(m.group(1), []).append(int(m.group(2)))
+    names = {o.name: o for o in targets}
+    renames = []
+    notes = []
+    for base, levels in sorted(by_base.items()):
+        if 0 not in levels and base in names:
+            renames.append((names[base], base + "_LOD0"))
+    if len(by_base) > 1:
+        notes.append("%d LOD bases in one file (%s): Unity makes one LOD Group per file, on the root, and puts them all "
+                     "in it. Export each base to its own file." % (len(by_base), ", ".join(sorted(by_base))))
+    low = sorted(o.name for o in targets if re.search(r"_lod\d+$", o.name, re.I) and not _UNITY_LOD.match(o.name))
+    if low:
+        notes.append("%s will not group: Unity reads the suffix _LOD with capitals, and these import as separate "
+                     "renderers." % ", ".join(low))
+    missing = sorted(b for b, lv in by_base.items() if 0 not in lv and b not in names)
+    if missing:
+        notes.append("%s %s no LOD0 in this file." % (", ".join(missing), "has" if len(missing) == 1 else "have"))
+    return renames, notes
+
+
 FBX_IMPORT_ARGS = {
     "use_custom_normals": True,
     "use_anim": False,
@@ -749,9 +805,11 @@ def _material_images(objs):
     done = set()
     while trees:
         t = trees.pop()
-        if t.name in done:
+        # BY POINTER, NOT NAME (FOUND 2026-11-16): every material's own tree is named "Shader Nodetree", so a
+        # name check read the first material's tree and skipped every other one's images
+        if t.as_pointer() in done:
             continue
-        done.add(t.name)
+        done.add(t.as_pointer())
         for n in t.nodes:
             if n.type == "TEX_IMAGE" and n.image is not None and n.image.name not in seen:
                 seen.add(n.image.name)
@@ -761,7 +819,7 @@ def _material_images(objs):
     return out
 
 
-def _tangent_report(targets, args, path):
+def _tangent_report(targets, args, path, unity=False):
     """export_mesh's tangentSpace and zeroAreaUvFaces: what the file holds, and why a mesh got no tangents.
 
     inFile IS READ OFF THE FILE - a Tangents data node - not predicted, and not the "LayerElementTangent" string: on a
@@ -813,9 +871,13 @@ def _tangent_report(targets, args, path):
         note = "tangents were asked for and the file holds none - read the exporter's console output."
     else:
         note = None
+    if unity:
+        # Unity's default is to calculate Mikktspace itself; read from the file only with Tangents: Import. Both matched
+        # Blender's within 0.03 degrees on a smooth cylinder with hard caps, and a zero-area UV face got no zero tangent.
+        note = "Unity's default importer calculates Mikktspace tangents and ignores these unless Tangents is set to Import."
     out = {"tangentSpace": {"requested": requested, "inFile": in_file, "skipped": skipped or None, "note": note},
            "zeroAreaUvFaces": zero or None}
-    if zero:
+    if zero and not unity:
         out["zeroAreaUvNote"] = (
             "%d face(s) on UV channel 0 have a UV area of %g or less (zero area in UV space) - legal here, but Unreal "
             "gives their corners nearly zero tangents and warns on import (tolerance 1E-4) when it computes tangents "
@@ -826,11 +888,22 @@ def _tangent_report(targets, args, path):
 
 def op_export_mesh(params):
     """Export one object, a list of objects, or every mesh in the view layer to an .fbx file (glTF export is refused)
-    with the bridge's pinned scale and axis settings; an existing file is replaced unless overwrite is false."""
+    with the bridge's pinned scale and axis settings; an existing file is replaced unless overwrite is false. profile
+    unity writes for Unity's importer instead (FBX_UNITY_ARGS), and no profile is today's Unreal behavior exactly."""
     reject_unknown(params, set(_EXPORT_OVERRIDES) | {
         "object", "name", "objects", "file", "filepath", "path",
         "overwrite", "replaceExisting", "objectTypes", "localSpace", "animationsOnly", "globalScale",
-        "applyScaleOptions", "pathMode", "embedTextures", "facingBody", "splitShapeCorners", "sockets"}, "export_mesh")
+        "applyScaleOptions", "pathMode", "embedTextures", "facingBody", "splitShapeCorners", "sockets", "lodGroups",
+        "profile"},
+        "export_mesh")
+    profile = export_profile(params, "NOTHING was written.")
+    unity = profile == "unity"
+    if unity and params.get("sockets") is not None:
+        raise MifOpError("sockets writes Unreal's SOCKET_ Empties; profile unity has no reading of them measured. "
+                         "NOTHING was written.")
+    if unity and params.get("lodGroups") is not None:
+        raise MifOpError("lodGroups writes the LodGroup Empties Unreal's importer reads; profile unity has no reading of "
+                         "them measured (it names LODs <base>_LODn instead). NOTHING was written.")
     # THE SCALE PINS CAN BE CHANGED, NEVER BY DEFAULT (2026-10-04): a caller who sends neither gets the pinned
     # FBX_SCALE_NONE and 1.0 exactly as before. Read and checked here, before anything is written.
     gscale = take_float(params, "globalScale", default=None)
@@ -916,6 +989,36 @@ def op_export_mesh(params):
         if not targets:
             raise MifOpError("no mesh objects in the view layer to export. Pass 'object' "
                              "explicitly, or import something first.")
+    # A LOD GROUP GOES OUT WHOLE (2026-11-16, the UEFN check's export): lodGroups true writes, for each exported mesh
+    # under an Empty whose fbx_type is LodGroup (build_lod_chain's), that Empty and every mesh under it - the same set
+    # build_lod_chain's own file writes, so one file carries several pieces' chains. Unreal's FBX importer takes the
+    # group's children in order as LOD0, LOD1, ...; each LOD is exported as itself.
+    lod_groups = []
+    if take_bool(params, "lodGroups", default=False):
+        if local:
+            raise MifOpError("lodGroups and localSpace: the group carries each chain's placement, and localSpace would "
+                             "move LOD0 out from under it. Pass one. NOTHING was written.")
+        for t in list(targets):
+            grp = t.parent
+            if grp is None or grp.type != "EMPTY" or grp.get("fbx_type") != "LodGroup":
+                continue
+            if grp not in lod_groups:
+                lod_groups.append(grp)
+            for kid in grp.children:
+                if kid.type == "MESH" and kid not in targets:
+                    targets.append(kid)
+        if not lod_groups:
+            raise MifOpError("lodGroups: no exported mesh is under an Empty whose fbx_type is LodGroup - build_lod_chain "
+                             "makes one. Drop lodGroups to write the meshes alone. NOTHING was written.")
+    # HULLS STAY OUT OF A UNITY FILE: its importer has no collision naming, so UCX_ and its kin arrive as visible
+    # renderers with no collider (measured on 6000.0.31f1 and 6000.5.0f1, default importer settings).
+    hulls_left_out = []
+    if unity:
+        hulls_left_out = sorted(o.name for o in targets if _UNITY_HULL.match(o.name))
+        targets = [o for o in targets if not _UNITY_HULL.match(o.name)]
+        if not targets:
+            raise MifOpError("every object named (%s) is a collision hull, and Unity's importer draws those as visible "
+                             "meshes. NOTHING was written." % ", ".join(hulls_left_out))
     # FACES THAT POINT INTO THE BODY (2026-10-05): a rebuilt cuff and hem band that faced inward shipped and showed as
     # holes under a one-sided material. facingBody {body, maxInwardShare (default 0.1), bandStep, reach} measures each
     # mesh exported as mesh_quality facingAgainst does and refuses before the write when a larger share faces inward.
@@ -942,6 +1045,8 @@ def op_export_mesh(params):
                                     max_share))
 
     args = dict(FBX_EXPORT_ARGS)
+    if unity:
+        args.update(FBX_UNITY_ARGS)
     for key, (arg, kind) in _EXPORT_OVERRIDES.items():
         if key in params:
             value = params[key]
@@ -1009,13 +1114,28 @@ def op_export_mesh(params):
                              "no mesh in it is not something any caller here wants. NOTHING was "
                              "written.")
         args["object_types"] = set(types)
+    # A SKINNED MESH TAKES ITS RIG BY DEFAULT (FOUND 2026-11-10): with objectTypes unset the pin was {"MESH"}, so a
+    # character with an enabled Armature modifier went out frozen in its current pose as a static mesh - ok true,
+    # isSkeletal false, bonesWritten 0, and only a warning said so. Now an unset objectTypes includes ARMATURE when any
+    # exported mesh is deformed by one; objectTypes ["MESH"] still writes the frozen static mesh on purpose, warned.
+    rig_by_default = []
+    if types is None and not anims_only:
+        for obj in targets:
+            for mod in getattr(obj, "modifiers", []):
+                if mod.type == "ARMATURE" and getattr(mod, "object", None) is not None and mod.show_viewport \
+                        and mod.object.name not in rig_by_default:
+                    rig_by_default.append(mod.object.name)
+        if rig_by_default:
+            args["object_types"] = set(args["object_types"]) | {"ARMATURE"}
 
     # THE ARMATURE MUST BE IN THE SELECTION, not merely allowed by object_types. The exporter
     # gathers its context objects from the selection when use_selection is on, so naming ARMATURE in
     # object_types without selecting the armature produces exactly the same silently-posed static
     # mesh as before - the filter would have let it through and nothing offered it. Found by reading
     # export_fbx_bin.py rather than by exporting and wondering.
-    export_set = list(targets)
+    export_set = list(targets) + lod_groups
+    if lod_groups:
+        args["object_types"] = set(args["object_types"]) | {"EMPTY"}
     armatures = []
     unexported_deformers = []
     # A MESH ON A BONE IS NOT A SKIN: the engine's importer can drop a mesh parented to a bone or held by a Child Of
@@ -1075,7 +1195,9 @@ def op_export_mesh(params):
 
     # A KEYED MESH'S POINTS SPLIT AT ITS HARD CORNERS (1.3, splitShapeCorners, default on) - why at _split_shape_corners.
     # Read here, after every refusal above; the copies are made inside the try below and always removed.
-    split_corners = take_bool(params, "splitShapeCorners", default=True)
+    # Off under unity: the reason is Unreal's. Unity imported a keyed box the same, split or not: 24 vertices, the same
+    # deltas, no normal delta either way (measured on 6000.0.31f1 and 6000.5.0f1).
+    split_corners = take_bool(params, "splitShapeCorners", default=not unity)
     keyed = [o for o in targets if o.type == "MESH" and o.data.shape_keys is not None
              and len(o.data.shape_keys.key_blocks) >= 2 and o.name not in keys_dropped
              and "MESH" in args["object_types"]]
@@ -1091,6 +1213,13 @@ def op_export_mesh(params):
     ref_world = targets[0].matrix_world.copy()
     moved = None
     swapped, split_report = [], {}
+    lod_renames, lod_notes = _unity_lod_plan(targets) if unity else ([], [])
+    taken = set(bpy.data.objects.keys()) if lod_renames else set()
+    for _o, new in lod_renames:
+        if new in taken:
+            raise MifOpError("'%s' would be written as %s for Unity's LOD Group, and an object already has that name. "
+                             "NOTHING was written." % (_o.name, new))
+    renamed = []
     try:
         if split_corners:
             for obj in keyed:
@@ -1103,8 +1232,13 @@ def op_export_mesh(params):
         select_only(export_set)
         if local:
             moved = _local_space_move(targets[0], export_set, bool(args.get("use_mesh_modifiers")))
+        for o_, new in lod_renames:         # last of all: the steps above keep their records by object name
+            renamed.append((o_, o_.name))
+            o_.name = new
         bpy.ops.export_scene.fbx(filepath=path, use_selection=True, **args)
     finally:
+        for o_, old in renamed:
+            o_.name = old
         if moved:
             _local_space_restore(moved[0])
         for obj, original, copy in swapped:
@@ -1149,8 +1283,38 @@ def op_export_mesh(params):
                     for k, v in args.items()},
         "writtenHeight": written_height,
     }
+    if profile is not None:
+        out["profile"] = profile
+    if unity:
+        out["axis"] = {"up": "Y", "forward": "-Z", "unit": "m", "unityFromBlender": "(-x, z, -y)",
+                       "note": "Blender's front (-Y) faces Unity's +Z. Leave Bake Axis Conversion off: on, the piece "
+                               "turns 180 degrees (U = (x, z, y)) and is otherwise the same"}
+        if armatures:
+            out["rigNote"] = ("the rig's root keeps a -90 X rotation in Unity, its first bone the +90 that undoes it: "
+                              "the exporter's bake does not reach armatures. Scale is 1, and each clip's vertices land "
+                              "where Blender's do (measured).")
+        if hulls_left_out:
+            out["hullsLeftOut"] = hulls_left_out
+            out["hullsNote"] = ("left out of the file: Unity's importer has no collision naming and draws these as "
+                                "visible meshes with no collider (measured). Build colliders on the Unity side.")
+        if lod_renames:
+            out["lodRenamedForFile"] = {o_.name: new for o_, new in lod_renames}
+            out["lodNote"] = ("written as <base>_LOD0 in the file so Unity's LOD Group takes it; the scene's names are "
+                              "unchanged.")
+        if lod_notes:
+            out["lodWarning"] = lod_notes
     if socket_names is not None:
         out["socketsWritten"] = sorted(e.name for e in socket_objs)
+    if lod_groups:
+        out["lodGroupsWritten"] = [{"group": g.name, "meshes": sorted(k.name for k in g.children if k.type == "MESH")}
+                                   for g in lod_groups]
+    if unity and embed:
+        out["embedWarning"] = ("Unity bound none of the embedded images on import (measured): the material came in with no "
+                               "maps. Use export_material_textures profile unity.")
+    elif unity and args.get("path_mode") == "COPY":
+        out["copyWarning"] = ("Unity binds a copied base color and normal map on import, and leaves the normal map as a "
+                              "Default sRGB texture, which shades wrong; metallic and roughness are not read (measured). "
+                              "Use export_material_textures profile unity.")
     if embed:
         # FOUND IN THE FILE, image by image: each image file the exported materials read is looked for in the .fbx by
         # its own first 256 bytes, so the count is what the file carries rather than what was asked for.
@@ -1185,7 +1349,7 @@ def op_export_mesh(params):
     # measured 1 Blender unit = 100 Unreal units; any other pair writes a file the round-trip checks never measured.
     gs_used = finite_float(args.get("global_scale", 1.0), "globalScale")
     opt_used = args.get("apply_scale_options", "FBX_SCALE_NONE")
-    if abs(gs_used - 1.0) > 1e-9 or opt_used != "FBX_SCALE_NONE":
+    if not unity and (abs(gs_used - 1.0) > 1e-9 or opt_used != "FBX_SCALE_NONE"):
         out["roundTripWarning"] = (
             "globalScale %g with %s leaves the verified round trip (1.0 with FBX_SCALE_NONE: 1 Blender unit = 100 Unreal "
             "units, measured) - this file carries writtenHeight, not the scene's own size. Import it without a second "
@@ -1224,7 +1388,11 @@ def op_export_mesh(params):
     # With localSpace the file carries the first object at identity and the rest RELATIVE to it, on purpose, so the
     # warning below - about a transform the file carries - does not apply.
     shifted = [] if moved else [o["name"] for o in out["exported"] if not o.get("isIdentityTransform", True)]
-    if shifted:
+    if shifted and unity:
+        # MEASURED AGAINST THE WARNING BELOW: Unity keeps each node's transform and does not apply it twice. A moved, a
+        # turned, a non-uniformly scaled and a parented object each landed on their scene positions, pivot included.
+        out["transformsKept"] = shifted
+    elif shifted:
         out["nonIdentityTransformWarning"] = (
             "%s do NOT have an identity transform, so their loc/rot/scale is not baked into "
             "the mesh data and the importing engine will apply it AGAIN on top of what is in "
@@ -1237,9 +1405,17 @@ def op_export_mesh(params):
     # mesh whose deforming armature was left out of the file is named, not left for the caller to
     # discover on import.
     if "MESH" in args["object_types"]:
-        out.update(_tangent_report(targets, args, path))
+        out.update(_tangent_report(targets, args, path, unity))
     if anims_only:
         out["animationsOnly"] = True
+    if rig_by_default:
+        out["armatureIncludedByDefault"] = rig_by_default
+        out["armatureIncludedNote"] = (
+            "%s deform%s an exported mesh, so the file carries %s and the mesh at its rest pose (objectTypes was unset, "
+            "and MESH alone would have written the mesh frozen in its current pose as a static mesh). Pass objectTypes "
+            "[\"MESH\"] to write that static mesh on purpose."
+            % (", ".join("'%s'" % a for a in rig_by_default), "s" if len(rig_by_default) == 1 else "",
+               "it" if len(rig_by_default) == 1 else "them"))
     if bone_parented:
         out["boneParented"] = bone_parented
         out["boneParentedWarning"] = (
@@ -1266,7 +1442,7 @@ def op_export_mesh(params):
             "a key), or include the rig with objectTypes [\"MESH\", \"ARMATURE\"] when an Armature is the only one."
             % (", ".join("'%s'" % n for n in sorted(keys_dropped)),
                "; ".join("%s: %s" % (n, ", ".join(m)) for n, m in sorted(keys_dropped.items()))))
-    if armatures and args.get("add_leaf_bones"):
+    if armatures and args.get("add_leaf_bones") and not unity:
         out["leafBoneWarning"] = (
             "addLeafBones is on. Blender appends a synthetic tip bone to every chain end so the FBX "
             "can record bone length; Unreal has no concept of one and imports each as a REAL extra "
@@ -1281,7 +1457,7 @@ def op_export_mesh(params):
             "unchanged). Unreal reads no shape normals from an FBX and computes a morph target's normal change per point, "
             "from one face at each - so without the split a hard-cornered key arrives with the wrong normals or none. "
             "Unreal splits render vertices at hard corners anyway; splitShapeCorners false writes the points unsplit.")
-    elif keyed and not split_corners:
+    elif keyed and not split_corners and not unity:
         out["shapeCornersNote"] = (
             "splitShapeCorners false: Unreal computes a morph target's normal change per point, from one face at each, so "
             "a hard-cornered key arrives with that face's change at every corner of the point (or none).")
@@ -3857,7 +4033,7 @@ def _parse_seam_rules(raw, obj):
                     raise MifOpError("seamRules[%d] head needs the armature: '%s' has no Armature modifier with an object "
                                      "and no armature parent - pass armature. NOTHING was changed." % (i, obj.name))
             bname = r.get("bone")
-            if bname is not None and (not isinstance(bname, str) or bname not in arm.data.bones):
+            if bname is not None and (not isinstance(bname, str) or arm.data.bones.get(bname) is None):
                 raise MifOpError("seamRules[%d].bone %r is not a bone of '%s'. NOTHING was changed." % (i, bname, arm.name))
             if bname is None:
                 found = [b.name for b in arm.data.bones if b.name.lower() == "head"] or \
@@ -5103,8 +5279,14 @@ def _skin_world(meshes):
     return out
 
 
-def _apply_armature_transform(obj, do_loc, do_rot, do_scale, with_meshes):
-    """apply_transform on an ARMATURE: the armature and its skinned meshes together, the skin left where it was."""
+def _apply_armature_transform(obj, do_loc, do_rot, do_scale, with_meshes, scale_actions=False):
+    """apply_transform on an ARMATURE: the armature and its skinned meshes together, the skin left where it was.
+
+    scaleActions (FOUND 2026-11-16 scaling a rigged creature 14.456x): applying the scale moves it into the bones' rest,
+    and a pose bone's location keys are in the bone's own units, which are now that many times smaller - so every clip
+    moved its bones by the old distances, and maxSkinMove measured those unscaled keys (3.2 m). scaleActions multiplies
+    the location keys (values and handles) of every action that keys this armature's bones by the applied scale, before
+    the skin is measured again. A non-uniform scale has no single factor and is refused with it."""
     in_layer = set(bpy.context.view_layer.objects)
     meshes = [] if not with_meshes else sorted(
         (o for o in bpy.data.objects if o.type == "MESH" and o in in_layer
@@ -5117,7 +5299,21 @@ def _apply_armature_transform(obj, do_loc, do_rot, do_scale, with_meshes):
     keyed = []
     ad = obj.animation_data
     act = ad.action if ad is not None else None
-    if act is not None and do_scale and any(abs(s - 1.0) > 1e-9 for s in obj.scale):
+    factor = None
+    scaled_actions = []
+    if scale_actions:
+        sc = list(obj.scale)
+        if not do_scale:
+            raise MifOpError("scaleActions scales the clips by the scale being applied, and scale is not applied here. "
+                             "NOTHING was changed.")
+        if max(sc) - min(sc) > 1e-6 * max(1.0, max(abs(v) for v in sc)) or min(sc) <= 0.0:
+            raise MifOpError("scaleActions needs a uniform positive scale - '%s' is scaled %s, and a bone's location "
+                             "keys have no one factor for that. NOTHING was changed." % (obj.name, [round(v, 6) for v in sc]))
+        factor = sc[0]
+        from .ops_handoff import _action_bones                  # noqa: PLC0415 - export_actions' own reading
+        bone_names = {b.name for b in obj.data.bones}
+        scaled_actions = [a for a in bpy.data.actions if _action_bones(a)[0] & bone_names]
+    if act is not None and do_scale and any(abs(s - 1.0) > 1e-9 for s in obj.scale) and not scale_actions:
         from .ops_anim import _fcurves
         keyed = sorted({fc.data_path.split('"')[1] for fc in _fcurves(obj)
                         if fc.data_path.startswith("pose.bones[") and fc.data_path.endswith("].location")})
@@ -5130,6 +5326,22 @@ def _apply_armature_transform(obj, do_loc, do_rot, do_scale, with_meshes):
         bpy.ops.object.transform_apply(location=do_loc, rotation=do_rot, scale=do_scale)
     finally:
         selection_restore(snap)
+    action_rows = []
+    if scaled_actions and abs(factor - 1.0) > 1e-12:
+        from .ops_anim import _action_curves                    # noqa: PLC0415 - slotted actions on 4.4+
+        for a in scaled_actions:
+            n = 0
+            for fc in _action_curves(a):
+                if not (fc.data_path.startswith("pose.bones[") and fc.data_path.endswith("].location")):
+                    continue
+                for kp in fc.keyframe_points:
+                    kp.co[1] *= factor
+                    kp.handle_left[1] *= factor
+                    kp.handle_right[1] *= factor
+                fc.update()
+                n += len(fc.keyframe_points)
+            action_rows.append({"action": a.name, "locationKeysScaled": n})
+        bpy.context.scene.frame_set(bpy.context.scene.frame_current)
     bpy.context.view_layer.update()
     after_skin = _skin_world(meshes)
     moved = {n: max((a - b).length for a, b in zip(after_skin[n], before_skin[n])) if before_skin[n] else 0.0
@@ -5144,9 +5356,12 @@ def _apply_armature_transform(obj, do_loc, do_rot, do_scale, with_meshes):
            "maxSkinMove": round(max(moved.values()), 7) if moved else None,
            "maxBoneHeadMove": round(head_move, 7),
            "before": before, "after": after, "isIdentityTransform": after["isIdentityTransform"]}
+    if scale_actions:
+        out["actionsScaled"] = {"factor": round(factor, 9), "actions": action_rows}
     if keyed:
         out["animationNote"] = ("the scale was applied to the bones' rest, and the action '%s' keys location on %s - "
-                                "those keys are in the old scale's units, so the animation now moves those bones by a different distance."
+                                "those keys are in the old scale's units, so the animation now moves those bones by a "
+                                "different distance. scaleActions true scales every action's location keys with it."
                                 % (act.name, ", ".join(keyed[:10])))
     if not meshes and with_meshes:
         out["note"] = "no mesh is parented to '%s' or deformed by it; the armature alone was applied." % obj.name
@@ -5188,8 +5403,8 @@ def op_apply_transform(params):
     objects would move BOTH, one of them silently. Blender's own operator raises;
     this refuses first with the sharing count in the message.
     """
-    reject_unknown(params, ("object", "name", "location", "rotation", "scale", "fixNormals", "withMeshes"),
-                   "apply_transform")
+    reject_unknown(params, ("object", "name", "location", "rotation", "scale", "fixNormals", "withMeshes",
+                            "scaleActions"), "apply_transform")
     # AN ARMATURE IS TAKEN TOO (2026-10-06): applying a rig's scale or rotation with its skinned meshes was raw Python
     # (select the armature and its meshes, transform_apply). withMeshes (default true) brings every mesh parented to it
     # or deformed by its Armature modifier; the reply measures the evaluated skin and the bone heads in world space
@@ -5205,6 +5420,8 @@ def op_apply_transform(params):
                          % (obj.name, obj.mode))
     if obj.type == "MESH" and params.get("withMeshes") is not None:
         raise MifOpError("withMeshes is for an armature; '%s' is a mesh. NOTHING was changed." % obj.name)
+    if obj.type == "MESH" and params.get("scaleActions") is not None:
+        raise MifOpError("scaleActions scales an armature's clips; '%s' is a mesh. NOTHING was changed." % obj.name)
 
     # Asked BEFORE the takes consume the keys: naming any channel turns the unnamed ones off.
     named = any(k in params for k in ("location", "rotation", "scale"))
@@ -5220,7 +5437,8 @@ def op_apply_transform(params):
             "apply_transform was asked to apply nothing - location, rotation and scale are all "
             "false. Leave them unset to apply all three, or set at least one. NOTHING was changed.")
     if obj.type == "ARMATURE":
-        return _apply_armature_transform(obj, do_loc, do_rot, do_scale, take_bool(params, "withMeshes", default=True))
+        return _apply_armature_transform(obj, do_loc, do_rot, do_scale, take_bool(params, "withMeshes", default=True),
+                                         take_bool(params, "scaleActions", default=False))
 
     if obj.data.users > 1:
         raise MifOpError(
@@ -6483,6 +6701,57 @@ def _uv_box_pairs(boxes):
     return sorted(pairs), False
 
 
+
+def _uv_overlap_pairs(islands, face_island, island_boxes, loop_tris, uv_layer, budget=400000):
+    """(pairs sharing UV area, pairs only touching, pairs not confirmed, capped, box pairs) for one UV layer - uv_info's
+    test, and uv_pack's read-back after a pack. Bounding-box pairs are candidates; each is decided triangle by triangle
+    (intersect_tri_tri_2d, then again on triangles shrunk by _uv_tri_shrunk: a hit on both shares area, on the first
+    alone only touches). `budget` caps the triangle-pair tests; a pair past it is not confirmed, and the caller decides
+    what that counts as (uv_info counts it as overlapping)."""
+    box_pairs, capped = _uv_box_pairs(island_boxes)
+    overlaps = touching = unconfirmed = 0
+    if box_pairs:
+        # DEFERRED, not at module level: the offline suites import this module against a stub `mathutils` that is a
+        # plain module, and a module-level `from mathutils.geometry import ...` crashed test_blender_refusals.
+        from mathutils.geometry import intersect_tri_tri_2d   # noqa: PLC0415
+        island_tris = [[] for _ in islands]
+        for lt in loop_tris:
+            t = tuple(Vector((l[uv_layer].uv.x, l[uv_layer].uv.y)) for l in lt)
+            island_tris[face_island[lt[0].face.index]].append(
+                (t, min(p.x for p in t), max(p.x for p in t), min(p.y for p in t), max(p.y for p in t)))
+        filter_left = _UV_TRI_FILTER_LIMIT
+        for i, j in box_pairs:
+            (amin, amax), (bmin, bmax) = island_boxes[i], island_boxes[j]
+            filter_left -= len(island_tris[i]) + len(island_tris[j])
+            if filter_left < 0:
+                unconfirmed += 1
+                continue
+            # Inclusive, so a triangle that only touches the other island's box stays a candidate.
+            cand_a = [e[0] for e in island_tris[i]
+                      if e[1] <= bmax[0] and e[2] >= bmin[0] and e[3] <= bmax[1] and e[4] >= bmin[1]]
+            cand_b = [e[0] for e in island_tris[j]
+                      if e[1] <= amax[0] and e[2] >= amin[0] and e[3] <= amax[1] and e[4] >= amin[1]]
+            cost = len(cand_a) * len(cand_b)
+            if cost > budget:
+                unconfirmed += 1
+                continue
+            budget -= cost
+            touch = share = False
+            for ta in cand_a:
+                for tb in cand_b:
+                    if intersect_tri_tri_2d(*ta, *tb):
+                        touch = True
+                        if intersect_tri_tri_2d(*_uv_tri_shrunk(ta), *_uv_tri_shrunk(tb)):
+                            share = True
+                            break
+                if share:
+                    break
+            if share:
+                overlaps += 1
+            elif touch:
+                touching += 1
+    return overlaps, touching, unconfirmed, capped, len(box_pairs)
+
 def _uv_tri_shrunk(t, k=1e-4):
     """The triangle pulled 0.01% toward its centroid, so two that only share an edge or a corner no longer meet."""
     c = (t[0] + t[1] + t[2]) / 3.0
@@ -6766,50 +7035,9 @@ def op_uv_info(params):
                 densities.append((uv_area / face_area) ** 0.5)
 
         # BOX PAIRS ARE CANDIDATES; THE TRIANGLES DECIDE. See the docstring for the 48 pairs this used to report.
-        box_pairs, capped = _uv_box_pairs(island_boxes)
-        overlaps = touching = unconfirmed = 0
-        if box_pairs:
-            # DEFERRED, not at module level: the offline suites import this module against a stub `mathutils` that is a
-            # plain module, and a module-level `from mathutils.geometry import ...` crashed test_blender_refusals.
-            from mathutils.geometry import intersect_tri_tri_2d   # noqa: PLC0415
-            island_tris = [[] for _ in islands]
-            for lt in loop_tris:
-                t = tuple(Vector((l[uv_layer].uv.x, l[uv_layer].uv.y)) for l in lt)
-                island_tris[face_island[lt[0].face.index]].append(
-                    (t, min(p.x for p in t), max(p.x for p in t), min(p.y for p in t), max(p.y for p in t)))
-            budget = 400000          # triangle-pair tests per layer; a pair past it is counted by its box
-            filter_left = _UV_TRI_FILTER_LIMIT
-            for i, j in box_pairs:
-                (amin, amax), (bmin, bmax) = island_boxes[i], island_boxes[j]
-                filter_left -= len(island_tris[i]) + len(island_tris[j])
-                if filter_left < 0:
-                    unconfirmed += 1
-                    continue
-                # Inclusive, so a triangle that only touches the other island's box stays a candidate.
-                cand_a = [e[0] for e in island_tris[i]
-                          if e[1] <= bmax[0] and e[2] >= bmin[0] and e[3] <= bmax[1] and e[4] >= bmin[1]]
-                cand_b = [e[0] for e in island_tris[j]
-                          if e[1] <= amax[0] and e[2] >= amin[0] and e[3] <= amax[1] and e[4] >= amin[1]]
-                cost = len(cand_a) * len(cand_b)
-                if cost > budget:
-                    unconfirmed += 1
-                    continue
-                budget -= cost
-                touch = share = False
-                for ta in cand_a:
-                    for tb in cand_b:
-                        if intersect_tri_tri_2d(*ta, *tb):
-                            touch = True
-                            if intersect_tri_tri_2d(*_uv_tri_shrunk(ta), *_uv_tri_shrunk(tb)):
-                                share = True
-                                break
-                    if share:
-                        break
-                if share:
-                    overlaps += 1
-                elif touch:
-                    touching += 1
-            overlaps += unconfirmed
+        overlaps, touching, unconfirmed, capped, box_pairs = _uv_overlap_pairs(islands, face_island, island_boxes,
+                                                                               loop_tris, uv_layer)
+        overlaps += unconfirmed
 
         densities.sort()
         face_total = len(bm.faces)
@@ -6845,7 +7073,7 @@ def op_uv_info(params):
             "nearZeroTangents": deg.get("tangents"),
             "overlappingIslandPairs": overlaps,
             "touchingIslandPairs": touching,
-            "boxOverlapPairs": len(box_pairs),
+            "boxOverlapPairs": box_pairs,
             "pairsNotConfirmed": unconfirmed,
             "overlapCheckCapped": capped,
             "texelDensityMin": round(densities[0], 6) if densities else None,
@@ -6895,7 +7123,7 @@ def op_uv_info(params):
                 "%d island pair(s) overlap by bounding box, and each was checked triangle by triangle "
                 "(mathutils intersect_tri_tri_2d; triangles shrunk 0.01%% so a shared edge is not counted as area): "
                 "%d share area, %d only touch, %d are apart.%s"
-                % (len(box_pairs), overlaps - unconfirmed, touching, len(box_pairs) - overlaps - touching,
+                % (box_pairs, overlaps - unconfirmed, touching, box_pairs - overlaps - touching,
                    ((" %d pair(s) were past the work budget and are counted as overlapping by their box."
                      % unconfirmed) if unconfirmed else "")
                    + (" The search stopped at its work limit (overlapCheckCapped), so every count here is a lower "
@@ -7282,6 +7510,11 @@ def op_create_collision_hull(params):
         for name, (g, pts) in zip(names, plans):
             hull_mesh, simplified, outside = _hull_mesh(name, pts, shape, max_verts, span)
             hull_obj = bpy.data.objects.new(name, hull_mesh)
+            # A HULL IS COLLISION, NOT SURFACE (2026-11-15, met writing a kit generator): it rendered as a solid box over
+            # its source, while build_kit_piece hides its own hulls. Wire in the viewport and out of renders, the same;
+            # the FBX export still carries it (the exporter does not read hide_render).
+            hull_obj.display_type = "WIRE"
+            hull_obj.hide_render = True
             target_coll.objects.link(hull_obj)
             if not world:
                 hull_obj.matrix_world = src.matrix_world.copy()
@@ -7738,7 +7971,8 @@ def _falloff_value(d, radius, inner, shape):
         return 0.0
     return _FALLOFF_CURVES[shape](1.0 - (d - inner) / (radius - inner))
 _STATS_KEYS = {"object", "name", "evaluated", "attributeStats", "frame", "components", "attributeValues",
-               "allowSimulation", "instances"}
+               "allowSimulation", "instances", "islands"}
+_ISLAND_KEYS = {"evaluated", "limit"}
 _INST_KEYS = {"start", "limit", "matrix"}
 
 
@@ -7850,6 +8084,201 @@ def _instance_rows(obj, spec):
 # can be read, so those builds answer the mesh and the instance count and refuse the rest by name.
 _GEO_COMPONENTS = ("MESH", "POINTCLOUD", "CURVES", "INSTANCES")
 _AV_KEYS = {"component", "domain", "name", "limit", "start"}
+
+
+def _parse_islands(params):
+    """islands: true or {evaluated, limit} -> (evaluated, limit), or None. Checked before anything is read."""
+    raw = params.get("islands")
+    if raw is None or raw is False:
+        return None
+    if raw is True:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise MifOpError("islands is true or {evaluated, limit}, got %r. NOTHING was read." % (raw,))
+    bad = sorted(k for k in raw if k not in _ISLAND_KEYS)
+    if bad:
+        raise MifOpError("islands takes %s; %s is not one. NOTHING was read." % (", ".join(sorted(_ISLAND_KEYS)),
+                                                                                ", ".join(bad)))
+    ev = raw.get("evaluated", False)
+    if not isinstance(ev, bool):
+        raise MifOpError("islands.evaluated is true or false, got %r. NOTHING was read." % (ev,))
+    limit = raw.get("limit", 100)
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 10000:
+        raise MifOpError("islands.limit must be a whole number 1-10000, got %r. NOTHING was read." % (limit,))
+    return ev, limit
+
+
+def _islands_of(obj, isl):
+    if obj is None or obj.type != "MESH":
+        if obj is not None and isl[0]:
+            return _island_report(obj, True, isl[1])
+        raise MifOpError("islands reads a MESH's connected parts; '%s' is a %s - pass islands {evaluated: true} for the "
+                         "mesh it evaluates to." % (getattr(obj, "name", "?"), getattr(obj, "type", "?")))
+    return _island_report(obj, isl[0], isl[1])
+
+
+def _ray_parity(point, tris):
+    """How many of `tris` (T, 3, 3) a ray from `point` crosses - odd means inside a closed shell. The direction is
+    tilted off every axis so a ray along a grid of edges does not graze one."""
+    import numpy as np                                   # noqa: PLC0415
+    d = np.array([1.0, 0.0001414, 0.0001732])
+    d /= np.linalg.norm(d)
+    v0, v1, v2 = tris[:, 0], tris[:, 1], tris[:, 2]
+    e1, e2 = v1 - v0, v2 - v0
+    h = np.cross(d, e2)
+    a = np.einsum("ij,ij->i", e1, h)
+    ok = np.abs(a) > 1e-14
+    f = np.zeros_like(a)
+    f[ok] = 1.0 / a[ok]
+    sv = point - v0
+    u = f * np.einsum("ij,ij->i", sv, h)
+    q = np.cross(sv, e1)
+    v = f * (q @ d)
+    t = f * np.einsum("ij,ij->i", e2, q)
+    hit = ok & (u >= 0) & (v >= 0) & (u + v <= 1) & (t > 1e-12)
+    return int(hit.sum())
+
+
+def _island_report(obj, evaluated, limit):
+    """Connected islands of a mesh: per island V, E, F, V - E + F, boundary / non-manifold / wire edges, whether it is
+    closed, its signed volume, and which closed island it sits inside - read off the mesh as it is, no duplicate.
+
+    WHY (filed 2026-11-09, built 2026-11-15). components=True reports geometry component types, not islands, and agents
+    duplicated the object, separated it loose and read createdCount. A graph island count is not enough either: a
+    source with one island and chi -4 came out of a voxel remesh with chi 6, since thin slits pinch into sealed shells,
+    and 1-3 voxel pockets sat inside as closed shells - which `insideOf` names.
+    """
+    import numpy as np                                   # noqa: PLC0415
+    eval_obj = None
+    if evaluated:
+        eval_obj = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
+        mesh = eval_obj.to_mesh()
+    else:
+        mesh = obj.data
+    try:
+        nv, ne, nf = len(mesh.vertices), len(mesh.edges), len(mesh.polygons)
+        if nv == 0:
+            return {"from": "evaluated" if evaluated else "base", "count": 0, "rows": [], "eulerNumber": 0}
+        ev = np.empty(ne * 2, dtype=np.int64)
+        mesh.edges.foreach_get("vertices", ev)
+        ev = ev.reshape(-1, 2)
+        # LABELS BY HOOKING AND POINTER JUMPING: each edge pulls both ends to the smaller label, then every label
+        # follows its own label until nothing moves - a handful of passes on a real mesh, all in numpy.
+        lab = np.arange(nv, dtype=np.int64)
+        while ne:
+            a, b = lab[ev[:, 0]], lab[ev[:, 1]]
+            m = np.minimum(a, b)
+            before = lab.copy()
+            np.minimum.at(lab, ev[:, 0], m)
+            np.minimum.at(lab, ev[:, 1], m)
+            np.minimum.at(lab, a, m)
+            np.minimum.at(lab, b, m)
+            while True:
+                nxt = lab[lab]
+                if np.array_equal(nxt, lab):
+                    break
+                lab = nxt
+            if np.array_equal(lab, before):
+                break
+        roots, vid = np.unique(lab, return_inverse=True)
+        k = len(roots)
+        loop_v = np.empty(len(mesh.loops), dtype=np.int64)
+        mesh.loops.foreach_get("vertex_index", loop_v)
+        loop_e = np.empty(len(mesh.loops), dtype=np.int64)
+        mesh.loops.foreach_get("edge_index", loop_e)
+        starts = np.empty(nf, dtype=np.int64)
+        mesh.polygons.foreach_get("loop_start", starts)
+        faces_per_edge = np.bincount(loop_e, minlength=ne) if ne else np.zeros(0, dtype=np.int64)
+        e_isl = vid[ev[:, 0]] if ne else np.zeros(0, dtype=np.int64)
+        f_isl = vid[loop_v[starts]] if nf else np.zeros(0, dtype=np.int64)
+        V = np.bincount(vid, minlength=k)
+        E = np.bincount(e_isl, minlength=k)
+        F = np.bincount(f_isl, minlength=k)
+        boundary = np.bincount(e_isl[faces_per_edge == 1], minlength=k)
+        nonman = np.bincount(e_isl[faces_per_edge > 2], minlength=k)
+        wire = np.bincount(e_isl[faces_per_edge == 0], minlength=k)
+        co = np.empty(nv * 3, dtype=np.float64)
+        mesh.vertices.foreach_get("co", co)
+        co = co.reshape(nv, 3)
+        mesh.calc_loop_triangles()
+        tv = np.empty(len(mesh.loop_triangles) * 3, dtype=np.int64)
+        mesh.loop_triangles.foreach_get("vertices", tv)
+        tv = tv.reshape(-1, 3)
+        t_isl = vid[tv[:, 0]] if len(tv) else np.zeros(0, dtype=np.int64)
+        p0, p1, p2 = co[tv[:, 0]], co[tv[:, 1]], co[tv[:, 2]]
+        vol = np.bincount(t_isl, weights=np.einsum("ij,ij->i", p0, np.cross(p1, p2)) / 6.0, minlength=k)
+        lo = np.full((k, 3), np.inf)
+        hi = np.full((k, 3), -np.inf)
+        for ax in range(3):
+            np.minimum.at(lo[:, ax], vid, co[:, ax])
+            np.maximum.at(hi[:, ax], vid, co[:, ax])
+        closed = (boundary == 0) & (nonman == 0) & (wire == 0) & (F > 0)
+        # CONTAINMENT, only where a box holds a box: one vertex of island i against each closed island j around it
+        first_v = np.zeros(k, dtype=np.int64)
+        first_v[vid[::-1]] = np.arange(nv)[::-1]
+        inside_of = [None] * k
+        depth = [0] * k
+        closed_ids = np.nonzero(closed)[0]
+        tri_by = {}
+        if len(closed_ids) and len(tv):
+            order = np.argsort(t_isl, kind="stable")
+            counts = np.bincount(t_isl, minlength=k)
+            offs = np.concatenate([[0], np.cumsum(counts)])
+            for j in closed_ids:
+                tri_by[int(j)] = order[offs[j]:offs[j + 1]]
+        tests = 0
+        for i in range(k):
+            best, best_vol, n_in = None, None, 0
+            for j in closed_ids:
+                j = int(j)
+                if j == i or not (np.all(lo[j] <= lo[i]) and np.all(hi[j] >= hi[i])):
+                    continue
+                tests += 1
+                idx = tri_by.get(j)
+                if idx is None or not len(idx):
+                    continue
+                tris = np.stack([co[tv[idx, 0]], co[tv[idx, 1]], co[tv[idx, 2]]], axis=1)
+                if _ray_parity(co[first_v[i]], tris) % 2 == 1:
+                    n_in += 1
+                    if best is None or abs(vol[j]) < best_vol:
+                        best, best_vol = j, abs(vol[j])
+            inside_of[i] = best
+            depth[i] = n_in
+        rank = sorted(range(k), key=lambda i: (-int(V[i]), i))
+        new_index = {old: new for new, old in enumerate(rank)}
+        rows = []
+        for i in rank[:limit]:
+            chi = int(V[i] - E[i] + F[i])
+            row = {"island": new_index[i], "vertices": int(V[i]), "edges": int(E[i]), "faces": int(F[i]),
+                   "euler": chi, "boundaryEdges": int(boundary[i]), "nonManifoldEdges": int(nonman[i]),
+                   "wireEdges": int(wire[i]), "closed": bool(closed[i]),
+                   "volume": round(float(vol[i]), 9) if closed[i] else None,
+                   "inverted": bool(closed[i] and vol[i] < 0),
+                   "genus": ((2 - chi) // 2) if closed[i] and chi % 2 == 0 else None,
+                   "insideOf": new_index[inside_of[i]] if inside_of[i] is not None else None,
+                   "nestingDepth": depth[i],
+                   "boundsMin": [round(float(x), 6) for x in lo[i]], "boundsMax": [round(float(x), 6) for x in hi[i]]}
+            rows.append(row)
+        sealed = [new_index[i] for i in range(k) if closed[i] and inside_of[i] is not None]
+        return {
+            "from": "evaluated" if evaluated else "base", "space": "local",
+            "count": k, "rows": rows, "truncated": k > limit, "limit": limit,
+            "closedCount": int(closed.sum()), "openCount": int(k - closed.sum()),
+            "looseVertexIslands": int(((V == 1) & (E == 0)).sum()),
+            "eulerNumber": int(nv - ne + nf),
+            "boundaryEdges": int((faces_per_edge == 1).sum()), "nonManifoldEdges": int((faces_per_edge > 2).sum()),
+            "wireEdges": int((faces_per_edge == 0).sum()),
+            "sealedInside": sorted(sealed)[:limit], "sealedInsideCount": len(sealed),
+            "containmentTests": tests,
+            "note": ("euler is V - E + F per island; a closed orientable shell has euler 2 - 2 x genus (a sphere 2, a "
+                     "torus 0). insideOf names the smallest closed island this one's first vertex lies inside (ray "
+                     "parity), so a sealed void or a pocket left by a remesh shows there; inverted is a closed island "
+                     "whose normals point in (negative volume), the usual shape of an inner shell. Islands are ranked "
+                     "by vertex count, largest first."),
+        }
+    finally:
+        if eval_obj is not None:
+            eval_obj.to_mesh_clear()
 
 
 def _parse_geometry_request(params):
@@ -8081,7 +8510,17 @@ def op_rename_object(params):
             data_name = getattr(obj.data, "name", None)
 
     stolen = (clash is not None and clash.name != other_before)
+    # WHY THE DATA DID NOT TAKE THE NAME (FOUND 2026-11-09): dataRenamed false came with no reason; it is what another
+    # data block holds, typically one an earlier delete left with no user.
+    why_not = {}
+    if rename_data and getattr(obj, "data", None) is not None and data_name != obj.name:
+        from .ops_common import data_name_report               # noqa: PLC0415
+        rep = data_name_report(obj.data, obj.name)
+        why_not = {"dataNameHeldBy": rep.get("dataNameHeldBy"),
+                   "dataNotRenamedNote": (rep.get("dataNameNote") or "Blender kept the data's name.")
+                   + " Rename again once it is free."}
     return {
+        **why_not,
         "ok": True,
         "object": obj.name,
         "renamedFrom": was,
@@ -8616,8 +9055,9 @@ def op_mesh_stats(params):
     frame = take_int(params, "frame")
     comps, av = _parse_geometry_request(params)
     inst = _parse_instances(params)
+    isl = _parse_islands(params)
     rest = {k: v for k, v in params.items() if k not in ("frame", "components", "attributeValues", "allowSimulation",
-                                                          "instances")}
+                                                          "instances", "islands")}
     sc = bpy.context.scene
     # AN INSTANCER THAT IS NOT A MESH - a collection instance's Empty - has instances and nothing else to count.
     if inst is not None:
@@ -8633,6 +9073,8 @@ def op_mesh_stats(params):
         probe = bpy.data.objects.get(out.get("object") or "")
         if comps or av is not None:
             out.update(_geometry_read(probe, comps, av))
+        if isl is not None:
+            out["islands"] = _islands_of(probe, isl)
         if inst is not None:
             out["instances"] = _instance_rows(probe, inst)
         rows = _sim_cache_rows(probe, sc.frame_current) if probe is not None else []
@@ -8666,6 +9108,8 @@ def op_mesh_stats(params):
         out = _mesh_stats(rest)
         if comps or av is not None:
             out.update(_geometry_read(obj, comps, av))
+        if isl is not None:
+            out["islands"] = _islands_of(obj, isl)
         if inst is not None:
             out["instances"] = _instance_rows(obj, inst)
     finally:
@@ -9169,7 +9613,7 @@ def triangle_budget_for_size(obj):
                     "large 300 cm and over) - mesh_quality conventions' triangles for the size"}
 
 
-def _conventions(obj, kind_arg, module_cm):
+def _conventions(obj, kind_arg, module_cm, profile=None):
     """The conventions block of mesh_quality: every finding carries what was MEASURED, the convention it is held to,
     and `follows` (true, false, or null where the convention does not decide). Nothing here is a defect on its own -
     each is a note with its number, for the piece's author to weigh."""
@@ -9234,6 +9678,7 @@ def _conventions(obj, kind_arg, module_cm):
     names = [uv.name for uv in me.uv_layers]
     lm_named = [i for i, n in enumerate(names) if _CONV_LIGHTMAP_NAME.search(n)]
     lm_index = lm_named[-1] if lm_named else (len(names) - 1 if len(names) >= 2 else None)
+    unity = profile == "unity"
     uv = {"measured": {"count": len(names), "names": names,
                        "lightmapLayer": names[lm_index] if lm_index is not None else None,
                        "lightmapIndex": lm_index,
@@ -9244,6 +9689,12 @@ def _conventions(obj, kind_arg, module_cm):
     if not names:
         uv["follows"] = False
         notes.append("no UV layer at all - neither a texture nor a lightmap can be laid out")
+    elif unity:
+        # Measured: a second layer arrives as Mesh.uv2, and Generate Lightmap UVs makes one on request, replacing it. So
+        # the rule that holds a lightmap layer to Unreal's position and readiness does not apply.
+        uv["convention"] = ("UV0 for the texture. A second layer arrives as uv2 (lightmap UVs), and with one layer Unity's "
+                            "Generate Lightmap UVs makes it on import")
+        uv["follows"] = None
     elif lm_index is None:
         uv["follows"] = None
         uv["note"] = ("one layer: Unreal's importer can generate the lightmap from UV0 into the next channel "
@@ -9305,8 +9756,9 @@ def _conventions(obj, kind_arg, module_cm):
         "usualRange": [lo_t, hi_t], "rareAbove": p95, "usualPerM2": [lo_d, hi_d],
         "position": band,
         "follows": lo_t <= tris <= hi_t,
-        "note": ("a count past the usual range is ordinary on a Nanite mesh, which spends detail on large pieces; "
-                 "below it, a piece can read as low-poly at close range"),
+        "note": (("below the usual range, a piece can read as low-poly at close range" if unity else
+                  "a count past the usual range is ordinary on a Nanite mesh, which spends detail on large pieces; "
+                  "below it, a piece can read as low-poly at close range")),
     }
     if not (lo_t <= tris <= hi_t):
         notes.append("%d triangles is %s for a %s piece (%d-%d)" % (tris, band, size_class, lo_t, hi_t))
@@ -9369,13 +9821,17 @@ def _conventions(obj, kind_arg, module_cm):
             hulls.append({"object": o.name, "vertices": len(o.data.vertices),
                           "withinEngineLimit": len(o.data.vertices) <= _UE_HULL_VERT_LIMIT})
     hulls.sort(key=lambda h: h["object"])
-    over = [h["object"] for h in hulls if not h["withinEngineLimit"]]
+    over = [h["object"] for h in hulls if not h["withinEngineLimit"]] if not unity else []
     out["collision"] = {
         "measured": {"hulls": hulls, "count": len(hulls)},
         "convention": ("a few simple hulls named UCX_<mesh>_NN travel with the mesh; with none, the engine makes "
                        "collision on import or the piece has none - common on small props"),
         "follows": (not over) if hulls else None,
     }
+    if unity:
+        out["collision"]["convention"] = ("no collision naming: Unity's importer draws a hull named UCX_ as a visible "
+                                          "mesh with no collider, so export_mesh profile unity leaves them out")
+        out["collision"]["follows"] = None
     if over:
         notes.append("hull(s) over %d vertices: %s" % (_UE_HULL_VERT_LIMIT, ", ".join(over)))
 
@@ -9386,9 +9842,21 @@ def _conventions(obj, kind_arg, module_cm):
         "convention": "SM_ then words, then a two-digit number and a variant letter - SM_Wall_Plain_01a",
         "follows": bool(_CONV_NAME.match(obj.name)) and bool(_CONV_NAME_NUMBERED.search(obj.name)),
     }
-    if not out["name"]["follows"]:
+    if unity:
+        # NO PREFIX RULE, and only the one naming the importer reads: _LOD with capitals, which a lower-case _lod misses.
+        low = bool(re.search(r"_lod\d+$", obj.name)) or bool(re.search(r"_Lod\d+$", obj.name))
+        out["name"] = {"measured": {"name": obj.name, "lowerCaseLod": low},
+                       "convention": "Unity has no prefix rule; meshes named <base>_LOD0, _LOD1 in one file become an "
+                                     "LOD Group, and only with _LOD in capitals",
+                       "follows": False if low else None}
+        if low:
+            notes.append("the name '%s' ends in a _lod Unity's importer will not group - it reads _LOD in capitals"
+                         % obj.name)
+    elif not out["name"]["follows"]:
         notes.append("the name '%s' is not SM_<Words>_NNa" % obj.name)
 
+    if profile is not None:
+        out["profile"] = profile
     out["notes"] = notes
     out["followCount"] = sum(1 for v in out.values() if isinstance(v, dict) and v.get("follows") is True)
     out["differCount"] = sum(1 for v in out.values() if isinstance(v, dict) and v.get("follows") is False)
@@ -9665,7 +10133,7 @@ def thickness_report(obj, method, samples, seed, min_cm):
 MESH_QUALITY_PARAMS = (
     "object", "name", "uvLayer", "texelDensityFor", "conventions", "kind", "module", "boundaryLoops", "bone",
     "armature", "poles", "jointRings", "facingAgainst", "flippedAgainst", "collection", "thickness", "thicknessMinCm",
-    "gameReady",
+    "gameReady", "profile",
 )
 _KIT_ONE_MESH_KEYS = ("object", "name", "boundaryLoops", "bone", "armature", "poles", "jointRings", "facingAgainst",
                       "flippedAgainst", "thickness", "thicknessMinCm", "gameReady")
@@ -10034,11 +10502,12 @@ def _sliver_fix_distance(width):
     return float("%.0e" % d)
 
 
-def _game_ready_verdict(obj, checks, spec):
+def _game_ready_verdict(obj, checks, spec, profile=None):
     """Pass or fail for a game engine, read off the checks mesh_quality has just taken - plus the triangle count, and
     since 1.4's second pass the parts that float free and the sliver faces (_game_ready_shape). Each reason carries its
     number, its limit and the call that fixes it (args ready to send)."""
     name = obj.name
+    unity = profile == "unity"
     tris = mesh_counts(obj)["tris"]
     faces = checks["faces"]
     reasons = []
@@ -10059,9 +10528,10 @@ def _game_ready_verdict(obj, checks, spec):
              % (tris, tris - budget, budget,
                 "" if given else
                 " (no triangleBudget was given: the top of the usual range for a %s piece, %d cm on its longest side - "
-                "a Nanite mesh past it is ordinary; give triangleBudget to judge it by another number. No fix is named "
+                "%sgive triangleBudget to judge it by another number. No fix is named "
                 "against a number nobody asked for: take one of `choices`)"
-                % (budget_from["sizeClass"], budget_from["longestSideCm"])),
+                % (budget_from["sizeClass"], budget_from["longestSideCm"],
+                   "" if unity else "a Nanite mesh past it is ordinary; ")),
              *(cut if given else ()))
         if not given:
             # On shipped meshes over it, the decimate left a median 31% of the triangles and took over 1% of the surface
@@ -10160,10 +10630,11 @@ def _game_ready_verdict(obj, checks, spec):
         dist = _sliver_fix_distance(shape["sliverWidthMax"])
         fail("sliverFaces", len(slivers), 0, "%d face(s) under %.3g m wide (1/%d of the mesh's %.3g m, %g m at most) and "
              "%d or more times longer than wide - the needles a cut or a triangulated n-gon leaves; the widest is %.3g "
-             "m. They shade as streaks and give Unreal near-zero tangents. clean_mesh dissolveDegenerate at %g dissolves "
+             "m. They shade as streaks%s. clean_mesh dissolveDegenerate at %g dissolves "
              "faces up to that width" % (len(slivers), shape["sliverWidthLimitM"], round(1 / _GR_SLIVER_REL_WIDTH),
                                          shape["longestSideM"], _GR_SLIVER_MAX_WIDTH_M, _GR_SLIVER_ASPECT,
-                                         shape["sliverWidthMax"], dist),
+                                         shape["sliverWidthMax"],
+                                         "" if unity else " and give Unreal near-zero tangents", dist),
              ("clean_mesh", {"dissolveDegenerate": dist}))
     waste = _game_ready_waste(obj)
     wasted = []
@@ -10184,6 +10655,7 @@ def _game_ready_verdict(obj, checks, spec):
              "args": {"object": name, "gameReady": {"allowWaste": True}}}]
     tangents = checks.get("tangents") or {}
     zero_t = tangents.get("nearZeroVertexInstances") or 0
+    zero_all = zero_t
     t_faces = tangents.get("faces") or []
     on_slivers = bool(t_faces) and set(t_faces) <= set(slivers)
     # A UV FAULT OR A SLIVER, OR NOT THIS REASON. On 52 of 191 shipped meshes this failed, some near-zero tangents outlived
@@ -10191,7 +10663,7 @@ def _game_ready_verdict(obj, checks, spec):
     # reason there could never clear.
     tangent_rest = 0 if on_slivers else zero_t - (tangents.get("collapsedUvInstances") or 0)
     zero_t -= tangent_rest
-    if zero_t:
+    if zero_t and not unity:
         fixes = [("clean_mesh", {"dissolveDegenerate": _sliver_fix_distance(shape["sliverWidthMax"])})] \
             if on_slivers else []
         if not on_slivers:
@@ -10213,9 +10685,13 @@ def _game_ready_verdict(obj, checks, spec):
     elif waste["colorsVary"] and waste["flatShare"] >= _GR_WASTE_FLAT_SHARE and waste["flatTris"] >= _GR_WASTE_FLAT_TRIS:
         not_judged.append("wastedFaces flat (%d): its vertices carry colors that vary, so a flat face's vertices have a use"
                           % waste["flatTris"])
-    if tangent_rest:
+    if tangent_rest and not unity:
         not_judged.append("nearZeroTangents on faces with UV area (%d): calc_tangents reads them near zero from the shape or "
                           "the shading normals, and no UV edit reaches them" % tangent_rest)
+    if zero_all and unity:
+        not_judged.append("nearZeroTangents (%d): that limit is Unreal's. Unity gave a face with no UV area real tangents, "
+                          "calculated or imported (measured), though a normal map still has nothing to read there"
+                          % zero_all)
     if budget is None:
         not_judged.append("triangles (%d): no triangleBudget was given and the mesh has no size" % tris)
     if floating and spec["allowFloating"]:
@@ -10255,7 +10731,8 @@ def _game_ready_verdict(obj, checks, spec):
     if mods:
         not_judged.append("%d modifier(s) not applied (%s) - the base mesh was judged; an export that applies them "
                           "ships different geometry" % (len(mods), ", ".join(mods[:8])))
-    return {"pass": not reasons, "verdict": "pass" if not reasons else "fail",
+    return {**({"profile": profile} if profile is not None else {}),
+            "pass": not reasons, "verdict": "pass" if not reasons else "fail",
             "failCount": len(reasons), "reasons": reasons,
             "measured": {"triangles": tris, "faces": faces["total"], "ngons": faces["ngons"], "nonManifoldEdges": nm,
                          "looseVerts": lv, "looseEdges": le, "uvLayer": (checks.get("uv") or {}).get("layer"),
@@ -10324,7 +10801,7 @@ def _kit_conventions(params):
         raise MifOpError("collection '%s' (with its child collections) holds no mesh piece - %d object(s), %d of them "
                          "collision hulls - so there is no kit to measure, and an empty report would read as a clean "
                          "one. NOTHING was measured." % (name, len(objs), len(hulls)))
-    sub = {k: params[k] for k in ("kind", "module", "texelDensityFor", "uvLayer") if params.get(k) is not None}
+    sub = {k: params[k] for k in ("kind", "module", "texelDensityFor", "uvLayer", "profile") if params.get(k) is not None}
     rows, by_finding, medians, unmeasured = [], {}, [], []
     for o in sorted(pieces, key=lambda x: x.name):
         try:
@@ -10370,7 +10847,7 @@ def _kit_conventions(params):
                      "the lower one reads blurry beside the other (uv_unwrap BOX with one metersPerTile evens it)"
                      % (density["pixelsPerMetreMin"], density["pixelsPerMetreMax"], density["lowest"],
                         density["highest"], density["ratio"]))
-    for group in case_clash:
+    for group in case_clash if export_profile(params, "NOTHING was measured.") != "unity" else []:
         notes.append("%s differ only by case - Unreal's asset names do not, so they would land on one asset"
                      % " and ".join(group))
     for k in sorted(by_finding):
@@ -10450,10 +10927,19 @@ def op_mesh_quality(params):
                                20% of its thickness, the gap measured exactly; no fix is named, only
                                `choices`, since a delete sent blind takes wanted parts), sliverFaces (narrower than 1/10000 of the mesh and 100 times
                                longer than wide) and nearZeroTangents (checks.tangents, what Unreal warns about)
+      profile (str)            unreal (what no profile means) or unity: which engine conventions and gameReady hold the piece
+                               to. Under unity the SM_ name, UCX_ hulls and lightmap layer rules are not held against
+                               it, nearZeroTangents moves to notJudged, and a lower-case _lod is named, each from reading
+                               the import back in Unity.
       flippedAgainst (str)     add `flippedAgainst`: the faces whose normal turned over against the same face of a
                                reference copy (the mesh before a reshape, same faces vertex for vertex) - a fold
     """
     reject_unknown(params, MESH_QUALITY_PARAMS, "mesh_quality")
+    profile = export_profile(params, "NOTHING was measured.")
+    if profile is not None and not (params.get("conventions") or params.get("gameReady") or params.get("kind")
+                                    or params.get("module") is not None or params.get("collection")):
+        raise MifOpError("profile decides which rules conventions and gameReady hold the piece to, and neither was asked "
+                         "for. Pass conventions true or gameReady. NOTHING was measured.")
     if params.get("collection") is not None:
         return _kit_conventions(params)
     obj = get_object(take(params, "object", "name", required=True, kind=str), want_mesh=True)
@@ -10520,7 +11006,7 @@ def op_mesh_quality(params):
     concerns = []
     # THE CONVENTIONS FIRST, because they can refuse ("has no vertices") and the tangent check below makes and removes
     # a scratch mesh: a refusal after it would promise "NOTHING was measured" past a write. They read only the object.
-    conventions = (_conventions(obj, None if conv_kind in (None, "auto") else conv_kind, conv_module)
+    conventions = (_conventions(obj, None if conv_kind in (None, "auto") else conv_kind, conv_module, profile)
                    if want_conventions else None)
     # FACING TOO, for the same reason: it can refuse (nothing within reach), so it runs before the scratch mesh.
     facing_block = facing_report(obj, *facing) if facing is not None else None
@@ -10700,7 +11186,7 @@ def op_mesh_quality(params):
     if "uv" in checks and checks["uv"]["loopsOutside01"]:
         concerns.append("%d UV loop(s) outside the 0-1 tile" % checks["uv"]["loopsOutside01"])
     zero_t = (checks.get("tangents") or {}).get("nearZeroVertexInstances")
-    if zero_t:
+    if zero_t and profile != "unity":
         concerns.append("%d vertex instance(s) will get nearly zero tangents in Unreal (tolerance 1E-4) from UV channel 0 "
                         "'%s' - Unreal warns on import and shades them wrongly; faces whose UVs collapse to a line or a "
                         "point, listed in checks.tangents.faces" % (zero_t, checks["tangents"]["layer"]))
@@ -10718,7 +11204,7 @@ def op_mesh_quality(params):
                       "judged at all - an absence of data rather than a pass."),
     }
     if game_ready is not None:
-        out["gameReady"] = _game_ready_verdict(obj, checks, game_ready)
+        out["gameReady"] = _game_ready_verdict(obj, checks, game_ready, profile)
     if conventions is not None:
         out["conventions"] = conventions
     if boundary_loops is not None:
@@ -11778,7 +12264,13 @@ def op_fold_boundary_under(params):
 
 
 _UV_PACK_KEYS = ("object", "name", "uvLayer", "margin", "rotate", "equalizeByArea", "textureSize", "mergeOverlap",
-                 "targetTexelDensity", "unit", "region")
+                 "targetTexelDensity", "unit", "region", "marginMethod")
+_MARGIN_METHODS = ("SCALED", "ADD", "FRACTION")
+# A LOW FILL IS SAID PLAINLY (FOUND 2026-11-09: 4,990 small plate islands packed to 20% of the tile). Measured on 5.0.1
+# with 5,000 flat rectangles: margin 0.02 SCALED (the default) filled 0.24% of the tile, 0.001 SCALED 24.5%, and the
+# same margin as a FRACTION of the tile 68.6% (0.0005: 81.9%) - SCALED grows each island's margin with the layout's
+# scale, so thousands of islands spend the tile on gaps. CONCAVE and AABB gave the same fill on rectangles.
+_LOW_FILL = 0.4
 
 
 def _run_pack_islands(obj, name, margin, pinned):
@@ -11841,6 +12333,34 @@ def _measure_islands(me, layer_name, m3):
     return rows
 
 
+# THE OVERLAP READ-BACK'S WORK BUDGET (triangle-pair tests). uv_info's 400,000 left most pairs of a tightly packed
+# 1,470-island layout unconfirmed - counted as overlapping by their boxes - where every pair tested apart (2026-11-16, a
+# 31,842-vertex creature on 5.0.1 and 5.2.1: uv_info said 51 after a rotating FRACTION pack, the triangles 0, about
+# 1.2 million tests and 2 s). A pack is judged on the triangles, so its budget is large.
+_PACK_OVERLAP_BUDGET = 20000000
+
+
+def _layer_overlaps(me, layer_name, budget=_PACK_OVERLAP_BUDGET):
+    """{shared, touching, unconfirmed, capped} - the island pairs of one UV layer that share UV area, by
+    _uv_overlap_pairs, off a scratch bmesh that is freed."""
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(me)
+        bm.faces.ensure_lookup_table()
+        uv = bm.loops.layers.uv[layer_name]
+        islands, face_island = _uv_islands(bm, uv)
+        boxes = []
+        for island in islands:
+            us = [lp[uv].uv.x for f in island for lp in f.loops]
+            vs = [lp[uv].uv.y for f in island for lp in f.loops]
+            boxes.append(([min(us), min(vs)], [max(us), max(vs)]))
+        shared, touching, unconfirmed, capped, _n = _uv_overlap_pairs(islands, face_island, boxes,
+                                                                      bm.calc_loop_triangles(), uv, budget)
+    finally:
+        bm.free()
+    return {"shared": shared, "touching": touching, "unconfirmed": unconfirmed, "capped": capped}
+
+
 def op_uv_pack(params):
     """Pack a mesh's existing UV islands into the 0-1 tile WITHOUT re-unwrapping - optionally equalising them by area.
 
@@ -11874,6 +12394,13 @@ def op_uv_pack(params):
     require_editable(obj, "pack the UVs of")
     layer_name = take(params, "uvLayer", default=None, kind=str)
     margin = take_float(params, "margin", default=0.02)
+    margin_method = str(take(params, "marginMethod", default="SCALED", kind=str)).upper()
+    if margin_method not in _MARGIN_METHODS:
+        raise MifOpError("marginMethod must be one of %s, got %r. NOTHING was changed."
+                         % (", ".join(_MARGIN_METHODS), margin_method))
+    if params.get("marginMethod") is not None and "margin_method" not in \
+            bpy.ops.uv.pack_islands.get_rna_type().properties.keys():
+        raise MifOpError("marginMethod: this Blender's pack_islands has no margin_method. NOTHING was changed.")
     equalize = take_bool(params, "equalizeByArea", default=False)
     if not 0.0 <= margin < 1.0:
         raise MifOpError("margin must be in [0, 1), got %r. NOTHING was changed." % margin)
@@ -11926,11 +12453,30 @@ def op_uv_pack(params):
     m3 = obj.matrix_world.to_3x3()
     rows_before = _measure_islands(me, name, m3)
     med, spread_before = _ratio_stats(rows_before)
+    # THE OVERLAPS ARE READ BEFORE AND AFTER (FOUND 2026-11-16: a rotating pack was reported to turn 0 overlapping
+    # island pairs into 13). A pack that leaves more pairs sharing UV area than it found is packed again without
+    # rotation, and refused - the layer put back - when that rises too.
+    ov_before = _layer_overlaps(me, name)
     layer = me.uv_layers[name]
     saved = array.array("f", [0.0]) * (2 * len(layer.data))
     layer.data.foreach_get("uv", saved)
     scaled = skipped = 0
     scale_to = None
+    rotate_dropped = None
+
+    def overlapping(ov):
+        return ov["shared"] + ov["unconfirmed"]
+
+    def place_in_region():
+        placed = array.array("f", [0.0]) * (2 * len(me.uv_layers[name].data))
+        me.uv_layers[name].data.foreach_get("uv", placed)
+        side = region[2] - region[0] if tex is None else tex[0]
+        for i in range(0, len(placed), 2):
+            placed[i] = region[0] + placed[i] * side
+            placed[i + 1] = region[1] + placed[i + 1] * (side if tex is None else side * tex[1] / tex[0])
+        me.uv_layers[name].data.foreach_set("uv", placed)
+        me.update()
+
     try:
         if equalize and med is not None:
             bm = bmesh.new()
@@ -11956,11 +12502,11 @@ def op_uv_pack(params):
         if not square:
             # SQUARE TEXELS ON A w x h TILE: a UV step du covers du*w pixels and dv covers dv*h, so V is stretched by
             # w / h and one world unit spans as many pixels across as up.
-            flat_uv = array.array("f", [0.0]) * (2 * len(layer.data))
-            layer.data.foreach_get("uv", flat_uv)
+            flat_uv = array.array("f", [0.0]) * (2 * len(me.uv_layers[name].data))
+            me.uv_layers[name].data.foreach_get("uv", flat_uv)
             for i in range(1, len(flat_uv), 2):
                 flat_uv[i] *= tex[0] / tex[1]
-            layer.data.foreach_set("uv", flat_uv)
+            me.uv_layers[name].data.foreach_set("uv", flat_uv)
             me.update()
         if target is not None:
             rows_t = _measure_islands(me, name, m3)
@@ -11969,21 +12515,36 @@ def op_uv_pack(params):
                 raise MifOpError("no island has area in both UV and the world, so no density can be set")
             scale_to = target[0] / (uva * tex[0] * tex[1] / a3) ** 0.5
             _scale_layout_islands(me, name, scale_to)
-        pinned = dict(_PACK_PINNED, rotate=rotate, scale=target is None)
+        pinned = dict(_PACK_PINNED, rotate=rotate, scale=target is None, margin_method=margin_method)
         if merge is not None:
             pinned["merge_overlap"] = merge
         if not rotate:
             pinned.pop("rotate_method")
+        # THE LAYER IS LOOKED UP AGAIN, never the `layer` held from before: a bmesh written back (equalize, the target
+        # scale) can reallocate the UV data, and foreach_get through the stale reference crashed 5.0.1
+        # (EXCEPTION_ACCESS_VIOLATION in ensure_layer_data_is_mutable, 2026-11-16, test_blender_texel_density)
+        prepack = array.array("f", [0.0]) * (2 * len(me.uv_layers[name].data))
+        me.uv_layers[name].data.foreach_get("uv", prepack)
         _run_pack_islands(obj, name, margin, pinned)
         if region is not None:
-            placed = array.array("f", [0.0]) * (2 * len(layer.data))
-            me.uv_layers[name].data.foreach_get("uv", placed)
-            side = region[2] - region[0] if tex is None else tex[0]
-            for i in range(0, len(placed), 2):
-                placed[i] = region[0] + placed[i] * side
-                placed[i + 1] = region[1] + placed[i + 1] * (side if tex is None else side * tex[1] / tex[0])
-            me.uv_layers[name].data.foreach_set("uv", placed)
+            place_in_region()
+        ov_after = _layer_overlaps(me, name)
+        if overlapping(ov_after) > overlapping(ov_before) and rotate:
+            first = ov_after
+            me.uv_layers[name].data.foreach_set("uv", prepack)
             me.update()
+            pinned = dict(pinned, rotate=False)
+            pinned.pop("rotate_method", None)
+            _run_pack_islands(obj, name, margin, pinned)
+            if region is not None:
+                place_in_region()
+            ov_after = _layer_overlaps(me, name)
+            rotate_dropped = {"overlappingPairsWithRotate": overlapping(first)}
+        if overlapping(ov_after) > overlapping(ov_before):
+            raise MifOpError("the pack left %d island pair(s) sharing UV area where the layer had %d%s"
+                             % (overlapping(ov_after), overlapping(ov_before),
+                                " - and %d with rotation" % rotate_dropped["overlappingPairsWithRotate"]
+                                if rotate_dropped else ""))
     except Exception as exc:
         try:
             if obj.mode != "OBJECT":
@@ -11999,7 +12560,10 @@ def op_uv_pack(params):
     flat = [0.0] * (2 * len(me.uv_layers[name].data))
     me.uv_layers[name].data.foreach_get("uv", flat)
     us, vs = flat[0::2], flat[1::2]
-    out = {"object": obj.name, "layer": name, "islands": len(rows_after), "margin": margin, "rotate": rotate,
+    out = {"object": obj.name, "layer": name, "islands": len(rows_after), "margin": margin,
+           "rotate": rotate and rotate_dropped is None,
+           "overlappingIslandPairsBefore": overlapping(ov_before), "overlappingIslandPairsAfter": overlapping(ov_after),
+           "overlapPairsNotConfirmed": ov_after["unconfirmed"] or None,
            "equalizeByArea": equalize, "islandsScaled": scaled, "islandsWithoutArea": skipped,
            "ratioMedianBefore": round(med, 6) if med is not None else None,
            "ratioSpreadBefore": round(spread_before, 4) if spread_before is not None else None,
@@ -12011,8 +12575,25 @@ def op_uv_pack(params):
            "activeLayer": me.uv_layers.active.name if me.uv_layers.active else None}
     if equalize and med is None:
         out["note"] = "no island has area in both UV and 3D, so nothing was equalised; the pack ran."
+    if rotate_dropped is not None:
+        out["rotateDropped"] = dict(rotate_dropped, note=(
+            "the rotating pack left %d island pair(s) sharing UV area where the layer had %d, so it was packed again "
+            "without rotation (%d)." % (rotate_dropped["overlappingPairsWithRotate"], overlapping(ov_before),
+                                        overlapping(ov_after))))
     if merge is not None:
         out["mergeOverlap"] = merge
+    out["marginMethod"] = margin_method
+    tile = (region[2] - region[0]) * (region[3] - region[1]) if region is not None else 1.0
+    out["fill"] = round(out["uvAreaAfter"] / tile, 4) if tile > 0 else None
+    if target is None and out["fill"] is not None and out["fill"] < _LOW_FILL:
+        out["fillNote"] = (
+            "the islands cover %.0f%% of the %s. With %d islands a %s margin of %g spends most of it on gaps: margin "
+            "%s grows with the layout's scale. marginMethod FRACTION makes the margin a fraction of the tile (0.001 is "
+            "about 1 pixel of 1024), which took 5,000 small plates from under 1%% to 69%% (0.0005: 82%%)."
+            % (out["fill"] * 100, "region" if region is not None else "tile", len(rows_after), margin_method, margin,
+               margin_method) if margin_method == "SCALED" else
+            "the islands cover %.0f%% of the %s. A smaller margin, or islands of more even size, packs tighter."
+            % (out["fill"] * 100, "region" if region is not None else "tile"))
     if region is not None:
         out["region"] = [round(x, 6) for x in region]
         out["insideRegion"] = bool(min(us) >= region[0] - 1e-6 and min(vs) >= region[1] - 1e-6
@@ -12785,12 +13366,24 @@ def op_export_vertex_positions(params):
                          "written." % path)
 
     to_root = root.matrix_world.inverted() @ obj.matrix_world
+    # CENTIMETERS BY THE ROOT'S REAL SIZE (FOUND 2026-11-09). The file said "cm" whatever the frame was: true for an
+    # imported skeletal hierarchy, whose empty is scaled 0.01 so one of its units is a centimeter, and false for a plain
+    # mesh, whose root is itself at scale 1 - a 2 m mesh came out with max x 1.00952, Blender units labelled cm. One
+    # unit of the root's frame is its world scale times the scene's unit scale in meters, so the factor to cm is 1.0
+    # for the import (positions unchanged) and 100 for a plain mesh. A root scaled unevenly has no one size per unit:
+    # its units are written as they are and the reply says so.
+    rs = root.matrix_world.to_scale()
+    unit_m = float(getattr(bpy.context.scene.unit_settings, "scale_length", 1.0) or 1.0)
+    uniform = max(abs(rs.x), abs(rs.y), abs(rs.z)) - min(abs(rs.x), abs(rs.y), abs(rs.z)) <= 1e-4 * max(abs(rs.x), 1e-9)
+    to_cm = abs(rs.x) * unit_m * 100.0 if uniform else 1.0
+    if abs(to_cm - 1.0) < 1e-6:
+        to_cm = 1.0
     mesh = obj.data
     positions = []
     lo, hi = [math.inf] * 3, [-math.inf] * 3
     for v in mesh.vertices:
         p = to_root @ (key_block.data[v.index].co if key_block is not None else v.co)
-        row = [round(float(p.x), 5), round(float(-p.y), 5), round(float(p.z), 5)]
+        row = [round(float(p.x) * to_cm, 5), round(float(-p.y) * to_cm, 5), round(float(p.z) * to_cm, 5)]
         if not all(math.isfinite(c) for c in row):
             raise MifOpError("vertex %d of '%s' is not a finite position (%s). NOTHING was written."
                              % (v.index, obj.name, row))
@@ -12800,8 +13393,13 @@ def op_export_vertex_positions(params):
     if not positions:
         raise MifOpError("'%s' has no vertices. NOTHING was written." % obj.name)
     out = {"object": obj.name, "file": path, "vertexCount": len(positions), "root": root.name,
-           "rootIsObject": root is obj, "boundsCm": {"min": rnd(lo), "max": rnd(hi)},
-           "frame": "Unreal mesh space: centimeters, Y negated, in %s's frame" % root.name}
+           "rootIsObject": root is obj, "boundsCm": {"min": rnd(lo), "max": rnd(hi)} if uniform else None,
+           "bounds": {"min": rnd(lo), "max": rnd(hi)},
+           "unitsWritten": "cm" if uniform else "root units",
+           "cmPerRootUnit": round(to_cm, 6) if uniform else None,
+           "frame": ("Unreal mesh space: centimeters, Y negated, in %s's frame" % root.name) if uniform else
+                    ("Y negated, in %s's frame, in its own units: it is scaled unevenly (%s), so no one factor makes "
+                     "centimeters" % (root.name, rnd(list(rs))))}
     warnings = []
     keys = getattr(mesh, "shape_keys", None)
     if key_block is not None:
@@ -12823,7 +13421,8 @@ def op_export_vertex_positions(params):
     before = file_before(path)
     with open(path, "w", encoding="utf-8") as fh:
         json.dump({"positions": positions, "object": obj.name, "root": root.name,
-                   "frame": "unreal mesh space, cm (Y negated)"}, fh)
+                   "frame": "unreal mesh space, cm (Y negated)" if uniform else
+                            "unreal mesh space, root units (Y negated; the root is scaled unevenly)"}, fh)
     out.update(replaced_fields(before))
     if warnings:
         out["warnings"] = warnings

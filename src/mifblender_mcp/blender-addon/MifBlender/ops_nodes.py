@@ -481,8 +481,35 @@ def _canon_type_key(text):
     return "".join(ch for ch in str(text).lower() if ch.isalnum())
 
 
-def resolve_node_type(requested):
+# THE PREFIXES A TREE'S OWN NODES CARRY, so a friendly name finds the node of that kind of tree first.
+_TREE_NODE_PREFIXES = {"ShaderNodeTree": ("ShaderNode",), "GeometryNodeTree": ("GeometryNode", "FunctionNode"),
+                       "CompositorNodeTree": ("CompositorNode",), "TextureNodeTree": ("TextureNode",)}
+
+
+def _node_by_ui_name(requested, tree_idname=None):
+    """The bl_idname whose own UI name ('Wireframe', 'Ambient Occlusion') or idname tail ('Wireframe' for
+    ShaderNodeWireframe, 'TexNoise') matches `requested` with case and punctuation removed - every registered node of
+    the tree's kind, not a table, so a node the alias table never listed resolves like one it did (FOUND 2026-11-10:
+    'Wireframe' was refused while ShaderNodeWireframe worked). None when nothing or more than one node matches."""
+    key = _canon_type_key(requested)
+    prefixes = _TREE_NODE_PREFIXES.get(tree_idname or "ShaderNodeTree", ("ShaderNode",))
+    hits = set()
+    for attr in dir(bpy.types):
+        prefix = next((p for p in prefixes if attr.startswith(p) and len(attr) > len(p)), None)
+        if prefix is None or attr.endswith("Tree") or "Socket" in attr:
+            continue
+        rna = getattr(getattr(bpy.types, attr, None), "bl_rna", None)
+        ui = getattr(rna, "name", "") or ""
+        if _canon_type_key(attr[len(prefix):]) == key or _canon_type_key(ui) == key:
+            hits.add(attr)
+    return hits.pop() if len(hits) == 1 else None
+
+
+def resolve_node_type(requested, tree_idname=None):
     """A friendly node name or a raw bl_idname -> the bl_idname to create, or a refusal.
+
+    The alias table first, then a raw bl_idname, then any registered node of the tree's kind whose
+    own UI name or idname tail matches (_node_by_ui_name).
 
     REFUSED BY NAME WITH THE VERSION, never silently skipped and never left to
     tree.nodes.new()'s own message, which says only that Blender does not know the type. That is
@@ -493,6 +520,9 @@ def resolve_node_type(requested):
     idname = SHADER_NODE_ALIASES.get(_canon_type_key(requested), requested)
     if hasattr(bpy.types, idname):
         return idname
+    by_ui = _node_by_ui_name(requested, tree_idname)
+    if by_ui is not None:
+        return by_ui
     # NOT REGISTERED ON THIS BUILD. Everything below is message quality - the answer is already no.
     swap = _NODE_TYPE_REPLACEMENTS.get(idname)
     if swap is not None:
@@ -507,8 +537,9 @@ def resolve_node_type(requested):
     known = sorted(SHADER_NODE_ALIASES)
     raise MifOpError(
         "Blender %s has no node type '%s'%s - it is not registered on this build, so it is either "
-        "gone or not yet added. The friendly names this op knows are: %s. Any other raw bl_idname "
-        "is passed through to Blender unchanged. NOTHING was added."
+        "gone or not yet added. The friendly names this op knows are: %s, and any node's own UI name "
+        "('Wireframe', 'Ambient Occlusion'). Any other raw bl_idname is passed through to Blender "
+        "unchanged. NOTHING was added."
         % (bpy.app.version_string, idname,
            (" (asked for as '%s')" % requested) if requested != idname else "",
            ", ".join(known)))
@@ -537,6 +568,37 @@ def usable_sockets(collection, name):
 def socket_label(sock):
     """'name' or 'name (inactive)' - so a listing never hides that half of it is not read."""
     return sock.name if getattr(sock, "enabled", True) else "%s (inactive)" % sock.name
+
+
+def socket_choices(collection):
+    """Each socket as '<index>: name' plus its identifier where that differs - the spellings _find_socket takes. A Mix
+    Shader's two inputs are both 'Shader'; '1: Shader [Shader_001]' says how to reach the second (FOUND 2026-11-09)."""
+    out = []
+    for i, s in enumerate(collection):
+        label = "%d: %s" % (i, socket_label(s))
+        if s.identifier != s.name:
+            label += " [%s]" % s.identifier
+        out.append(label)
+    return ", ".join(out)
+
+
+def _socket_param(params, key):
+    """A socket named by name, identifier or index: an int is its index, the same as its digits as a string."""
+    raw = params.get(key)
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        return str(raw)
+    return str(take(params, key, default="", kind=str))
+
+
+def _ambiguous_note(node, name, sock, collection):
+    """A note when `name` matched more than one live socket and the first was taken, naming how to reach the others."""
+    if not name or name.isdigit():
+        return None
+    live, _ = usable_sockets(collection, name)
+    if len(live) < 2:
+        return None
+    return ("'%s' on '%s' names %d live sockets, so the first (%s) was used. Name one by identifier or index: %s"
+            % (name, node.name, len(live), sock.identifier, socket_choices(collection)))
 
 
 # ===========================================================================
@@ -1167,7 +1229,7 @@ def op_add_group_node(params):
     # RESOLVED AND VERSION-CHECKED BEFORE ANYTHING IS CREATED. A friendly name becomes a bl_idname,
     # a raw bl_idname passes through, and a type this build does not register is refused naming the
     # version - see resolve_node_type.
-    ntype = resolve_node_type(asked)
+    ntype = resolve_node_type(asked, tree.bl_idname)
     try:
         node = tree.nodes.new(ntype)
     except RuntimeError as exc:
@@ -1565,9 +1627,9 @@ def _unlink(tree, params):
     if tn is None:
         raise MifOpError("no node named '%s' in '%s'. It has: %s. NOTHING was removed."
                          % (tn_name, tree.name, ", ".join(n.name for n in tree.nodes)))
-    ts_name = str(take(params, "toSocket", default="", kind=str))
+    ts_name = _socket_param(params, "toSocket")
     fn_name = str(take(params, "fromNode", default="", kind=str))
-    fs_name = str(take(params, "fromSocket", default="", kind=str))
+    fs_name = _socket_param(params, "fromSocket")
     if not ts_name and not fn_name:
         raise MifOpError("remove:true needs toSocket, fromNode or both - removing every link into '%s' "
                          "is too wide to be what one call meant. NOTHING was removed." % tn.name)
@@ -1576,7 +1638,7 @@ def _unlink(tree, params):
         ts = _find_socket(tn, ts_name, tn.inputs) or _principled_fallback(tn, ts_name)
         if ts is None:
             raise MifOpError("node '%s' has no input socket '%s'. It has: %s. NOTHING was removed."
-                             % (tn.name, ts_name, ", ".join(socket_label(s) for s in tn.inputs)))
+                             % (tn.name, ts_name, socket_choices(tn.inputs)))
     fn = fs = None
     if fn_name:
         fn = tree.nodes.get(fn_name)
@@ -1587,7 +1649,7 @@ def _unlink(tree, params):
             fs = _find_socket(fn, fs_name, fn.outputs)
             if fs is None:
                 raise MifOpError("node '%s' has no output socket '%s'. It has: %s. NOTHING was removed."
-                                 % (fn.name, fs_name, ", ".join(socket_label(s) for s in fn.outputs)))
+                                 % (fn.name, fs_name, socket_choices(fn.outputs)))
     elif fs_name:
         raise MifOpError("fromSocket needs fromNode - a socket name alone does not say which node's. "
                          "NOTHING was removed.")
@@ -1653,8 +1715,8 @@ def op_link_group_nodes(params):
             raise MifOpError("'%s' is a zone input that is not paired with an output, so nothing passes through it. "
                              "Make the zone with add_group_node zone {kind}, which pairs the two. NOTHING was linked."
                              % n.name)
-    fs_name = str(take(params, "fromSocket", default="", kind=str))
-    ts_name = str(take(params, "toSocket", default="", kind=str))
+    fs_name = _socket_param(params, "fromSocket")
+    ts_name = _socket_param(params, "toSocket")
     fs = _find_socket(fn, fs_name, fn.outputs) if fs_name else (fn.outputs[0] if fn.outputs else None)
     ts = _find_socket(tn, ts_name, tn.inputs) if ts_name else (tn.inputs[0] if tn.inputs else None)
     # THE VERSION-RENAME FALLBACK, tried only after the literal name has failed so it can never
@@ -1666,11 +1728,13 @@ def op_link_group_nodes(params):
             ts_alias = ts.name
     if fs is None:
         raise MifOpError("node '%s' has no output socket '%s'. It has: %s. NOTHING was linked."
-                         % (fn.name, fs_name, ", ".join(socket_label(s) for s in fn.outputs)))
+                         % (fn.name, fs_name, socket_choices(fn.outputs)))
     if ts is None:
         raise MifOpError("node '%s' has no input socket '%s'. It has: %s. NOTHING was linked."
-                         % (tn.name, ts_name, ", ".join(socket_label(s) for s in tn.inputs)))
+                         % (tn.name, ts_name, socket_choices(tn.inputs)))
 
+    ambiguous = [n for n in (_ambiguous_note(fn, fs_name, fs, fn.outputs),
+                             _ambiguous_note(tn, ts_name, ts, tn.inputs)) if n]
     before = len(tree.links)
     fn_name, tn_name_final = fn.name, tn.name
     fs_final, ts_final = fs.name, ts.name
@@ -1705,6 +1769,10 @@ def op_link_group_nodes(params):
             # WHICH SPELLING THIS BUILD USED, when the name asked for was another version's. Null
             # when the socket really is called what the caller called it.
             "toSocketResolvedFrom": (ts_name if ts_alias else None),
+            "fromIdentifier": fs_id, "toIdentifier": ts_id,
+            # A NAME SEVERAL LIVE SOCKETS SHARE (2026-11-09): a Mix Shader's two inputs are both Shader, and the first
+            # was taken without a word.
+            "socketAmbiguousNote": " ".join(ambiguous) or None,
             "linkCountBefore": before, "linkCountAfter": len(tree.links),
             "replacedLinks": replaced,
             "replacedNote": (

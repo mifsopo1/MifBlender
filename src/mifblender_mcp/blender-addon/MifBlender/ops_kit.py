@@ -56,7 +56,7 @@ BUILD_KIT_PIECE_PARAMS = (
 )
 VERTEX_RULE_PARAMS = (
     "object", "rule", "name", "channel", "range", "invert", "combine", "seed", "element", "distance", "rays",
-    "space", "makeActive", "dirt", "group", "adjust",
+    "space", "makeActive", "dirt", "group", "adjust", "weightCombine",
 )
 _DIRT_KEYS = {"blurStrength", "blurIterations", "cleanAngle", "dirtAngle", "dirtOnly", "normalize"}
 LOD_CHAIN_PARAMS = ("object", "ratios", "file", "overwrite")
@@ -994,6 +994,49 @@ def _infill_report(mesh, spec, shift, parts):
     return out
 
 
+# THE TRIM'S PROFILE (2026-11-15, met writing a kit generator): trim was on or off, so a plinth's height and depth and a
+# casing's width could not be set. trim takes {plinthHeight, plinthDepth, casingWidth} in cm as well as a boolean; the
+# builder reads the module's trim constants, so a profile sets them for this one build and puts them back after.
+_TRIM_PROFILE_KEYS = {"plinthHeight": (4.0, 60.0), "plinthDepth": (0.3, 6.0), "casingWidth": (4.0, 30.0)}
+
+
+def _build_with_trim_profile(params):
+    """build_kit_piece with trim as a profile {plinthHeight, plinthDepth, casingWidth} (cm)."""
+    raw = params["trim"]
+    bad = sorted(k for k in raw if k not in _TRIM_PROFILE_KEYS)
+    if bad:
+        raise MifOpError("trim is true, false or {%s} in cm; %s is not one. NOTHING was created."
+                         % (", ".join(sorted(_TRIM_PROFILE_KEYS)), ", ".join(bad)))
+    prof = {}
+    for k, (lo, hi) in _TRIM_PROFILE_KEYS.items():
+        if k in raw:
+            v = finite_float(raw[k], "trim.%s" % k)
+            if not lo <= v <= hi:
+                raise MifOpError("trim.%s is %g cm; it runs %g to %g. NOTHING was created." % (k, v, lo, hi))
+            prof[k] = v
+    g = globals()
+    keep = {n: g[n] for n in ("_PLINTH_H", "_PLINTH_PROUD", "_BEAD_H", "_BEAD_PROUD", "_CASING_W", "_CASING_PROUD",
+                              "_BAND_W", "_BAND_PROUD")}
+    try:
+        if "plinthHeight" in prof:
+            g["_PLINTH_H"] = prof["plinthHeight"]
+            g["_BEAD_H"] = min(keep["_BEAD_H"], prof["plinthHeight"] / 3.0)
+        if "plinthDepth" in prof:
+            g["_PLINTH_PROUD"] = prof["plinthDepth"]
+            g["_BEAD_PROUD"] = prof["plinthDepth"] + (keep["_BEAD_PROUD"] - keep["_PLINTH_PROUD"])
+        if "casingWidth" in prof:
+            g["_CASING_W"] = prof["casingWidth"]
+            g["_BAND_W"] = min(keep["_BAND_W"], prof["casingWidth"] / 3.0)
+        out = op_build_kit_piece(dict(params, trim=True))
+    finally:
+        g.update(keep)
+    if isinstance(out, dict):
+        out["trimProfile"] = {"plinthHeight": prof.get("plinthHeight", keep["_PLINTH_H"]),
+                              "plinthDepth": prof.get("plinthDepth", keep["_PLINTH_PROUD"]),
+                              "casingWidth": prof.get("casingWidth", keep["_CASING_W"]), "units": "cm"}
+    return out
+
+
 def op_build_kit_piece(params):
     """Build one modular kit piece - a wall, a wall with a door or window opening, a floor or a pillar - on a module
     grid: sides in whole modules, the pivot at the bottom (a corner by default; a pillar's bottom center), every edge
@@ -1035,7 +1078,8 @@ def op_build_kit_piece(params):
                             pillar center; always at the bottom, which is where floor modules tile from too
       bevel (cm)            edge rounding, default 1 (1.5 on a pillar); 0 leaves hard edges
       bevelSegments (int)   1 to 8, default 3
-      trim (bool)           plinth, casing and sill on a wall, base and capital on a pillar; default true
+      trim (bool | dict)    plinth, casing and sill on a wall, base and capital on a pillar; default true. Or a profile
+                            {plinthHeight, plinthDepth, casingWidth} in cm (2026-11-15): trim on, at those sizes
       uvTileCm (cm)         meters of surface per UV0 repeat, in cm; default 200
       gridCm (cm)           extra grid lines across the slab's (a pillar's shaft's) faces every this many cm, so a
                             vertex-color mask has vertices to vary across; default 50, 0 for none
@@ -1053,6 +1097,9 @@ def op_build_kit_piece(params):
                             the kit defaults stay as they are; the figure depends on the renderer's tracing mode
     """
     reject_unknown(params, BUILD_KIT_PIECE_PARAMS, "build_kit_piece", _KIT_NOTES)
+    if isinstance(params.get("trim"), dict):
+        built = _build_with_trim_profile(params)
+        return built
     min_t = take_float(params, "minThicknessCm")
     if min_t is not None and not (math.isfinite(min_t) and min_t > 0.0):
         raise MifOpError("minThicknessCm is a thickness in CENTIMETERS above 0, not %r. NOTHING was created." % min_t)
@@ -1241,23 +1288,7 @@ def op_build_kit_piece(params):
         slots.append({"slot": i, "part": "trim" if i else "surface", "material": mat.name, "made": made_mat})
 
     # ---- the lightmap layer, LAST, made by uv_unwrap and judged by uv_info --------------------------------------
-    sel = selection_snapshot()
-    try:
-        lm = op_uv_unwrap({"object": obj.name, "method": "SMART", "uvLayer": _LIGHTMAP_LAYER, "islandMargin": 0.02})
-        layers = {r.get("name"): r for r in (op_uv_info({"object": obj.name, "layer": _LIGHTMAP_LAYER}).get("layers")
-                                             or [])}
-        lm_row = layers.get(_LIGHTMAP_LAYER) or {}
-        method = "SMART"
-        if not lm_row.get("lightmapReady"):
-            # A SMART LAYOUT WITH TOUCHING ISLANDS IS REPACKED one face group per island, which never touches
-            op_uv_unwrap({"object": obj.name, "method": "LIGHTMAP", "uvLayer": _LIGHTMAP_LAYER, "replace": True,
-                          "islandMargin": 0.05})
-            layers = {r.get("name"): r for r in
-                      (op_uv_info({"object": obj.name, "layer": _LIGHTMAP_LAYER}).get("layers") or [])}
-            lm_row = layers.get(_LIGHTMAP_LAYER) or {}
-            method = "LIGHTMAP"
-    finally:
-        selection_restore(sel)
+    lm, lm_row, method = _lightmap_layer(obj)
     mesh.uv_layers.active = mesh.uv_layers["UVMap"]
     try:
         mesh.uv_layers["UVMap"].active_render = True
@@ -1546,7 +1577,8 @@ def op_set_vertex_color_by_rule(params):
                 dirt {blurStrength (0.01-1, default 1), blurIterations (0-40, default 1), cleanAngle / dirtAngle
                 (degrees, default 180 / 0), dirtOnly, normalize (default true)}; occlusion-like grime without rays
       fromWeight  a vertex group's weights (group) into the channel, through range (default 0 to 1) - a wind or wetness
-                mask authored as weights, moved to where Unreal's VertexColor node reads it
+                mask authored as weights, moved to where Unreal's VertexColor node reads it. group may be a list (a
+                body region over several bones): weightCombine max (default) or sum (clamped at 1) joins them
       adjust    change what the attribute already holds, no mask computed: adjust {levels {offset, gain}: gain x (value +
                 offset); hsv {hue (0.5 leaves it), saturation, value}: RGB only; brightnessContrast {brightness,
                 contrast} -100 to 100} - Blender's Levels, Hue/Saturation/Value and Brightness/Contrast, in that order,
@@ -1617,9 +1649,28 @@ def op_set_vertex_color_by_rule(params):
                          "NOTHING was changed.")
     dirt_only = take_bool(dspec, "dirtOnly", default=False)
     normalize = take_bool(dspec, "normalize", default=True)
-    group = take(params, "group", kind=str)
-    if rule == "fromWeight" and not group:
-        raise MifOpError("rule fromWeight needs group: the vertex group to read. NOTHING was changed.")
+    # SEVERAL GROUPS IN ONE CALL (FOUND 2026-11-11): a body region (a shirt over spine, chest, shoulders and upper arms)
+    # took one call per bone and a levels pass to combine them. group takes a name or a list; weightCombine max (the
+    # default: the strongest weight of any group) or sum (added, clamped at 1).
+    group = params.get("group")
+    if isinstance(group, str):
+        groups = [group] if group else []
+    elif isinstance(group, list) and group and all(isinstance(g, str) and g for g in group):
+        groups = list(dict.fromkeys(group))
+    elif group is None:
+        groups = []
+    else:
+        raise MifOpError("group is a vertex group name or a list of them, got %r. NOTHING was changed." % (group,))
+    if rule == "fromWeight" and not groups:
+        raise MifOpError("rule fromWeight needs group: the vertex group (or a list of them) to read. NOTHING was "
+                         "changed.")
+    if params.get("weightCombine") is not None and rule != "fromWeight":
+        raise MifOpError("'weightCombine' is read by rule fromWeight only; rule is %s. It is refused rather than "
+                         "ignored. NOTHING was changed." % rule)
+    weight_combine = take(params, "weightCombine", default="max", kind=str)
+    if weight_combine not in ("max", "sum"):
+        raise MifOpError("weightCombine is max (the strongest group weight) or sum (added, clamped at 1), got %r. "
+                         "NOTHING was changed." % weight_combine)
     adjust = None
     if rule == "adjust":
         if params.get("adjust") is None:
@@ -1631,9 +1682,12 @@ def op_set_vertex_color_by_rule(params):
             raise MifOpError("range and combine shape a computed mask; adjust changes the values already there. NOTHING "
                              "was changed.")
     obj = get_object(obj_name, want_mesh=True)
-    if rule == "fromWeight" and group not in obj.vertex_groups:
-        raise MifOpError("'%s' has no vertex group %r (it has %s). NOTHING was changed."
-                         % (obj.name, group, ", ".join(g.name for g in obj.vertex_groups) or "none"))
+    have_groups = {g.name for g in obj.vertex_groups}      # one pass, not a scan of the groups per name asked
+    missing_groups = [g for g in groups if g not in have_groups] if rule == "fromWeight" else []
+    if missing_groups:
+        raise MifOpError("'%s' has no vertex group %s (it has %s). NOTHING was changed."
+                         % (obj.name, ", ".join(repr(g) for g in missing_groups),
+                            ", ".join(g.name for g in obj.vertex_groups) or "none"))
     mesh = obj.data
     if not mesh.polygons:
         raise MifOpError("'%s' has no faces, so there is nothing to color. NOTHING was changed." % obj.name)
@@ -1690,8 +1744,11 @@ def op_set_vertex_color_by_rule(params):
         raw = [1.0 - t for t in tones]
         resolved = rng_in or (0.0, 1.0)
     elif rule == "fromWeight":
-        gi = obj.vertex_groups[group].index
-        raw = [next((g.weight for g in v.groups if g.group == gi), 0.0) for v in mesh.vertices]
+        gis = {obj.vertex_groups[g].index for g in groups}
+        if weight_combine == "sum":
+            raw = [min(1.0, sum(g.weight for g in v.groups if g.group in gis)) for v in mesh.vertices]
+        else:
+            raw = [max([g.weight for g in v.groups if g.group in gis] or [0.0]) for v in mesh.vertices]
         resolved = rng_in or (0.0, 1.0)
     elif rule == "adjust":
         raw = None
@@ -1850,7 +1907,8 @@ def op_set_vertex_color_by_rule(params):
                        "note": "1 in creases, 0 on open or worn surface - invert gives Blender's own Dirty Vertex Colors "
                                "tone"}
     if rule == "fromWeight":
-        out["group"] = group
+        out["group"] = groups[0] if isinstance(group, str) else groups
+        out["weightCombine"] = weight_combine
     if rule == "adjust":
         out["adjust"] = {k: list(v) for k, v in adjust.items()}
         out.pop("range", None)
@@ -1894,6 +1952,24 @@ def _resharpen(mesh, degrees=_LOD_SHARP_DEG):
 
 def _tris(mesh):
     return sum(len(p.vertices) - 2 for p in mesh.polygons)
+
+
+def _make_lod_group(obj, lods, coll, group_name=None):
+    """The Empty <object>_LODGroup (fbx_type LodGroup) with obj as LOD0 and `lods` after it, in order. Shared by
+    build_lod_chain (decimated LODs) and build_road (LODs built by the road builder itself, whose seam rows match).
+
+    THE GROUP TAKES THE OBJECT'S PLACE: it sits where the object sat, and every LOD rides on it with no offset of its
+    own - so every LOD sits exactly on LOD0."""
+    group = bpy.data.objects.new(group_name or obj.name + "_LODGroup", None)
+    group["fbx_type"] = "LodGroup"
+    group.empty_display_type = "PLAIN_AXES"
+    coll.objects.link(group)
+    group.matrix_world = obj.matrix_world.copy()
+    for child in [obj] + list(lods):
+        child.parent = group
+        child.matrix_parent_inverse = Matrix.Identity(4)
+        child.matrix_basis = Matrix.Identity(4)
+    return group
 
 
 def _skin_armature(obj):
@@ -2089,6 +2165,11 @@ def _skinned_lod_chain(obj, arm, ratios, names, path, started):
     return out
 
 
+def is_socket(o):
+    """An Empty named SOCKET_<name> - what Unreal's FBX importer makes a static mesh socket of (export_mesh sockets)."""
+    return o.type == "EMPTY" and o.name.startswith("SOCKET_")
+
+
 def op_build_lod_chain(params):
     """Make a chain of LODs for one mesh that Unreal's FBX importer takes as the static mesh's LODs: decimated copies
     <object>_LOD1, <object>_LOD2, ... and the object itself as LOD0, all under an Empty <object>_LODGroup whose
@@ -2139,11 +2220,15 @@ def op_build_lod_chain(params):
     if arm is None and obj.parent is not None:
         raise MifOpError("'%s' is parented to '%s'; the chain parents it under its LOD group, which would replace "
                          "that. Clear the parent first. NOTHING was created." % (obj.name, obj.parent.name))
-    if obj.children:
+    # A SOCKET STAYS (FOUND 2026-11-16): an Empty named SOCKET_<name> under the mesh is a static mesh socket on import
+    # (export_mesh sockets), not geometry, so it rides on LOD0 - every other child is refused as before
+    others = [c for c in obj.children if not is_socket(c)]
+    if others:
         # A LOD NODE'S WHOLE SUBTREE IS THAT LOD in Unreal (FindAllLODGroupNode collects every mesh under it), so a
         # child would be merged into LOD0
         raise MifOpError("'%s' has children (%s); under a LOD group they would be merged into LOD0 on import. Unparent "
-                         "them first. NOTHING was created." % (obj.name, ", ".join(c.name for c in obj.children)))
+                         "them first (an Empty named SOCKET_<name> may stay). NOTHING was created."
+                         % (obj.name, ", ".join(c.name for c in others)))
     base = obj.name
     group_name = base + "_LODGroup"
     names = ["%s_LOD%d" % (base, i + 1) for i in range(len(ratios))]
@@ -2210,10 +2295,7 @@ def op_build_lod_chain(params):
             coll.objects.link(lod)
             made.append(lod)
             lods.append(lod)
-        group = bpy.data.objects.new(group_name, None)
-        group["fbx_type"] = "LodGroup"
-        group.empty_display_type = "PLAIN_AXES"
-        coll.objects.link(group)
+        group = _make_lod_group(obj, lods, coll, group_name)
         made.append(group)
     except Exception:
         # WHAT THIS CALL MADE IS TAKEN BACK before the error goes on: the temporary copy, the LODs, the group
@@ -2223,14 +2305,6 @@ def op_build_lod_chain(params):
             except ReferenceError:
                 pass
         raise
-    # THE GROUP TAKES THE OBJECT'S PLACE: it sits where the object sat, and every LOD rides on it with no offset of
-    # its own - so every LOD sits exactly on LOD0
-    world = obj.matrix_world.copy()
-    group.matrix_world = world
-    for child in [obj] + lods:
-        child.parent = group
-        child.matrix_parent_inverse = Matrix.Identity(4)
-        child.matrix_basis = Matrix.Identity(4)
     # the object keeps its own modifiers; the LODs were made from its evaluated result
     rows = [{"lod": 0, "object": obj.name, "ratioAsked": 1.0, "triangles": base_tris, "ratioAchieved": 1.0,
              "uvLayers": [u.name for u in obj.data.uv_layers],
@@ -2258,7 +2332,7 @@ def op_build_lod_chain(params):
         try:
             if bpy.context.object is not None and bpy.context.object.mode != "OBJECT":
                 bpy.ops.object.mode_set(mode="OBJECT")
-            export_set = [group, obj] + lods + [bpy.data.objects[h] for h in hulls]
+            export_set = [group, obj] + lods + [bpy.data.objects[h] for h in hulls] +                 [c for c in obj.children if is_socket(c)]
             select_only(export_set)
             args = dict(FBX_EXPORT_ARGS)
             args["object_types"] = {"MESH", "EMPTY"}
@@ -2282,10 +2356,11 @@ def op_build_lod_chain(params):
 # create_mesh's. Each part is a closed solid when its ends are closed, and its winding is checked by signed volume.
 
 _LATHE_KEYS = ("name", "profile", "segments", "axis", "caps", "smooth", "uvScale", "location", "rotation", "scale",
-               "collection", "takeOverName", "material")
+               "collection", "takeOverName", "material", "lightmap")
 _TUBE_KEYS = ("name", "points", "start", "end", "sag", "samples", "radius", "sides", "closed", "caps", "smooth",
               "uvScale", "location", "rotation", "scale", "collection", "takeOverName", "material", "surface", "lift",
-              "step", "hangEnds", "endCaps", "stoppers")
+              "step", "hangEnds", "endCaps", "stoppers", "smoothPath", "pathSamples", "ends", "strands", "twist", "lightmap")
+_TUBE_ENDS = ("FLAT", "ROUND", "OPEN")
 _AXES = {"Z": ((1, 0, 0), (0, 1, 0), (0, 0, 1)), "Y": ((0, 0, 1), (1, 0, 0), (0, 1, 0)),
          "X": ((0, 1, 0), (0, 0, 1), (1, 0, 0))}
 
@@ -2314,6 +2389,47 @@ def _build_through_create_mesh(params, verts, faces, uvs, smooth, default_name, 
     return out
 
 
+def _lightmap_layer(obj):
+    """Make the lightmap UV layer LAST on obj (SMART, then LIGHTMAP repacked when SMART's islands touch) and judge it
+    with uv_info: (the unwrap's reply, uv_info's row, the method that stuck). Shared by build_kit_piece, build_lathe and
+    build_tube (lightmap), so every builder's lightmap layer is made and checked the same way."""
+    sel = selection_snapshot()
+    try:
+        lm = op_uv_unwrap({"object": obj.name, "method": "SMART", "uvLayer": _LIGHTMAP_LAYER, "islandMargin": 0.02})
+        layers = {r.get("name"): r for r in (op_uv_info({"object": obj.name, "layer": _LIGHTMAP_LAYER}).get("layers")
+                                             or [])}
+        lm_row = layers.get(_LIGHTMAP_LAYER) or {}
+        method = "SMART"
+        if not lm_row.get("lightmapReady"):
+            # A SMART LAYOUT WITH TOUCHING ISLANDS IS REPACKED one face group per island, which never touches
+            op_uv_unwrap({"object": obj.name, "method": "LIGHTMAP", "uvLayer": _LIGHTMAP_LAYER, "replace": True,
+                          "islandMargin": 0.05})
+            layers = {r.get("name"): r for r in
+                      (op_uv_info({"object": obj.name, "layer": _LIGHTMAP_LAYER}).get("layers") or [])}
+            lm_row = layers.get(_LIGHTMAP_LAYER) or {}
+            method = "LIGHTMAP"
+    finally:
+        selection_restore(sel)
+    return lm, lm_row, method
+
+
+def _lightmap_reply(obj, want):
+    """lightmap: true on build_lathe / build_tube (2026-11-15): the layer, last, with UVMap kept active and rendering."""
+    if not want:
+        return None
+    mesh = obj.data
+    _lm, row, method = _lightmap_layer(obj)
+    if "UVMap" in mesh.uv_layers:
+        mesh.uv_layers.active = mesh.uv_layers["UVMap"]
+        try:
+            mesh.uv_layers["UVMap"].active_render = True
+        except (AttributeError, TypeError):
+            pass
+    return {"layer": _LIGHTMAP_LAYER, "index": len(mesh.uv_layers) - 1, "method": method,
+            "lightmapReady": bool(row.get("lightmapReady")), "reason": row.get("lightmapReadyReason"),
+            "islands": row.get("islandCount")}
+
+
 def op_build_lathe(params):
     """Revolve a profile [[r, h], ...] round an axis into a closed or open solid of revolution - a can, a bottle, a post.
 
@@ -2335,6 +2451,7 @@ def op_build_lathe(params):
     """
     tail = "NOTHING was created."
     reject_unknown(params, _LATHE_KEYS, "build_lathe")
+    want_lightmap = take_bool(params, "lightmap", default=False)
     raw = params.get("profile")
     if not isinstance(raw, (list, tuple)) or len(raw) < 2:
         raise MifOpError("profile must be two or more [r, h] points. %s" % tail)
@@ -2424,6 +2541,9 @@ def op_build_lathe(params):
         uvs = [list(reversed(u)) for u in uvs]
         vol = -vol
     out = _build_through_create_mesh(params, verts, faces, uvs, smooth, "Lathe", "build_lathe")
+    lmr = _lightmap_reply(bpy.data.objects[out["name"]], want_lightmap)
+    if lmr is not None:
+        out["lightmap"] = lmr
     out.update({"segments": segs, "axis": axis, "capped": capped, "closed": closed,
                 "outwardCheck": {"signedVolume": round(vol, 9), "closed": closed,
                                  "turnedOver": flipped,
@@ -2479,6 +2599,174 @@ def _cap_fan(verts, faces, uvs, ring, reverse):
             uvs.append([[0.5, 0.5], disc[k], disc[k1]])
 
 
+
+def _tube_tangents_frames(pts, closed):
+    """Unit tangents along a path and a parallel-transported (normal, binormal) frame at each point."""
+    m = len(pts)
+    tangents = []
+    for i in range(m):
+        if closed:
+            t = (pts[(i + 1) % m] - pts[i]).normalized() + (pts[i] - pts[i - 1]).normalized()
+        elif i == 0:
+            t = pts[1] - pts[0]
+        elif i == m - 1:
+            t = pts[-1] - pts[-2]
+        else:
+            t = (pts[i + 1] - pts[i]).normalized() + (pts[i] - pts[i - 1]).normalized()
+        if t.length < 1e-9:
+            t = pts[min(i + 1, m - 1)] - pts[max(i - 1, 0)]
+        tangents.append(t.normalized())
+    t0 = tangents[0]
+    ref = Vector((0, 0, 1)) if abs(t0.z) < 0.9 else Vector((1, 0, 0))
+    nrm = (ref - t0 * ref.dot(t0)).normalized()
+    frames = []
+    for i, t in enumerate(tangents):
+        if i:
+            prev = tangents[i - 1]
+            rot = prev.rotation_difference(t)
+            nrm = (rot @ nrm)
+            nrm = (nrm - t * nrm.dot(t)).normalized()
+        frames.append((nrm.copy(), t.cross(nrm).normalized()))
+    return tangents, frames
+
+
+def _tube_sweep(pts, closed, radius, sides, uv_scale, ends):
+    """(verts, faces, uvs, along) of one round tube along pts. ends: FLAT (a fan cap), ROUND (a hemisphere) or OPEN."""
+    m = len(pts)
+    tangents, frames = _tube_tangents_frames(pts, closed)
+    verts, rings = [], []
+    for i, (p, t, (nx, bx)) in enumerate(zip(pts, tangents, frames)):
+        widen = 1.0
+        if 0 < i < m - 1 or closed:
+            seg = (pts[(i + 1) % m] - p).normalized()
+            c = abs(seg.dot(t))
+            widen = 1.0 / max(c, 0.2)
+        ring = []
+        for k in range(sides):
+            ang = 2 * math.pi * k / sides
+            off = nx * math.cos(ang) + bx * math.sin(ang)
+            # widen only across the bend (the component in the bend's plane)
+            if widen != 1.0:
+                seg = (pts[(i + 1) % m] - p).normalized()
+                bend = (seg - t * seg.dot(t))
+                if bend.length > 1e-9:
+                    bend.normalize()
+                    off = off + bend * off.dot(bend) * (widen - 1.0)
+            ring.append(len(verts))
+            verts.append(list(p + off * radius))
+        rings.append(ring)
+    along = [0.0]
+    for i in range(1, m + (1 if closed else 0)):
+        along.append(along[-1] + (pts[i % m] - pts[i - 1]).length)
+    circ = 2 * math.pi * radius
+    faces, uvs = [], []
+    for i in range(m - 1 + (1 if closed else 0)):
+        a, b = rings[i], rings[(i + 1) % m]
+        v0, v1 = along[i] / uv_scale, along[i + 1] / uv_scale
+        for k in range(sides):
+            k1 = (k + 1) % sides
+            u0, u1 = circ * k / sides / uv_scale, circ * (k + 1) / sides / uv_scale
+            faces.append([a[k], a[k1], b[k1], b[k]])
+            uvs.append([[u0, v0], [u1, v0], [u1, v1], [u0, v1]])
+    if not closed and ends == "FLAT":
+        for ring, rev in ((rings[0], True), (rings[-1], False)):
+            _cap_fan(verts, faces, uvs, ring, rev)
+    elif not closed and ends == "ROUND":
+        for ring, i, sign in ((rings[0], 0, -1.0), (rings[-1], m - 1, 1.0)):
+            _cap_dome(verts, faces, uvs, ring, pts[i], tangents[i] * sign, frames[i], radius, sides, sign < 0)
+    return verts, faces, uvs, along
+
+
+def _cap_dome(verts, faces, uvs, ring, centre, out_dir, frame, radius, sides, start):
+    """Close a round ring with a hemisphere bulging along out_dir: sides // 4 (at least 2) rings, then a pole."""
+    nx, bx = frame
+    steps = max(2, sides // 4)
+    prev = list(ring)
+    disc = [[0.5 + 0.5 * math.cos(2 * math.pi * k / sides), 0.5 + 0.5 * math.sin(2 * math.pi * k / sides)]
+            for k in range(sides)]
+    for j in range(1, steps):
+        th = (math.pi / 2) * j / steps
+        cur = []
+        for k in range(sides):
+            ang = 2 * math.pi * k / sides
+            off = (nx * math.cos(ang) + bx * math.sin(ang)) * (radius * math.cos(th)) + out_dir * (radius * math.sin(th))
+            cur.append(len(verts))
+            verts.append(list(centre + off))
+        for k in range(sides):
+            k1 = (k + 1) % sides
+            f = [prev[k], prev[k1], cur[k1], cur[k]]
+            faces.append(list(reversed(f)) if start else f)
+            uvs.append([disc[k], disc[k1], disc[k1], disc[k]])
+        prev = cur
+    pole = len(verts)
+    verts.append(list(centre + out_dir * radius))
+    for k in range(sides):
+        k1 = (k + 1) % sides
+        f = [prev[k], prev[k1], pole]
+        faces.append(list(reversed(f)) if start else f)
+        uvs.append([disc[k], disc[k1], [0.5, 0.5]])
+
+
+def _smooth_path(pts, closed, per_span):
+    """A centripetal Catmull-Rom curve through every point, per_span samples a span: the tube bends through its points
+    instead of kinking at each one (FOUND 2026-11-09)."""
+    n = len(pts)
+    out = []
+
+    def p(i):
+        if closed:
+            return pts[i % n]
+        return pts[max(0, min(n - 1, i))] if 0 <= i < n else (2 * pts[0] - pts[1] if i < 0 else 2 * pts[-1] - pts[-2])
+    spans = n if closed else n - 1
+    for i in range(spans):
+        p0, p1, p2, p3 = p(i - 1), p(i), p(i + 1), p(i + 2)
+
+        def tj(ti, a, b):
+            return ti + max((b - a).length, 1e-9) ** 0.5
+        t0 = 0.0
+        t1 = tj(t0, p0, p1)
+        t2 = tj(t1, p1, p2)
+        t3 = tj(t2, p2, p3)
+        for k in range(per_span):
+            t = t1 + (t2 - t1) * k / per_span
+            a1 = p0 * ((t1 - t) / (t1 - t0)) + p1 * ((t - t0) / (t1 - t0))
+            a2 = p1 * ((t2 - t) / (t2 - t1)) + p2 * ((t - t1) / (t2 - t1))
+            a3 = p2 * ((t3 - t) / (t3 - t2)) + p3 * ((t - t2) / (t3 - t2))
+            b1 = a1 * ((t2 - t) / (t2 - t0)) + a2 * ((t - t0) / (t2 - t0))
+            b2 = a2 * ((t3 - t) / (t3 - t1)) + a3 * ((t - t1) / (t3 - t1))
+            out.append(b1 * ((t2 - t) / (t2 - t1)) + b2 * ((t - t1) / (t2 - t1)))
+    if not closed:
+        out.append(pts[-1].copy())
+    return out
+
+
+def _tube_strands(raw, radius, tail):
+    """strands: a count (that many tubes of radius, touching round the path) or [{radius, offset, angle}] (offset metres
+    from the path, angle degrees round it). Returns [(radius, offset, angle radians)]."""
+    if isinstance(raw, bool):
+        raise MifOpError("strands is a count or a list of {radius, offset, angle}. %s" % tail)
+    if isinstance(raw, int):
+        if not 1 <= raw <= 256:
+            raise MifOpError("strands must be 1-256, got %d. %s" % (raw, tail))
+        if raw == 1:
+            return [(radius, 0.0, 0.0)]
+        ring = radius / math.sin(math.pi / raw)
+        return [(radius, ring, 2 * math.pi * k / raw) for k in range(raw)]
+    if not isinstance(raw, (list, tuple)) or not raw or len(raw) > 256:
+        raise MifOpError("strands is a count or a list of 1-256 {radius, offset, angle}. %s" % tail)
+    out = []
+    for i, st in enumerate(raw):
+        if not isinstance(st, dict) or set(st) - {"radius", "offset", "angle"}:
+            raise MifOpError("strands[%d] takes radius, offset and angle, got %r. %s" % (i, st, tail))
+        r = float(finite_floats([st.get("radius", radius)], "strands.radius")[0])
+        off = float(finite_floats([st.get("offset", 0.0)], "strands.offset")[0])
+        ang = math.radians(float(finite_floats([st.get("angle", 0.0)], "strands.angle")[0]))
+        if not r > 0 or off < 0:
+            raise MifOpError("strands[%d]: radius must be above 0 and offset 0 or above. %s" % (i, tail))
+        out.append((r, off, ang))
+    return out
+
+
 def op_build_tube(params):
     """A round tube along points or hanging between two of them - a cable, a pipe, a neon tube, a downspout's run.
 
@@ -2497,6 +2785,7 @@ def op_build_tube(params):
     """
     tail = "NOTHING was created."
     reject_unknown(params, _TUBE_KEYS, "build_tube")
+    want_lightmap = take_bool(params, "lightmap", default=False)
     has_pts = params.get("points") is not None
     has_ends = params.get("start") is not None or params.get("end") is not None
     if has_pts == has_ends:
@@ -2515,6 +2804,28 @@ def op_build_tube(params):
         raise MifOpError("uvScale must be above 0, got %g. %s" % (uv_scale, tail))
     if params.get("material") is not None and params["material"] not in bpy.data.materials:
         raise MifOpError("no material named %r. %s" % (params["material"], tail))
+    # ENDS, A SMOOTH PATH AND STRANDS (FOUND 2026-11-09: cable bundles kinked at every point, ended flat, and made one
+    # object per strand). ends FLAT (caps true, the default) | ROUND | OPEN (caps false); smoothPath runs a curve
+    # through the points at pathSamples (default 8) a span; strands lays a count or a list of tubes round the path,
+    # twisted by twist turns a metre, as one object.
+    if params.get("ends") is not None and params.get("caps") is not None:
+        raise MifOpError("ends replaces caps (FLAT is caps true, OPEN caps false) - pass one. %s" % tail)
+    ends = str(take(params, "ends", default="FLAT" if caps else "OPEN", kind=str)).upper()
+    if ends not in _TUBE_ENDS:
+        raise MifOpError("ends must be one of %s, got %r. %s" % (", ".join(_TUBE_ENDS), ends, tail))
+    caps = ends != "OPEN"
+    smooth_path = take_bool(params, "smoothPath", default=False)
+    per_span = take_int(params, "pathSamples", default=8)
+    if params.get("pathSamples") is not None and not smooth_path:
+        raise MifOpError("pathSamples sets the samples of smoothPath; pass smoothPath true too. %s" % tail)
+    if not 2 <= per_span <= 64:
+        raise MifOpError("pathSamples must be 2-64, got %d. %s" % (per_span, tail))
+    strand_rows = _tube_strands(params["strands"], radius, tail) if params.get("strands") is not None else None
+    twist = take_float(params, "twist", default=0.0)
+    if params.get("twist") is not None and strand_rows is None:
+        raise MifOpError("twist turns strands round the path; pass strands too. %s" % tail)
+    if strand_rows is not None and (params.get("endCaps") is not None or params.get("stoppers") is not None):
+        raise MifOpError("endCaps and stoppers finish one cord; with strands pass ends instead. %s" % tail)
     if has_pts:
         if params.get("sag") is not None or params.get("samples") is not None:
             raise MifOpError("sag and samples hang a cable between start and end; points give the path itself. %s" % tail)
@@ -2539,6 +2850,13 @@ def op_build_tube(params):
         if not 1 <= n <= 1000:
             raise MifOpError("samples must be 1-1000, got %d. %s" % (n, tail))
         pts = _catenary(a, b, sag, n)
+    if smooth_path:
+        if not has_pts:
+            raise MifOpError("smoothPath curves a path of points; a hanging cable is already smooth. %s" % tail)
+        for i in range(len(pts) - (0 if closed else 1)):
+            if (pts[(i + 1) % len(pts)] - pts[i]).length < 1e-9:
+                raise MifOpError("points %d and %d are on one spot. %s" % (i, (i + 1) % len(pts), tail))
+        pts = _smooth_path(pts, closed, per_span)
     # ON A SURFACE (2026-10-06, spec "Eyelets ... and a cord threaded through them"): a drawcord runs round a hood's
     # channel from one eyelet to the other, lift off the cloth, and hangs past each end. surface names the mesh the
     # path is laid on: points are resampled every step (default: as given), each moved to the nearest point of the
@@ -2615,68 +2933,30 @@ def op_build_tube(params):
         if (pts[(i + 1) % len(pts)] - pts[i]).length < 1e-9:
             raise MifOpError("points %d and %d are on one spot. %s" % (i, (i + 1) % len(pts), tail))
     m = len(pts)
-    tangents = []
-    for i in range(m):
-        if closed:
-            t = (pts[(i + 1) % m] - pts[i]).normalized() + (pts[i] - pts[i - 1]).normalized()
-        elif i == 0:
-            t = pts[1] - pts[0]
-        elif i == m - 1:
-            t = pts[-1] - pts[-2]
-        else:
-            t = (pts[i + 1] - pts[i]).normalized() + (pts[i] - pts[i - 1]).normalized()
-        if t.length < 1e-9:
-            t = pts[min(i + 1, m - 1)] - pts[max(i - 1, 0)]
-        tangents.append(t.normalized())
-    t0 = tangents[0]
-    ref = Vector((0, 0, 1)) if abs(t0.z) < 0.9 else Vector((1, 0, 0))
-    nrm = (ref - t0 * ref.dot(t0)).normalized()
-    frames = []
-    for i, t in enumerate(tangents):
-        if i:
-            prev = tangents[i - 1]
-            rot = prev.rotation_difference(t)
-            nrm = (rot @ nrm)
-            nrm = (nrm - t * nrm.dot(t)).normalized()
-        frames.append((nrm.copy(), t.cross(nrm).normalized()))
-    verts, rings = [], []
-    for i, (p, t, (nx, bx)) in enumerate(zip(pts, tangents, frames)):
-        widen = 1.0
-        if 0 < i < m - 1 or closed:
-            seg = (pts[(i + 1) % m] - p).normalized()
-            c = abs(seg.dot(t))
-            widen = 1.0 / max(c, 0.2)
-        ring = []
-        for k in range(sides):
-            ang = 2 * math.pi * k / sides
-            off = nx * math.cos(ang) + bx * math.sin(ang)
-            # widen only across the bend (the component in the bend's plane)
-            if widen != 1.0:
-                seg = (pts[(i + 1) % m] - p).normalized()
-                bend = (seg - t * seg.dot(t))
-                if bend.length > 1e-9:
-                    bend.normalize()
-                    off = off + bend * off.dot(bend) * (widen - 1.0)
-            ring.append(len(verts))
-            verts.append(list(p + off * radius))
-        rings.append(ring)
-    along = [0.0]
-    for i in range(1, m + (1 if closed else 0)):
-        along.append(along[-1] + (pts[i % m] - pts[i - 1]).length)
-    circ = 2 * math.pi * radius
-    faces, uvs = [], []
-    for i in range(m - 1 + (1 if closed else 0)):
-        a, b = rings[i], rings[(i + 1) % m]
-        v0, v1 = along[i] / uv_scale, along[i + 1] / uv_scale
-        for k in range(sides):
-            k1 = (k + 1) % sides
-            u0, u1 = circ * k / sides / uv_scale, circ * (k + 1) / sides / uv_scale
-            faces.append([a[k], a[k1], b[k1], b[k]])
-            uvs.append([[u0, v0], [u1, v0], [u1, v1], [u0, v1]])
-    if caps and not closed:
-        for ring, rev in ((rings[0], True), (rings[-1], False)):
-            _cap_fan(verts, faces, uvs, ring, rev)
-    solid = closed or caps
+    if strand_rows is None:
+        verts, faces, uvs, along = _tube_sweep(pts, closed, radius, sides, uv_scale, ends)
+    else:
+        # MANY STRANDS IN ONE OBJECT (FOUND 2026-11-09: 34 cables made 34 objects): each strand is the path moved by its
+        # offset in the path's own frame, turned by twist (turns per metre) along it, swept and joined into one mesh.
+        _tan, frames = _tube_tangents_frames(pts, closed)
+        dist = [0.0]
+        for i in range(1, m):
+            dist.append(dist[-1] + (pts[i] - pts[i - 1]).length)
+        verts, faces, uvs = [], [], []
+        along = None
+        for sr, off, ang in strand_rows:
+            sp = []
+            for i in range(m):
+                nx, bx = frames[i]
+                a2 = ang + 2 * math.pi * twist * dist[i]
+                sp.append(pts[i] + (nx * math.cos(a2) + bx * math.sin(a2)) * off)
+            sv, sf, su, s_along = _tube_sweep(sp, closed, sr, sides, uv_scale, ends)
+            base = len(verts)
+            verts += sv
+            faces += [[i + base for i in f] for f in sf]
+            uvs += su
+            along = along or s_along
+    solid = closed or ends != "OPEN"
     vol = _signed_volume(verts, faces)
     flipped = solid and vol < 0
     if flipped:
@@ -2712,6 +2992,9 @@ def op_build_tube(params):
                 placed.append((k, st, pos, tan))
             stop_rows.append(row)
     out = _build_through_create_mesh(params, verts, faces, uvs, smooth, "Tube", "build_tube")
+    lmr = _lightmap_reply(bpy.data.objects[out["name"]], want_lightmap)
+    if lmr is not None:
+        out["lightmap"] = lmr
     if placed:
         tube = bpy.data.objects[out["name"]]
         for k, st, pos, tan in placed:
@@ -2728,7 +3011,11 @@ def op_build_tube(params):
             stop_rows[k].update({"object": dup.name, "model": model.name, "boreRadius": st["boreRadius"],
                                  "scale": round(scale, 6), "boreAxis": st["boreAxis"]})
     out.update({"pathPoints": m, "pathLength": round(along[-1], 6), "closedLoop": closed,
-                "capped": bool(caps and not closed), "radius": radius, "sides": sides,
+                "capped": bool(caps and not closed), "ends": ends if not closed else None, "radius": radius,
+                "sides": sides, "smoothPath": smooth_path or None,
+                "strands": len(strand_rows) if strand_rows is not None else None,
+                "strandRadii": sorted({round(r, 6) for r, _o, _a in strand_rows}) if strand_rows else None,
+                "twist": twist if strand_rows is not None else None,
                 "lowestPoint": rnd(list(min(pts, key=lambda q: q.z))),
                 "surface": surf_name, "surfaceGap": surface_gap,
                 "channelLength": round(channel_len, 6) if channel_len is not None else None,
@@ -2928,7 +3215,9 @@ def op_build_vehicle_body(params):
     HANDLE a bar in its dish. mirrors [{x, z, size [along, out, up], reach}] - a housing on an arm each side, its rear
     face on the glass slot. archLips {width, out, embed, segments} - a band round every arch each side. wheels
     {radius, width, rimRadius, inset, segments} - a tyre and rim through build_lathe in every arch, standing on the
-    ground. materials adds lens, lamp, trim and tyre for the parts. Reply: parts {lids, seams, bumpers, pockets,
+    ground, each wheel with two slots, the tyre and the rim (materials.rim, else trim). materials adds lens, lamp, trim,
+    tyre and rim for the parts. The roof panel stays on the body slot inside a glass range (a face flat across the section
+    and along the car); faces the parts cut get UVs again (uvFacesReprojected). Reply: parts {lids, seams, bumpers, pockets,
     mirrors, archLips, wheels, objects}.
 
     Refused before anything exists: a curve whose x does not rise, bottom / belt / halfWidth not covering one common
@@ -3067,6 +3356,18 @@ def op_build_vehicle_body(params):
             j1 = (j + 1) % m
             faces.append([a[j], b[j], b[j1], a[j1]])
             upper = (q <= j < 3 * q) and roof_on[k] and roof_on[k + 1]
+            # THE ROOF IS PAINT, NOT GLASS (FOUND 2026-11-11): every face of the glasshouse inside a glass range took
+            # the glass slot, the roof panel too. A face is roof when it lies within 30 degrees of level across the
+            # section AND the roof line is flatter than about 19 degrees along the car there - a windscreen or rear
+            # window slopes along x, a side window (tumblehome under 60 degrees) stands up across the section, and both
+            # stay glass.
+            if upper:
+                pa, pb, pc, pd = verts[a[j]], verts[b[j]], verts[b[j1]], verts[a[j1]]
+                across = (abs(pd[2] - pa[2]) + abs(pc[2] - pb[2]), abs(pd[1] - pa[1]) + abs(pc[1] - pb[1]))
+                dx = max(abs(pb[0] - pa[0]), 1e-9)
+                along = max(abs(pb[2] - pa[2]), abs(pc[2] - pd[2])) / dx
+                if across[0] <= 0.577 * across[1] and along <= 0.35:
+                    upper = False
             is_glass = upper and any(g0 <= xm <= g1 for g0, g1 in glass)
             slot_of.append(1 if is_glass else 0)
             uvs.append([[k / (n_st - 1), j / m], [(k + 1) / (n_st - 1), j / m], [(k + 1) / (n_st - 1), (j + 1) / m],
@@ -3129,6 +3430,9 @@ def op_build_vehicle_body(params):
             if isinstance(exc, MifOpError):
                 raise MifOpError("%s The body and its parts were removed - NOTHING was created." % exc)
             raise
+    # the grooves and pockets cut the body after its UVs were written, and their new faces came out with no UV area
+    # (FOUND 2026-11-11) - each such face is projected again
+    out["uvFacesReprojected"] = _car_uv_tidy(obj, x1 - x0, False)[1]
     with_roof = [sections[k][0] for k in range(n_st) if roof_on[k]]
     out.update({"op": "build_vehicle_body", "length": round(x1 - x0, 6), "xRange": [round(x0, 6), round(x1, 6)],
                 "stations": n_st, "sectionPoints": n_sec, "stationsWithRoof": len(with_roof),
@@ -3144,7 +3448,51 @@ def op_build_vehicle_body(params):
 # edited in place (grooves pressed, pockets cut) and the parts are made as objects parented to it, in its local space.
 
 _CAR_PARTS = ("lids", "seams", "bumpers", "pockets", "mirrors", "archLips", "wheels")
-_CAR_MATS = ("body", "glass", "lens", "lamp", "trim", "tyre")
+_CAR_MATS = ("body", "glass", "lens", "lamp", "trim", "tyre", "rim")
+
+
+def _car_uv_tidy(obj, scale, dissolve):
+    """Every face of `obj` with area but no UV area gets a UV again, projected on its dominant axis (in metres / scale,
+    so it sits near the 0-1 the lofted grid uses). With `dissolve`, zero-area faces are collapsed first - a face with no
+    area cannot have UV area. Returns (degenerate faces collapsed, faces reprojected)."""
+    me = obj.data
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(me)
+        gone = 0
+        if dissolve:
+            before = len(bm.faces)
+            bmesh.ops.dissolve_degenerate(bm, dist=1e-7, edges=list(bm.edges))
+            # a SLIVER - three corners in a line, every edge longer than dist - survives that; it is joined into the
+            # face across its long edge, which keeps the outline exactly (that face takes the middle corner)
+            for f in [f for f in bm.faces if f.is_valid and len(f.verts) == 3 and f.calc_area() <= 1e-12]:
+                if not f.is_valid:
+                    continue
+                long_edge = max(f.edges, key=lambda e: e.calc_length())
+                other = [g for g in long_edge.link_faces if g is not f]
+                if len(other) == 1:
+                    bmesh.utils.face_join([f, other[0]])
+            gone = before - len(bm.faces)
+        uv = bm.loops.layers.uv.active
+        fixed = 0
+        if uv is not None:
+            for f in bm.faces:
+                pts = [lp[uv].uv for lp in f.loops]
+                area = 0.0
+                for i in range(len(pts)):
+                    area += pts[i].x * pts[(i + 1) % len(pts)].y - pts[(i + 1) % len(pts)].x * pts[i].y
+                if abs(area) > 1e-12 or f.calc_area() <= 1e-12:
+                    continue
+                ax = max(range(3), key=lambda a: abs(f.normal[a]))
+                u, v = [(1, 2), (0, 2), (0, 1)][ax]
+                for lp in f.loops:
+                    lp[uv].uv = (lp.vert.co[u] / scale, lp.vert.co[v] / scale)
+                fixed += 1
+        bm.to_mesh(me)
+        me.update()
+        return gone, fixed
+    finally:
+        bm.free()
 _POCKET_KINDS = {"LAMP": ("FRONT", "REAR"), "GRILLE": ("FRONT", "REAR"), "PLATE": ("FRONT", "REAR"),
                  "HANDLE": ("LEFT", "RIGHT", "SIDES")}
 
@@ -3785,6 +4133,8 @@ def _car_build_parts(obj, plan, geo, mats, params, made):
         res = op_create_mesh(sub)
         po = bpy.data.objects[res["name"]]
         made.append(po)
+        # a font's outline can carry faces with no area (the plate's characters did), and those have no UV area
+        _car_uv_tidy(po, 1.0, True)
         po.parent = obj
         po.matrix_parent_inverse = Matrix.Identity(4)
         objects.append(po.name)
@@ -3805,11 +4155,26 @@ def _car_build_parts(obj, plan, geo, mats, params, made):
                 res = op_build_lathe(sub)
                 po = bpy.data.objects[res["name"]]
                 made.append(po)
+                # THE RIM ON ITS OWN SLOT (FOUND 2026-11-11: the whole wheel took the tyre slot). Slot 0 is the tyre,
+                # slot 1 the rim - materials.rim, else trim, else empty for the caller to fill - and a face is rim when
+                # every corner is within the rim's radius of the wheel's axis.
+                me = po.data
+                me.materials.clear()
+                me.materials.append(bpy.data.materials.get(mats["tyre"]) if mats.get("tyre") else None)
+                rim_key = "rim" if mats.get("rim") else "trim"
+                me.materials.append(bpy.data.materials.get(mats[rim_key]) if mats.get(rim_key) else None)
+                rim_faces = 0
+                for poly in me.polygons:
+                    on_rim = all(math.hypot(me.vertices[i].co.x, me.vertices[i].co.z) <= rim + 0.0151
+                                 for i in poly.vertices)
+                    poly.material_index = 1 if on_rim else 0
+                    rim_faces += on_rim
                 po.parent = obj
                 po.matrix_parent_inverse = Matrix.Identity(4)
                 objects.append(po.name)
                 out["wheels"].append({"object": po.name, "x": row["x"], "y": round(s * row["y"], 6), "radius": R,
-                                      "rimRadius": rim, "width": wh["width"]})
+                                      "rimRadius": rim, "width": wh["width"], "slots": ["tyre", "rim"],
+                                      "rimFaces": rim_faces, "tyreFaces": len(me.polygons) - rim_faces})
     out["objects"] = objects
     return {k: v for k, v in out.items() if v}
 

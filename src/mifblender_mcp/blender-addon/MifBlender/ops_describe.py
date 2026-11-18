@@ -273,6 +273,13 @@ def op_describe_op(params):
     from . import server                                            # runtime: avoids a cycle
     table = server._op_table()                                      # noqa: SLF001 - same package
     fn = table.get(name)
+    asked = name
+    # THE TOOL SPELLING (2026-11-09). No add-on op starts with bl_, while the MCP tools and bl_batch entries do, so
+    # describe_op(op='bl_add_modifier') was refused for the op it names. A caller on the socket sends the tool name
+    # too; the prefix comes off when what is left is an op.
+    if fn is None and name.startswith("bl_") and table.get(name[3:]) is not None:
+        name = name[3:]
+        fn = table[name]
     if fn is None:
         raise MifOpError("unknown op '%s'. `ping` returns the full list." % name)
     from . import extensions                                        # an op a separate add-on registered
@@ -292,6 +299,10 @@ def op_describe_op(params):
         "handler": fn.__name__,
         "module": getattr(module, "__name__", "?"),
     }
+    if asked != name:
+        out["askedAs"] = asked
+        out["spellingNote"] = ("'%s' is the tool's name; the add-on op is '%s'. bl_batch takes either in an entry's op."
+                               % (asked, name))
     # WHAT UNDO DOES WITH IT (1.3, docs/31_WORKFLOWS.md), from ops_undo's own sets - the ones server.py pushes steps by - so a
     # workflow's dry run can say before anything runs whether a step can be rolled back, without a second copy of the list.
     from . import ops_undo                                          # runtime: ops_undo imports bpy at module level

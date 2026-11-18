@@ -18,6 +18,7 @@ SHARED CONTRACT, every op in this module:
 from __future__ import annotations
 
 import math
+import os
 
 import bmesh
 import bpy
@@ -2042,7 +2043,13 @@ _CLOTH_DEFORMS = ("DRAG", "PUSH", "GRAB", "PINCH_POINT", "INFLATE", "EXPAND")
 _CLOTH_PASSES = 20      # edge-length constraint passes after each cloth dab (Gauss-Seidel, stiffness 1)
 _BOUNDARY_DEFORMS = ("BEND", "EXPAND", "INFLATE", "GRAB", "SMOOTH")
 _FACE_SET_ATTR = ".sculpt_face_set"      # Blender's own face-set attribute (INT, FACE domain)
+_AUTO_SPACING = 0.5      # a fraction of the radius; see _sculpt_parse
 _DYNTOPO_MAX_VERTS = 400000
+# WHAT ONE STROKE MAY ADD (FOUND 2026-11-09). The limit was on the mesh's total, so a body already over 400,000 vertices
+# was refused any split at all, with advice ("raise detailSize or lower the radius") that passes only once no edge needs
+# splitting - no dyntopo. The limit exists to stop runaway growth, so it counts growth: a stroke may add maxGrowth
+# vertices (default below), and the total may pass _DYNTOPO_MAX_VERTS only by that much.
+_DYNTOPO_MAX_GROWTH = 100000
 _MULTIRES_MAX_VERTS = 2000000
 # Blender's brush falloff curves as formulas of t = distance / radius (0 at the centre, 1 at the rim).
 _SCULPT_FALLOFF = {
@@ -2087,20 +2094,35 @@ def _sculpt_dabs(path, symmetry, spacing, radius):
     return mirrored
 
 
-def _dyntopo_refine(bm, centres, r_loc, detail):
+def _dyntopo_refine(bm, centres, r_loc, detail, max_growth=_DYNTOPO_MAX_GROWTH):
     """Dynamic topology's detail half, in mesh space: the faces touching the brush are triangulated and every edge
     there longer than `detail` is split, pass after pass, until none is. Works on the scratch bmesh only; a refusal
     here leaves the mesh untouched. Returns (passes, the longest edge left in the region)."""
     r2 = r_loc * r_loc
+    v_start = len(bm.verts)
+    cap = max(_DYNTOPO_MAX_VERTS, v_start + max_growth)
 
     def near(v):
         return any((v.co - c).length_squared < r2 for c in centres)
-    tri = [f for f in bm.faces if len(f.verts) > 3 and any(near(v) for v in f.verts)]
+    # ONLY WHAT IS IN REACH IS WALKED (2026-11-09): every pass scanned every edge of the mesh. The vertices under the
+    # brush come from a KD tree, and the ones each split makes are added to them; an edge is a candidate only through a
+    # near endpoint, so the set of edges split is the same as the full scan's.
+    from mathutils.kdtree import KDTree
+    bm.verts.ensure_lookup_table()
+    kd = KDTree(len(bm.verts))
+    for v in bm.verts:
+        kd.insert(v.co, v.index)
+    kd.balance()
+    region = {bm.verts[i] for c in centres for _p, i, _d in kd.find_range(c, r_loc)}
+
+    def region_edges():
+        return {e for v in region if v.is_valid for e in v.link_edges if near(e.verts[0]) or near(e.verts[1])}
+    tri = list({f for v in region for f in v.link_faces if len(f.verts) > 3 and any(near(x) for x in f.verts)})
     if tri:
         bmesh.ops.triangulate(bm, faces=tri)
     passes = 0
     while True:
-        long_edges = [e for e in bm.edges if e.calc_length() > detail and (near(e.verts[0]) or near(e.verts[1]))]
+        long_edges = [e for e in region_edges() if e.calc_length() > detail]
         if not long_edges:
             break
         passes += 1
@@ -2110,24 +2132,40 @@ def _dyntopo_refine(bm, centres, r_loc, detail):
         r = bmesh.ops.subdivide_edges(bm, edges=long_edges, cuts=1, use_grid_fill=True, use_single_edge=False,
                                       use_only_quads=False, smooth=0.0)
         new_v = [g for g in r["geom_inner"] + r["geom_split"] if isinstance(g, bmesh.types.BMVert)]
+        region.update(new_v)
         ngons = list({f for v in new_v for f in v.link_faces if len(f.verts) > 3})
         if ngons:
             bmesh.ops.triangulate(bm, faces=ngons)
-        if len(bm.verts) > _DYNTOPO_MAX_VERTS:
+        if len(bm.verts) > cap:
+            if v_start > _DYNTOPO_MAX_VERTS:
+                raise MifOpError(
+                    "dyntopo detailSize %g would add more than %d vertices to this mesh, which already has %d (over the "
+                    "%d a fresh mesh may grow to): the limit here counts what this stroke adds. Raise detailSize, lower "
+                    "the radius, or raise dyntopo.maxGrowth. NOTHING was changed."
+                    % (detail, max_growth, v_start, _DYNTOPO_MAX_VERTS))
             raise MifOpError("dyntopo detailSize %g would grow the mesh past %d vertices - raise detailSize or lower the "
-                             "radius. NOTHING was changed." % (detail, _DYNTOPO_MAX_VERTS))
-    longest = max([e.calc_length() for e in bm.edges if near(e.verts[0]) or near(e.verts[1])] or [0.0])
+                             "radius, or raise dyntopo.maxGrowth. NOTHING was changed." % (detail, cap))
+    longest = max([e.calc_length() for e in region_edges()] or [0.0])
     return passes, longest
 
 
-def _boundary_region(bm, co, centre, r_loc):
+def _boundary_region(bm, co, centre, r_loc, in_reach=None):
     """BOUNDARY brush's region: the open-boundary vertex nearest the dab (within the radius), the boundary vertices
     within the radius of it ALONG the boundary, and every vertex within the radius of those along the mesh's edges.
     Returns ({vertex: (distance from the boundary, its boundary origin)}, the boundary vertices) or (None, None)."""
     import heapq
     lim = r_loc * (1.0 + 1e-5)     # float32 grid steps sum a hair past the radius
-    on_b = [v for v in bm.verts if any(e.is_boundary for e in v.link_edges)]
-    on_b_idx = {v.index for v in on_b}
+    # ONLY THE VERTICES IN REACH (2026-11-09): in_reach(centre, radius) gives the candidates from the stroke's KD tree;
+    # without it every vertex is scanned, as before. Boundary membership is read per vertex as the walk meets it.
+    cand = bm.verts if in_reach is None else [bm.verts[i] for i in in_reach(centre, lim)]
+    on_b = [v for v in cand if any(e.is_boundary for e in v.link_edges)]
+    _b_cache = {}
+
+    def is_b(j):
+        b = _b_cache.get(j)
+        if b is None:
+            b = _b_cache[j] = any(e.is_boundary for e in bm.verts[j].link_edges)
+        return b
     near = [(((co[v.index] - centre).length), v.index) for v in on_b]
     near = [x for x in near if x[0] <= lim]
     if not near:
@@ -2157,7 +2195,7 @@ def _boundary_region(bm, co, centre, r_loc):
             continue
         for e in vs[i].link_edges:
             j = e.other_vert(vs[i]).index
-            if j in on_b_idx and j not in bdist:     # the boundary past the radius is not the region's to move
+            if j not in bdist and is_b(j):     # the boundary past the radius is not the region's to move
                 continue
             nd = d + (co[i] - co[j]).length
             if nd <= lim and nd < region.get(j, (1e30,))[0]:
@@ -2166,9 +2204,9 @@ def _boundary_region(bm, co, centre, r_loc):
     return region, set(bdist)
 
 
-def _boundary_dab(bm, co, vn, nbrs, centre, end, r_loc, mode, k_strength, sign, fall, mask_w):
+def _boundary_dab(bm, co, vn, nbrs, centre, end, r_loc, mode, k_strength, sign, fall, mask_w, in_reach=None):
     """One BOUNDARY dab: {vertex: new position}. GRAB moves by end - centre; the rest act at the dab."""
-    region, bverts = _boundary_region(bm, co, centre, r_loc)
+    region, bverts = _boundary_region(bm, co, centre, r_loc, in_reach)
     if not region:
         return {}
     w = {}
@@ -2301,6 +2339,56 @@ def _cloth_dab(co, rest, edges, c, nxt, w, area, mask_w, vn_fn, cfg):
         _cloth_relax(co, edges, rest, free, _CLOTH_PASSES)
 
 
+class _LazyNeighbours:
+    """Each vertex's edge neighbours, read from the bmesh the first time a vertex is asked for (SMOOTH and BOUNDARY)."""
+
+    def __init__(self, verts):
+        self._verts, self._cache = verts, {}
+
+    def __getitem__(self, i):
+        n = self._cache.get(i)
+        if n is None:
+            v = self._verts[i]
+            n = self._cache[i] = [e.other_vert(v).index for e in v.link_edges]
+        return n
+
+
+class _TrackedCo(list):
+    """The stroke's vertex positions, which remember the furthest any vertex has moved from where it began - so a KD
+    tree built once on the start positions still finds every vertex in reach: search radius + that drift."""
+
+    def __init__(self, items, start):
+        list.__init__(self, items)
+        self.start = start
+        self.drift = 0.0
+
+    def __setitem__(self, i, value):
+        list.__setitem__(self, i, value)
+        d = (value - self.start[i]).length
+        if d > self.drift:
+            self.drift = d
+
+
+class _LazyNormals:
+    """Vertex normals from `co`, computed for a vertex the first time it is asked for. A dab reads the normals of the
+    few hundred vertices under it; computing all of them took ~1.4 s a dab on 422,500 vertices (FOUND 2026-11-09)."""
+
+    def __init__(self, co, verts):
+        self._co, self._verts, self._cache = co, verts, {}
+
+    def __getitem__(self, i):
+        n = self._cache.get(i)
+        if n is None:
+            n = Vector()
+            co = self._co
+            for f in self._verts[i].link_faces:
+                vs = [co[x.index] for x in f.verts]
+                n += (vs[1] - vs[0]).cross(vs[2] - vs[0]) if len(vs) >= 3 else Vector()
+            n = n.normalized() if n.length > 1e-12 else Vector((0.0, 0.0, 1.0))
+            self._cache[i] = n
+        return n
+
+
 def _sculpt_apply(bm, cfg):
     """Run the brush over the scratch bmesh's vertex positions (or a shape-key layer). Returns (start, co, moved, n_dabs,
     the bmesh verts, the layer written). Nothing is written to the mesh here."""
@@ -2310,8 +2398,16 @@ def _sculpt_apply(bm, cfg):
     layer = bm.verts.layers.shape.get(cfg["shapeKey"]) if cfg["shapeKey"] else None
     deform = bm.verts.layers.deform.active
     verts = list(bm.verts)
-    co = [Vector(v[layer]) if layer is not None else v.co.copy() for v in verts]
-    start = [c.copy() for c in co]
+    start = [Vector(v[layer]) if layer is not None else v.co.copy() for v in verts]
+    co = _TrackedCo((c.copy() for c in start), start)
+    # A DAB COSTS WHAT IS IN REACH, NOT THE WHOLE MESH (FOUND 2026-11-09: 20 CREASE dabs at radius 0.03 took 28 s on
+    # 422,500 vertices and 5.9 s on 100,489 - every dab scanned every vertex and recomputed every normal). The tree is
+    # built once on the start positions; _TrackedCo's drift widens the search so a vertex moved toward a dab is found.
+    from mathutils.kdtree import KDTree
+    kd = KDTree(len(start))
+    for i, p in enumerate(start):
+        kd.insert(p, i)
+    kd.balance()
     mw = None
     if cfg["groupIndex"] is not None:
         mw = [v[deform].get(cfg["groupIndex"], 0.0) if deform is not None else 0.0 for v in verts]
@@ -2325,30 +2421,27 @@ def _sculpt_apply(bm, cfg):
 
     def mask_w(i):
         return 1.0 if mw is None else mw[i]
-    nbrs = [[e.other_vert(v).index for e in v.link_edges] for v in verts]
+    nbrs = _LazyNeighbours(verts)
 
     def normals():
-        out = []
-        for v in verts:
-            n = Vector()
-            for f in v.link_faces:
-                vs = [co[x.index] for x in f.verts]
-                n += (vs[1] - vs[0]).cross(vs[2] - vs[0]) if len(vs) >= 3 else Vector()
-            out.append(n.normalized() if n.length > 1e-12 else Vector((0.0, 0.0, 1.0)))
-        return out
+        return _LazyNormals(co, verts)
+
+    def in_reach(c, radius):
+        return [i for _p, i, _d in kd.find_range(c, radius + co.drift + 1e-9) if (co[i] - c).length <= radius]
 
     def weights(c):
         out = {}
-        for i, p in enumerate(co):
-            d = (p - c).length
+        for _p, i, _d in kd.find_range(c, r_loc + co.drift + 1e-9):
+            d = (co[i] - c).length
             if d < r_loc:
                 w = fall(d / r_loc) * mask_w(i)
                 if w > 0.0:
                     out[i] = w
         return out
     n_dabs = 0
-    vn0 = normals() if brush == "DRAW_SHARP" else None
-    edges = _cloth_edges(bm)
+    vn0 = _LazyNormals(start, verts) if brush == "DRAW_SHARP" else None
+    cloth = brush == "CLOTH" or cfg["deformTarget"] == "CLOTH_SIM"
+    edges = _cloth_edges(bm) if cloth else []
     rest = [(co[i] - co[j]).length for i, j in edges]
     area_r = cfg["clothArea"] * r_loc
 
@@ -2373,7 +2466,7 @@ def _sculpt_apply(bm, cfg):
             for c, end in pairs:
                 n_dabs += 1
                 upd = _boundary_dab(bm, co, normals(), nbrs, c, end, r_loc, cfg["boundaryDeform"], strength, sign,
-                                    fall, mask_w)
+                                    fall, mask_w, in_reach)
                 for i, q in upd.items():
                     co[i] = q
             continue
@@ -2514,7 +2607,7 @@ def _sculpt_apply(bm, cfg):
                 free[i] = min(free[i], 1.0 - m / top)
         _cloth_relax(co, edges, rest, free, _CLOTH_PASSES * 2)
     moved = [i for i in range(len(co)) if (co[i] - start[i]).length > 1e-9]
-    return start, co, moved, n_dabs, verts, layer
+    return start, list(co), moved, n_dabs, verts, layer
 
 
 def _multires_mesh(obj, mres):
@@ -2630,7 +2723,7 @@ def _sculpt_parse(params):
     elif keys is not None:
         raise MifOpError("'%s' has shape keys, and the Basis holds its rest shape - name the key to sculpt with "
                          "shapeKey. NOTHING was changed." % obj.name)
-    detail = _sculpt_dyntopo_arg(params.get("dyntopo"), kb, obj)
+    detail, max_growth = _sculpt_dyntopo_arg(params.get("dyntopo"), kb, obj)
     mres, level = _sculpt_multires_arg(obj, params, kb, detail)
     scale = _uniform_scale(obj)
     if scale is None:
@@ -2641,12 +2734,21 @@ def _sculpt_parse(params):
     if stabilize is not None:
         local = _sculpt_stabilize(local, stabilize / scale)
     r_loc = radius / scale
-    return obj, {"brush": brush, "boundaryDeform": deform if brush == "BOUNDARY" else None, "radius": radius,
+    # A LINE OF DABS THAT DO NOT OVERLAP IS A ROW OF DENTS (FOUND 2026-11-09): with no spacing the dabs land only on the
+    # given points, so a 20-point line 0.05 apart at radius 0.03 left a groove whose depth along the line ran from
+    # 0.5 mm to 3.75 mm (CREASE; DRAW_SHARP 0.08 to 7.5 mm) - the sawtooth a build saw. When a dab brush's points are
+    # farther apart than the radius and no spacing is given, the path is resampled at half the radius, which measured
+    # under 1% ripple; the reply says so (spacingApplied). Brushes that move along the path keep their points.
+    auto_spacing = None
+    if spacing is None and not grabs and brush not in ("POSE", "BOUNDARY", "CLOTH") and len(local) > 1 and max(
+            (b - a).length for a, b in zip(local, local[1:])) > r_loc:
+        spacing = auto_spacing = _AUTO_SPACING
+    return obj, {"brush": brush, "autoSpacing": auto_spacing, "boundaryDeform": deform if brush == "BOUNDARY" else None, "radius": radius,
                  "r_loc": r_loc, "scale": scale, "strength": strength, "falloff": falloff,
                  "fall": _SCULPT_FALLOFF[falloff], "invert": invert, "sign": -1.0 if invert else 1.0,
                  "symmetry": list(sym), "stabilize": stabilize, "faceSets": face_sets,
                  "groupIndex": group.index if group is not None else None, "shapeKey": kb.name if kb else None,
-                 "detail": detail, "mres": mres, "level": level, "clothDeform": cloth_deform if brush == "CLOTH"
+                 "detail": detail, "maxGrowth": max_growth, "mres": mres, "level": level, "clothDeform": cloth_deform if brush == "CLOTH"
                  else None, "deformTarget": target, "clothArea": cloth_area,
                  "dabSets": _sculpt_dabs(local, list(sym), spacing, r_loc)}
 
@@ -2684,12 +2786,18 @@ def _sculpt_mask(obj, mask):
 
 
 def _sculpt_dyntopo_arg(raw, kb, obj):
-    """dyntopo {detailSize} (world units) - or None."""
+    """(dyntopo detailSize in mesh units, maxGrowth) - or (None, None). maxGrowth is how many vertices one stroke may
+    add (default _DYNTOPO_MAX_GROWTH)."""
     if raw is None:
-        return None
-    if not isinstance(raw, dict) or set(raw) != {"detailSize"}:
-        raise MifOpError("dyntopo is {detailSize: the longest edge left under the brush, in world units}, got %r. "
-                         "NOTHING was changed." % (raw,))
+        return None, None
+    if not isinstance(raw, dict) or "detailSize" not in raw or set(raw) - {"detailSize", "maxGrowth"}:
+        raise MifOpError("dyntopo is {detailSize: the longest edge left under the brush, in world units, maxGrowth: how "
+                         "many vertices the stroke may add (default %d)}, got %r. NOTHING was changed."
+                         % (_DYNTOPO_MAX_GROWTH, raw))
+    growth = raw.get("maxGrowth", _DYNTOPO_MAX_GROWTH)
+    if isinstance(growth, bool) or not isinstance(growth, int) or not 1 <= growth <= 5000000:
+        raise MifOpError("dyntopo.maxGrowth is a whole number of vertices from 1 to 5000000, got %r. NOTHING was "
+                         "changed." % (growth,))
     detail = raw["detailSize"]
     if isinstance(detail, bool) or not isinstance(detail, (int, float)) or not math.isfinite(detail) or detail <= 0:
         raise MifOpError("dyntopo.detailSize is a world length above 0 (Blender's relative detail in screen pixels "
@@ -2701,7 +2809,7 @@ def _sculpt_dyntopo_arg(raw, kb, obj):
         raise MifOpError("'%s' has a Multires modifier, whose levels are bound to the base topology - dyntopo would "
                          "break them (Blender refuses the same). NOTHING was changed." % obj.name)
     s = _uniform_scale(obj) or 1.0
-    return float(detail) / s
+    return float(detail) / s, growth
 
 
 def _sculpt_multires_arg(obj, params, kb, detail):
@@ -2779,7 +2887,8 @@ def op_sculpt_stroke(params):
     object's own axes. mask {vertexGroup, faceSets [ids]} multiplies by the group's weight and / or keeps the vertices
     on a face of those sets (Blender's .sculpt_face_set attribute). shapeKey writes the stroke into that key.
     dyntopo {detailSize} (world length) triangulates the faces under the brush and splits every edge there longer than
-    detailSize before the stroke - detail is added, never collapsed. multiresLevel sculpts the Multires modifier's top
+    detailSize before the stroke - detail is added, never collapsed; maxGrowth (default 100000) is how many vertices one
+    stroke may add, and a mesh may grow past 400000 only by that much. multiresLevel sculpts the Multires modifier's top
     level (levels are added with Catmull-Clark subdivision up to it) and writes it back with Blender's own reshape: the
     base mesh does not move. Reply: dabs, verticesMoved, maxDisplacement, the world box before and after, and dyntopo /
     multires blocks with their counts.
@@ -2808,11 +2917,20 @@ def op_sculpt_stroke(params):
             dyn = None
             if cfg["detail"] is not None:
                 centres = [c for dabs in cfg["dabSets"] for c in dabs]
-                passes, longest = _dyntopo_refine(bm, centres, cfg["r_loc"], cfg["detail"])
+                passes, longest = _dyntopo_refine(bm, centres, cfg["r_loc"], cfg["detail"],
+                                                  cfg.get("maxGrowth") or _DYNTOPO_MAX_GROWTH)
                 dyn = {"detailSize": round(cfg["detail"] * cfg["scale"], 6), "passes": passes, "verticesBefore": v0,
                        "verticesAfter": len(bm.verts), "longestEdgeUnderBrush": round(longest * cfg["scale"], 6),
                        "collapse": "not done: detail is added, never removed"}
             start, co, moved, n_dabs, verts, layer = _sculpt_apply(bm, cfg)
+            if not moved and cfg["brush"] in ("FLATTEN", "SCRAPE", "FILL", "CLAY_STRIPS", "SMOOTH") and any(
+                    (v.co - c).length < cfg["r_loc"] for c in cfg["dabSets"][0][:3] for v in bm.verts):
+                # NOT "nothing in reach" (FOUND 2026-11-09: FLATTEN on a flat grid was told no vertex lay within the
+                # radius, beside vertices under every dab): these brushes move a vertex toward a plane or its
+                # neighbours, and on a surface already there they have nothing to do.
+                raise MifOpError("the stroke moved no vertex: vertices lie within %g of the path, and %s found them "
+                                 "already where it puts them (a flat or already smooth surface). NOTHING was changed."
+                                 % (cfg["radius"], cfg["brush"]))
             if not moved:
                 raise MifOpError("the stroke moved no vertex - no vertex lies within %g of the path%s%s. NOTHING was "
                                  "changed." % (cfg["radius"], " with weight in the mask" if (
@@ -2861,6 +2979,10 @@ def op_sculpt_stroke(params):
             bpy.data.meshes.remove(target_mesh)
     bpy.context.view_layer.update()
     out = {"object": obj.name, "brush": cfg["brush"], "dabs": n_dabs, "verticesMoved": len(moved),
+           "spacingApplied": cfg.get("autoSpacing"),
+           "spacingNote": ("the path's points are farther apart than the radius, so it was resampled every %g x the "
+                           "radius - dabs only on the given points leave a row of separate dents. Pass spacing to "
+                           "choose." % cfg["autoSpacing"]) if cfg.get("autoSpacing") else None,
            "maxDisplacement": round(max_d * cfg["scale"], 6), "radius": cfg["radius"], "strength": cfg["strength"],
            "falloff": cfg["falloff"], "invert": cfg["invert"], "symmetry": cfg["symmetry"],
            "shapeKey": cfg["shapeKey"], "boxBefore": box_before, "boxAfter": box_after}
@@ -4487,8 +4609,29 @@ def op_add_quads_on_surface(params):
 
 
 # --------------------------------------------------------------------------------------------- subdivide_multires
-_MRES_KEYS = ("object", "name", "modifier", "mode", "levels", "sculptLevels", "viewportLevels", "renderLevels")
+_MRES_KEYS = ("object", "name", "modifier", "mode", "levels", "sculptLevels", "viewportLevels", "renderLevels",
+              "memoryBudgetGB", "dryRun")
 _MRES_MODES = ("CATMULL_CLARK", "SIMPLE", "LINEAR", "UNSUBDIVIDE", "REBUILD")
+
+
+# WHAT A MULTIRES SUBDIVIDE TAKES (FOUND 2026-11-09: one SIMPLE level on a 419,272 vertex body took Blender from about
+# 1 GB to 16.38 GB). Measured on 5.0.1 in plain bpy, private commit before and after object.multires_subdivide: a quad
+# grid costs about 70-600 bytes per top-level vertex, but a face that is not a quad costs far more - 1,682 triangles
+# took 201 MB at the first level and 380 MB at two, 6,962 took 554 MB and 900 MB, and a 102,400 vertex triangulated
+# grid with UVs took 25 GB at one level. So the estimate is per face: _MRES_TRI_BYTES for each non-quad face at the first
+# level added, half again for each further level, plus _MRES_QUAD_BYTES per top-level vertex.
+_MRES_TRI_BYTES = 128 * 1024
+_MRES_QUAD_BYTES = 600
+_MRES_RESERVE = 4 * 1024 ** 3       # memory left free for the rest of the machine when no budget is given
+
+
+def _mres_estimate(me, base_levels, add):
+    """Bytes a subdivide adding `add` levels to a Multires at `base_levels` is likely to take, from measured rates."""
+    non_quads = sum(1 for p in me.polygons if p.loop_total != 4)
+    top = len(me.vertices) * 4 ** (base_levels + add)
+    first = 1 if base_levels == 0 else 0
+    levels_weight = first + 0.5 * (add - first)
+    return int(non_quads * _MRES_TRI_BYTES * levels_weight + top * _MRES_QUAD_BYTES), non_quads
 
 
 def _mres_levels(m):
@@ -4554,6 +4697,36 @@ def op_subdivide_multires(params):
     if adds and base0 * 4 ** top > _MULTIRES_MAX_VERTS:
         raise MifOpError("%d levels on %d base vertices would be about %d vertices at the top (cap %d). NOTHING was "
                          "changed." % (top, base0, base0 * 4 ** top, _MULTIRES_MAX_VERTS))
+    budget_gb = take_float(params, "memoryBudgetGB", default=None)
+    dry = take_bool(params, "dryRun", default=False)
+    from . import childproc                                     # noqa: PLC0415
+    avail = childproc.available_memory_bytes()
+    estimate, non_quads = _mres_estimate(obj.data, total0, n) if adds else (0, 0)
+    if budget_gb is not None and (not math.isfinite(budget_gb) or budget_gb <= 0):
+        raise MifOpError("memoryBudgetGB is a size in GB above 0, got %r. NOTHING was changed." % budget_gb)
+    budget = int(budget_gb * 1024 ** 3) if budget_gb is not None else (
+        None if avail is None else max(0, avail - _MRES_RESERVE))
+    mem_report = {"estimatedBytes": estimate, "estimatedGB": round(estimate / 1024 ** 3, 2),
+                  "nonQuadFaces": non_quads, "availableBytes": avail,
+                  "budgetBytes": budget, "budgetFrom": "memoryBudgetGB" if budget_gb is not None else (
+                      "available memory less %d GB" % (_MRES_RESERVE // 1024 ** 3) if avail is not None else None),
+                  "estimateNote": ("from measured rates: about %d KB per face that is not a quad at the first level "
+                                   "and half that per further level, and %d bytes per top-level vertex. A mesh of "
+                                   "triangles costs far more than one of quads; a quad remesh first is the cheap way."
+                                   % (_MRES_TRI_BYTES // 1024, _MRES_QUAD_BYTES))}
+    if dry:
+        return dict({"object": obj.name, "modifier": m.name, "mode": mode, "dryRun": True, "nothingWritten": True,
+                     "levelsToAdd": n if adds else 0, "topLevelVerticesEstimate": base0 * 4 ** top if adds else None},
+                    **mem_report)
+    if adds and budget is not None and estimate > budget:
+        raise MifOpError(
+            "this subdivide is estimated to take %.1f GB (%d faces that are not quads, %d levels on %d base vertices), "
+            "over the %.1f GB %s. Quad-remesh the mesh first (triangles cost far more), add fewer levels, or pass "
+            "memoryBudgetGB if the machine can spare it. dryRun:true answers the estimate alone. NOTHING was changed."
+            % (estimate / 1024 ** 3, non_quads, top, base0, budget / 1024 ** 3,
+               "budget you gave" if budget_gb is not None else "of memory free now less a %d GB reserve"
+               % (_MRES_RESERVE // 1024 ** 3)))
+    mem_before = childproc.memory_bytes(os.getpid())
     cap = total0 + n if mode == "UNSUBDIVIDE" else (total0 + 10 if mode == "REBUILD" else top)
     for key, (_attr, v) in want.items():
         if not 0 <= v <= cap:
@@ -4600,6 +4773,10 @@ def op_subdivide_multires(params):
     out = {"object": obj.name, "modifier": m.name, "mode": mode, "passes": passes, "before": before,
            "after": _mres_levels(m), "baseVerticesBefore": base0, "baseVerticesAfter": len(obj.data.vertices),
            "topLevelVertices": top_verts}
+    if adds:
+        mem_after = childproc.memory_bytes(os.getpid())
+        out.update(mem_report)
+        out["memoryTakenBytes"] = (mem_after - mem_before) if mem_after is not None and mem_before is not None else None
     if mode == "UNSUBDIVIDE":
         out["lowestReached"] = lowest
     if clamped:

@@ -98,6 +98,7 @@ if IS_WINDOWS:
     _k32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
     _k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
     _k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    _k32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
     _k32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
     _k32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
     _psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PMC_EX), wintypes.DWORD]
@@ -161,14 +162,48 @@ def _parents():
     return out
 
 
+def started(pid):
+    """When process `pid` was created, as a number that orders processes (Windows: 100 ns ticks since 1601; elsewhere:
+    clock ticks since boot), or None when it cannot be read."""
+    if IS_WINDOWS:
+        h = _k32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not h:
+            return None
+        try:
+            t = [wintypes.FILETIME() for _ in range(4)]
+            if not _k32.GetProcessTimes(h, *[ctypes.byref(x) for x in t]):
+                return None
+            return (t[0].dwHighDateTime << 32) | t[0].dwLowDateTime
+        finally:
+            _k32.CloseHandle(h)
+    try:
+        with open("/proc/%d/stat" % int(pid), "rb") as fh:
+            return int(fh.read().decode("utf-8", "replace").rsplit(")", 1)[1].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def tree(pid):
     """`pid` and every process descended from it, parents first. A process whose parent ended is no longer found
-    under it - which is why the watchdog reads the tree every half second rather than once."""
+    under it - which is why the watchdog reads the tree every half second rather than once.
+
+    A child is followed only when it was created after the parent it names (FOUND 2026-11-09 in review): a process
+    keeps its dead parent's pid as its parent for good, and pids are reused, so a new process given that pid "had"
+    every orphan of the old one as a child - their memory counted against its ceiling, and kill_tree ended them with
+    it (an updater's orphaned app, say). A real child is always younger than its parent. A child whose creation time
+    cannot be read is not followed: nothing is ended that cannot be shown to be ours."""
     pid = int(pid)
     kids = {}
     for child, parent in _parents().items():
         if child != parent:
             kids.setdefault(parent, []).append(child)
+    born = {}
+
+    def when(p):
+        if p not in born:
+            born[p] = started(p)
+        return born[p]
+
     out, todo, seen = [], [pid], set()
     while todo:
         p = todo.pop(0)
@@ -176,7 +211,10 @@ def tree(pid):
             continue
         seen.add(p)
         out.append(p)
-        todo.extend(kids.get(p, []))
+        for c in kids.get(p, []):
+            tc, tp = when(c), when(p)
+            if tc is not None and (tp is None or tc >= tp):
+                todo.append(c)
     return out
 
 
@@ -227,6 +265,27 @@ def physical_memory_bytes():
         return None
     try:
         return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (AttributeError, ValueError, OSError):
+        return None
+
+
+def available_memory_bytes():
+    """Physical memory free to use now, in bytes (the OS's available figure, standby pages counted), or None."""
+    if IS_WINDOWS:
+        m = _MEMORYSTATUSEX()
+        m.dwLength = ctypes.sizeof(m)
+        if _k32.GlobalMemoryStatusEx(ctypes.byref(m)):
+            return int(m.ullAvailPhys)
+        return None
+    try:
+        with open("/proc/meminfo", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
     except (AttributeError, ValueError, OSError):
         return None
 
@@ -429,7 +488,9 @@ class PidProc:
 
 def watch(proc, sid=None, limit=None, kind="job", interval=0.5):
     """Start the watchdog on a started Popen-like object (anything with .pid and .poll()). Ends the tree past `limit`
-    bytes (None: memory_limit_bytes(); 0: no ceiling, the peak is still read) and frees slot `sid` when the job ends."""
+    bytes (None: memory_limit_bytes(); 0: no ceiling, the peak is still read) and frees slot `sid` when the job ends.
+    The returned Watch's .limit is read on every tick, so its owner can move the ceiling while the job runs (a
+    long-lived worker whose next task needs more, or less)."""
     lim = memory_limit_bytes() if limit is None else int(limit)
     w = Watch(proc, sid, lim, kind)
     if sid:
@@ -440,6 +501,7 @@ def watch(proc, sid=None, limit=None, kind="job", interval=0.5):
             while proc.poll() is None:
                 used, _n = tree_memory_bytes(proc.pid)
                 w.peak = max(w.peak, used)
+                lim = w.limit
                 if lim > 0 and used > lim:
                     pids = kill_tree(proc.pid)
                     w.killed = {"bytes": used, "limit": lim, "pids": pids,

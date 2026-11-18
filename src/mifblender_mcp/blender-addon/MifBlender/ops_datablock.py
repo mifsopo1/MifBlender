@@ -34,7 +34,11 @@ def _kind(params, tail, default=None, allowed=None):
     raw = take(params, "kind", "type", default=default, kind=str)
     if raw is None:
         raise MifOpError("kind is required: one of %s. %s" % (", ".join(sorted(allowed or _KINDS)), tail))
-    k = str(raw).upper()
+    k = str(raw).strip().upper().replace(" ", "_").replace("-", "_")
+    # THE PLURAL IS THE SAME KIND (FOUND 2026-11-09): kind 'objects' was refused while 'OBJECT' worked. A bpy.data
+    # collection's own name ('objects', 'node_groups', 'meshes') reads as its kind, in any case.
+    if k not in _KINDS:
+        k = {v.upper(): key for key, v in _KINDS.items()}.get(k, k)
     pool = allowed or _KINDS
     if k not in pool or not hasattr(bpy.data, _KINDS.get(k, "")):
         have = [x for x in sorted(pool) if hasattr(bpy.data, _KINDS.get(x, ""))]

@@ -160,9 +160,48 @@ def _require_generative(op):
         raise MifOpError(GENERATIVE_HELP % ((op,) + _OFF_BY[by]))
 
 
+# A COMFYUI ON THIS MACHINE ONLY, UNLESS ONE IS CONFIGURED ON PURPOSE (1.4, FOUND 2026-11-11 in a code review). A call's
+# host was taken as given, so any host a client named got the prompt and, through /upload/image, whatever file
+# imagePath or meshPath named, over plain HTTP. A host now has to be loopback, or be configured in BLENDER's environment
+# by whoever runs it: MIF_COMFY_HOST (the default host, so set on purpose) or MIF_COMFY_ALLOW_REMOTE (a comma list of
+# host names, or * for any). A call cannot widen that list.
+def _host_name(host):
+    h = str(host).strip()
+    if "://" in h:
+        h = h.split("://", 1)[1]
+    h = h.split("/", 1)[0]
+    if h.startswith("["):
+        return h[1:h.find("]")] if "]" in h else h[1:]
+    return h.rsplit(":", 1)[0] if h.count(":") == 1 else h
+
+
+def _is_loopback(name):
+    import ipaddress
+    if name.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(name).is_loopback
+    except ValueError:
+        return False
+
+
+def _remote_allowed(name):
+    allowed = {_host_name(h).lower() for h in (os.environ.get("MIF_COMFY_ALLOW_REMOTE") or "").split(",") if h.strip()}
+    if os.environ.get("MIF_COMFY_HOST"):
+        allowed.add(_host_name(os.environ["MIF_COMFY_HOST"]).lower())
+    return "*" in allowed or name.lower() in allowed
+
+
 def _host(params):
-    host = take(params, "host", "server", default=None)
-    return str(host or os.environ.get("MIF_COMFY_HOST") or DEFAULT_HOST)
+    host = str(take(params, "host", "server", default=None) or os.environ.get("MIF_COMFY_HOST") or DEFAULT_HOST)
+    name = _host_name(host)
+    if not _is_loopback(name) and not _remote_allowed(name):
+        raise MifOpError(
+            "ComfyUI host '%s' is not on this machine, and the gen ops talk to a ComfyUI on this machine only unless "
+            "one is configured: a remote ComfyUI gets the prompt and every uploaded file over plain HTTP. To use it "
+            "on purpose, set MIF_COMFY_HOST=%s (the default host) or MIF_COMFY_ALLOW_REMOTE=%s (a comma list, or * for "
+            "any) in Blender's environment and restart Blender. Nothing was sent." % (host, host, name))
+    return host
 
 
 def _post(host, path, payload=None, timeout=60):
@@ -869,6 +908,10 @@ def _upload_mesh(host, path):
     return _upload_file(host, path, "mesh")
 
 
+_UPLOAD_EXTS = {"image": frozenset((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tga", ".tif", ".tiff")),
+                "mesh": frozenset((".glb", ".gltf", ".obj", ".ply", ".stl", ".fbx"))}
+
+
 def _upload_file(host, path, kind):
     """ComfyUI's /upload/image is multipart, not JSON - hand-rolled to avoid a dependency.
 
@@ -879,6 +922,14 @@ def _upload_file(host, path, kind):
     """
     if not os.path.isfile(path):
         raise MifOpError("no such %s: %s" % (kind, path))
+    # ONLY THE KIND OF FILE THE CALL IS ABOUT GOES (1.4, FOUND 2026-11-11): imagePath and meshPath uploaded whatever they
+    # named - a key, a config, a document - to ComfyUI's input folder. An image path must be an image, a mesh path a
+    # mesh, by extension, before a byte is read.
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in _UPLOAD_EXTS[kind]:
+        raise MifOpError("%s '%s' is not %s file (%s): the gen ops upload only the %s the call is about. Nothing was "
+                         "sent." % ("imagePath" if kind == "image" else "meshPath", path, "an image" if kind == "image" else "a mesh",
+                                    ", ".join(sorted(_UPLOAD_EXTS[kind])), kind))
     boundary = "----MifBlender%d" % int(time.time())
     name = os.path.basename(path)
     with open(path, "rb") as handle:
@@ -955,7 +1006,8 @@ def _download_output(host, filename, subfolder):
         raise MifOpError(
             "ComfyUI reported success but would not serve '%s' from %s: %s"
             % (filename, subfolder or "the output root", exc))
-    dest = os.path.join(bpy.app.tempdir or tempfile.gettempdir(), filename)
+    # the name ComfyUI gave, never a path it gave: a reply naming ../../x must not write outside the temp folder
+    dest = os.path.join(bpy.app.tempdir or tempfile.gettempdir(), os.path.basename(str(filename).replace("\\", "/")))
     with open(dest, "wb") as handle:
         handle.write(blob)
     return dest

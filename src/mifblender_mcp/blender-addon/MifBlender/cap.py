@@ -98,7 +98,7 @@ _READ_OPS = frozenset((
     "vertex_info", "objects_overlap", "audit_placement", "points_inside", "compare_to_reference", "evaluate_at_frame", "mesh_quality",
     "undo_history", "call_log", "render_status", "render_info", "uv_info", "physics_info", "compositor_info",
     "world_info", "select_edges", "select_faces", "project_mode", "gen_status", "save_file", "export_mesh",
-    "export_scene", "export_actions", "export_material_textures", "export_camera", "export_groom", "heightmap_from_mesh", "frame_viewport", "set_viewport_shading", "set_viewport_view", "undo", "redo", "open_file"))
+    "read_mesh_data", "export_uv_layout", "export_scene", "export_actions", "export_material_textures", "export_camera", "export_groom", "heightmap_from_mesh", "frame_viewport", "set_viewport_shading", "set_viewport_view", "undo", "redo", "open_file"))
 _CREATE_PREFIXES = ("create_", "build_", "gen_", "import_")
 # A material NAMED by an op that assigns it is not changed; set_material_* edits the material it names.
 _TARGET_KEYS = ("object", "objects", "target", "source", "sources", "armature", "camera", "light", "collection", "mesh")

@@ -14,7 +14,8 @@ blender/<AddOn>/ - a Blender add-on that registers ops into MifBlender's dispatc
     python mifext.py install-blender <folder> --addons <dir> [--force]   copy blender/<AddOn>/ into a Blender add-ons folder
 
 The extensions directory is MIF_EXTENSIONS_DIR (several joined with the path separator; the first is where install
-writes) or, unset, ~/.mifbridge/extensions. MIF_EXTENSIONS=off makes the MCP server load none.
+writes) or, unset, ~/.mifbridge/extensions. The MCP server loads an installed extension only when its environment opts
+in (1.4): MIF_EXTENSIONS=on loads every one, MIF_EXTENSIONS=<name>,<name> those, and unset or off loads none.
 
 Installing and removing are a PERSON's acts, on purpose: no MCP tool installs or removes an extension, because an
 extension's module runs inside the MCP server with the person's privileges (an agent that could install code into its
@@ -62,8 +63,39 @@ def extension_dirs():
     return [os.path.join(os.path.expanduser("~"), ".mifbridge", "extensions")]
 
 
+# OPT-IN (1.4, FOUND 2026-11-11 in a code review). Until then the server imported every installed extension on every
+# start unless MIF_EXTENSIONS=off, so a folder dropped into ~/.mifbridge/extensions ran inside the MCP server with the
+# person's privileges the next time any client started it. Now nothing loads unless the MCP server's environment says
+# so: MIF_EXTENSIONS=on (every installed extension) or a comma list of extension names. Unset, installed extensions are
+# listed as not enabled, with the setting that turns them on (mif_extensions, the startup log, mifext.py list).
+_ON_WORDS = ("on", "1", "true", "yes", "all")
+_OFF_WORDS = ("off", "0", "false", "no", "none")
+
+
+def _setting():
+    return os.environ.get("MIF_EXTENSIONS", "").strip()
+
+
 def loading_disabled():
-    return os.environ.get("MIF_EXTENSIONS", "").strip().lower() in ("off", "0", "false", "no")
+    """True when MIF_EXTENSIONS turns every extension off: unset (the default) or an off word."""
+    raw = _setting().lower()
+    return raw == "" or raw in _OFF_WORDS
+
+
+def enabled_names():
+    """None for every installed extension (MIF_EXTENSIONS=on), else the set of names it lists (empty: none)."""
+    raw = _setting()
+    if raw.lower() in _ON_WORDS:
+        return None
+    if raw == "" or raw.lower() in _OFF_WORDS:
+        return set()
+    return {n.strip() for n in raw.split(",") if n.strip()}
+
+
+def enable_hint(name=None):
+    return ("extensions load only when opted in: set MIF_EXTENSIONS=%s in the MCP server's environment (your client's "
+            "MCP config), or MIF_EXTENSIONS=on for every installed one, and restart the MCP server. An extension's "
+            "module runs inside the server with your privileges." % (name or "<name>[,<name>]"))
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -335,13 +367,18 @@ def discover():
 def load_all(transport=None, taken=()):
     """Load every installed extension. Returns {"loaded": [Loaded], "failed": [{folder, name?, error}], "dirs",
     "disabled"}. Never raises for one bad extension."""
-    report = {"loaded": [], "failed": [], "dirs": extension_dirs(), "disabled": loading_disabled()}
-    if report["disabled"]:
-        return report
+    report = {"loaded": [], "failed": [], "dirs": extension_dirs(), "disabled": loading_disabled(), "notEnabled": [],
+              "unknownEnabled": []}
+    wanted = enabled_names()
     taken = set(taken)
     names = {}
     for folder in discover():
         base = os.path.basename(folder)
+        if wanted is not None and base not in wanted:
+            m, errs = read_manifest(folder)              # the manifest is JSON, read only; the module is not imported
+            report["notEnabled"].append({"folder": folder, "name": base, "enable": enable_hint(base),
+                                         "tools": list((m or {}).get("tools") or []) if not errs else []})
+            continue
         try:
             manifest, errs = read_manifest(folder)
             if manifest is not None and not errs and manifest["name"] != base:
@@ -357,6 +394,9 @@ def load_all(transport=None, taken=()):
         names[ext.name] = folder
         taken.update(ext.tools)
         report["loaded"].append(ext)
+    if wanted:
+        found = {os.path.basename(f) for f in discover()}
+        report["unknownEnabled"] = sorted(wanted - found)     # a typo in MIF_EXTENSIONS says so, never loads nothing quietly
     return report
 
 
@@ -669,8 +709,8 @@ def install(folder, force=False):
     os.makedirs(root, exist_ok=True)
     shutil.copytree(folder, dest, ignore=_COPY_IGNORE)
     out = {"ok": True, "installedAt": dest, "warnings": v["warnings"],
-           "note": "restart the MCP server (your client's MCP reconnect) to load it; its tools are the pack ext_%s. "
-                   "The module runs inside the MCP server with your privileges." % manifest["name"]}
+           "note": "%s Then restart the MCP server (your client's MCP reconnect) to load it; its tools are the pack "
+                   "ext_%s." % (enable_hint(manifest["name"]), manifest["name"])}
     if replaced:
         out["replacedMovedTo"] = replaced
     if manifest.get("native"):
@@ -687,10 +727,15 @@ def list_installed():
             failed.append({"folder": folder, "error": "; ".join(errs)})
             continue
         native = m.get("native") or {}
+        wanted = enabled_names()
         rows.append({"name": m["name"], "version": m["version"], "folder": folder, "tools": m.get("tools") or [],
-                     "nativeEndpoints": native.get("endpoints") or [], "nativePlugin": native.get("plugin")})
-    return {"ok": True, "dirs": extension_dirs(), "extensions": rows, "invalid": failed,
-            "loadingDisabled": loading_disabled()}
+                     "nativeEndpoints": native.get("endpoints") or [], "nativePlugin": native.get("plugin"),
+                     "enabled": wanted is None or m["name"] in wanted})
+    out = {"ok": True, "dirs": extension_dirs(), "extensions": rows, "invalid": failed,
+           "loadingDisabled": loading_disabled(), "setting": "MIF_EXTENSIONS=%s" % (_setting() or "(unset)")}
+    if any(not r["enabled"] for r in rows):
+        out["note"] = enable_hint()
+    return out
 
 
 def remove(name):

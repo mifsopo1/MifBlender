@@ -5007,7 +5007,7 @@ def op_transfer_by_uv(params):
 # --------------------------------------------------------------------------------------------- loft_garment
 
 _LOFT_KEYS = ("body", "armature", "rings", "segments", "ease", "offset", "edgeLength", "evaluated", "name",
-              "collection", "takeOverName", "garment", "easeTable")
+              "collection", "takeOverName", "garment", "easeTable", "axis", "center", "limb")
 
 # MEASURED EASE TABLES, by garment and body region: a ring's ease (garment perimeter / body perimeter - 1 in the plane
 # square to the bone, loft_garment's own measure) read off a professionally made garment on the body it was fitted to,
@@ -5137,12 +5137,178 @@ def _lg_ease_table(params, tail):
     return table
 
 
+# RINGS ON AN UNRIGGED BODY (FOUND 2026-11-09: clothing a finished, unrigged character - outfit before rig, the usual
+# order - none of loft_garment, attach_sleeve, attach_hood or build_sole could run: each placed its rings at bones, so a
+# whole outfit was generated outside and sent through create_mesh). Without `armature`, a ring is placed by:
+#   axis   a world axis ("X", "Y", "Z" or [x, y, z]) and a point on it, center (default the body's bounding-box centre):
+#          rings [{height}] - the plane square to the axis at that coordinate along it (world, through the origin);
+#   limb   {from: [x, y, z], to: [x, y, z]} - a line through a limb: rings [{at}] (0 from - 1 to).
+# Either way the ring's centre is found from the body's own cross-section: from the given point the section is cast and
+# its centroid taken, three times, so the centre sits in the middle of the part the point is inside - a leg, an arm, the
+# torso - and a limb's centre line follows the limb, its plane square to the line through the centres a little above and
+# below. Angle 0 points along world X (world Y on an X axis). The armature route is unchanged.
+_RIGFREE_KEYS = ("axis", "center", "limb")
+_FIT_ANGLES = 32
+
+
+class _Place:
+    """A rig-free ring's placement: name (for replies), at (its height or share), and the frame computed from the body."""
+
+    def __init__(self, name, at, frame):
+        self.name = name
+        self.at = at
+        self.c, self.n, self.ux = frame
+
+    def frame(self):
+        return self.c, self.n, self.ux
+
+
+def _stable_ux(n):
+    ref = Vector((1.0, 0.0, 0.0)) if abs(n.x) < 0.9 else Vector((0.0, 1.0, 0.0))
+    u = ref - n * ref.dot(n)
+    return u.normalized()
+
+
+def _fit_centre(bm, c, n, label, tail, intersect_line_line_2d):
+    """The centre of the body's section loop round c in the plane (c, n), refined three times: the loop is the section
+    segments the rays from c meet first, and its centre their length-weighted midpoint - the loop's perimeter centroid,
+    not the mean of the hit points, which a point off-centre biases toward itself."""
+    angles = [2.0 * math.pi * k / (2 * _FIT_ANGLES) for k in range(2 * _FIT_ANGLES)]
+    for _it in range(3):
+        ux = _stable_ux(n)
+        uy = n.cross(ux)
+        section = _lg_section(bm, c, n)
+        segs = [((p - c).dot(ux), (p - c).dot(uy), (q - c).dot(ux), (q - c).dot(uy)) for p, q in section]
+        hit, missed = set(), 0
+        for ang in angles:
+            dx, dy = math.cos(ang), math.sin(ang)
+            best = None
+            for i, (ax, ay, bx, by) in enumerate(segs):
+                h = _ray_hit(dx, dy, ax, ay, bx, by)
+                if h is not None and (best is None or h < best[0]):
+                    best = (h, i)
+            if best is None:
+                missed += 1
+            else:
+                hit.add(best[1])
+        if missed or not hit:
+            raise MifOpError("%s: the point %s is not inside the body in the plane square to %s (%d of %d rays met no "
+                             "surface) - move center, or the limb's from and to, inside the part this ring goes round. %s"
+                             % (label, [round(x, 4) for x in c], [round(x, 4) for x in n], missed, len(angles), tail))
+        tot, acc = 0.0, Vector()
+        for i in hit:
+            p, q = section[i]
+            w = (q - p).length
+            tot += w
+            acc += (p + q) * (0.5 * w)
+        if tot <= 0.0:
+            break
+        m = acc / tot
+        c = m - n * (m - c).dot(n)
+    return c
+
+
+def _rigfree_mode(params, tail):
+    """'axis', 'limb' or None (the armature route), refusing a call that names both routes or neither."""
+    free = [k for k in ("axis", "limb") if params.get(k) is not None]
+    if len(free) > 1:
+        raise MifOpError("axis and limb are two rig-free routes - pass one. %s" % tail)
+    if free and params.get("armature") is not None:
+        raise MifOpError("armature places rings at bones; %s places them without one - pass one route. %s"
+                         % (free[0], tail))
+    if params.get("center") is not None and not free:
+        raise MifOpError("center goes with axis (a point on the axis line). %s" % tail)
+    if not free and params.get("armature") is None:
+        raise MifOpError("pass armature (rings at bones), or place the rings without a rig: axis with rings [{height}], "
+                         "or limb {from, to} with rings [{at}]. %s" % tail)
+    return free[0] if free else None
+
+
+def _rigfree_rings(raw, params, tail, least, table):
+    """[(place, at, ease, offset)] for an unrigged body (see above)."""
+    mode = _rigfree_mode(params, tail)
+    key = "height" if mode == "axis" else "at"
+    if not isinstance(raw, (list, tuple)) or len(raw) < least or len(raw) > 200:
+        raise MifOpError("rings is a list of %d-200 {%s, ease, offset, region}. %s" % (least, key, tail))
+    body = get_object(take(params, "body", required=True, kind=str), want_mesh=True)
+    if mode == "axis":
+        ax = params["axis"]
+        names = {"X": (1.0, 0.0, 0.0), "Y": (0.0, 1.0, 0.0), "Z": (0.0, 0.0, 1.0)}
+        if isinstance(ax, str) and ax.upper() in names:
+            n = Vector(names[ax.upper()])
+        elif isinstance(ax, (list, tuple)) and len(ax) == 3:
+            n = Vector(finite_floats(list(ax), "axis"))
+            if n.length < 1e-9:
+                raise MifOpError("axis is not zero. %s" % tail)
+            n.normalize()
+        else:
+            raise MifOpError("axis is X, Y, Z or [x, y, z], got %r. %s" % (ax, tail))
+        if params.get("center") is not None:
+            cen = params["center"]
+            if not isinstance(cen, (list, tuple)) or len(cen) != 3:
+                raise MifOpError("center is [x, y, z] (world). %s" % tail)
+            center = Vector(finite_floats(list(cen), "center"))
+        else:
+            box = [body.matrix_world @ Vector(v) for v in body.bound_box]
+            center = sum(box, Vector()) / 8.0
+    else:
+        lb = params["limb"]
+        if not isinstance(lb, dict) or set(lb) != {"from", "to"}:
+            raise MifOpError("limb is {from: [x, y, z], to: [x, y, z]} (world), got %r. %s" % (lb, tail))
+        a = Vector(finite_floats(list(lb["from"]), "limb.from"))
+        b = Vector(finite_floats(list(lb["to"]), "limb.to"))
+        if len(a) != 3 or len(b) != 3 or (b - a).length < 1e-9:
+            raise MifOpError("limb.from and limb.to are two different points [x, y, z]. %s" % tail)
+    parsed = []
+    for k, r in enumerate(raw):
+        if not isinstance(r, dict) or key not in r or set(r) - {key, "ease", "offset", "region"}:
+            raise MifOpError("rings[%d] is {%s, ease, offset, region} with %s, got %r. %s" % (k, key, mode, r, tail))
+        if table is not None and r.get("ease") is None:
+            reg = r.get("region")
+            if reg is None or str(reg) not in table:
+                raise MifOpError("rings[%d]: region %r is not in the ease table (%s) - pass its ease. %s"
+                                 % (k, reg, ", ".join(sorted(table)), tail))
+            r = dict(r, ease=table[str(reg)])
+        v = finite_float(r[key], "rings[%d].%s" % (k, key))
+        if mode == "limb" and not 0.0 <= v <= 1.0:
+            raise MifOpError("rings[%d].at is 0 (from) - 1 (to), got %r. %s" % (k, v, tail))
+        ease = None if r.get("ease") is None else finite_float(r["ease"], "rings[%d].ease" % k)
+        off = None if r.get("offset") is None else finite_float(r["offset"], "rings[%d].offset" % k)
+        if ease is not None and ease <= -1.0:
+            raise MifOpError("rings[%d].ease must be above -1 (a share of the body's size), got %r. %s" % (k, ease, tail))
+        parsed.append((v, ease, off))
+    from mathutils.geometry import intersect_line_line_2d   # noqa: PLC0415 - after the refusals (offline stub)
+    bm = evaluated_world(body, evaluated=take_bool(params, "evaluated", default=True))
+    try:
+        out = []
+        for k, (v, ease, off) in enumerate(parsed):
+            if mode == "axis":
+                label = "ring %d (height %g on the axis)" % (k, v)
+                c = _fit_centre(bm, center + n * (v - center.dot(n)), n, label, tail, intersect_line_line_2d)
+                place = _Place("height %g" % v, v, (c, n, _stable_ux(n)))
+            else:
+                label = "ring %d (limb at %g)" % (k, v)
+                n0 = (b - a).normalized()
+                lo, hi = max(0.0, v - 0.05), min(1.0, v + 0.05)
+                ca = _fit_centre(bm, a.lerp(b, lo), n0, label, tail, intersect_line_line_2d)
+                cb = _fit_centre(bm, a.lerp(b, hi), n0, label, tail, intersect_line_line_2d)
+                nn = (cb - ca).normalized() if (cb - ca).length > 1e-9 else n0
+                c = _fit_centre(bm, a.lerp(b, v), nn, label, tail, intersect_line_line_2d)
+                place = _Place("limb at %g" % v, v, (c, nn, _stable_ux(nn)))
+            out.append((place, v, ease, off))
+    finally:
+        bm.free()
+    return out
+
+
 def _lg_rings(raw, arm, tail, least=2, params=None):
     """[(pose bone, at, ease or None, offset or None)] from rings [{bone, at, ease, offset, region}]. With params, a
     ring without its own ease takes its region's from the call's ease table (_lg_ease_table)."""
     if not isinstance(raw, (list, tuple)) or len(raw) < least or len(raw) > 200:
         raise MifOpError("rings is a list of %d-200 {bone, at (0 head - 1 tail), ease, offset}. %s" % (least, tail))
     table = _lg_ease_table(params, tail) if params is not None else None
+    if arm is None:
+        return _rigfree_rings(raw, params or {}, tail, least, table)
     out = []
     for k, r in enumerate(raw):
         if not isinstance(r, dict) or "bone" not in r or set(r) - {"bone", "at", "ease", "offset", "region"}:
@@ -5193,7 +5359,10 @@ def _lg_section(bm, p, n):
 
 
 def _lg_frame(arm, pb, at, tail):
-    """(centre, unit bone direction, unit X in the ring's plane on the bone's own Z - its roll) in world space."""
+    """(centre, unit bone direction, unit X in the ring's plane on the bone's own Z - its roll) in world space; a rig-free
+    ring's own frame (_Place)."""
+    if isinstance(pb, _Place):
+        return pb.frame()
     mw = arm.matrix_world @ pb.matrix
     head, tl = arm.matrix_world @ pb.head, arm.matrix_world @ pb.tail
     if (tl - head).length < 1e-9:
@@ -5206,23 +5375,37 @@ def _lg_frame(arm, pb, at, tail):
     return head.lerp(tl, at), n, ux.normalized()
 
 
+def _ray_hit(dx, dy, ax, ay, bx, by):
+    """Distance along the unit ray (dx, dy) from the origin to the segment a-b, or None - in double precision.
+    mathutils' intersect_line_line_2d works in single precision, and against a ray a million units long it returned
+    distances wrong enough for a ray that did not start at the section's centre that the rig-free centre fit landed at
+    (0.089, 0.074) for a leg on (0.15, 0) (measured 2026-11-09)."""
+    ex, ey = bx - ax, by - ay
+    den = dx * ey - dy * ex
+    if abs(den) < 1e-15:
+        return None
+    t = (ax * ey - ay * ex) / den
+    u = (ax * dy - ay * dx) / den
+    # u's slack: the section's segments are cut face by face, so two that share a corner end a float apart, and a ray
+    # aimed at that corner (every ray, when the ray count matches the body's sides) must not slip between them
+    if t < 0.0 or u < -1e-6 or u > 1.0 + 1e-6:
+        return None
+    return t
+
+
 def _lg_cast(section, c, n, ux, angles, e, o, intersect_line_line_2d):
     """(garment ring, body points, rays missed): along each angle (0 on ux) in the plane (c, n), the first crossing of
     the body's section from c, times 1 + e plus o."""
     uy = n.cross(ux)
     segs = [((a - c).dot(ux), (a - c).dot(uy), (b - c).dot(ux), (b - c).dot(uy)) for a, b in section]
-    far = 1e6
     ring, body_pts, missed = [], [], 0
     for ang in angles:
         d = (math.cos(ang), math.sin(ang))
-        end = Vector((d[0] * far, d[1] * far))
         best = None
         for ax, ay, bx, by in segs:
-            hit = intersect_line_line_2d(Vector((0.0, 0.0)), end, Vector((ax, ay)), Vector((bx, by)))
-            if hit is not None:
-                r = hit.length
-                if best is None or r < best:
-                    best = r
+            r = _ray_hit(d[0], d[1], ax, ay, bx, by)
+            if r is not None and (best is None or r < best):
+                best = r
         if best is None:
             missed += 1
             continue
@@ -5236,6 +5419,10 @@ def _lg_row(pb, at, c, e, o, body_pts, ring):
     def perim(pts):
         return sum((pts[i] - pts[i - 1]).length for i in range(len(pts)))
     bp, gp = perim(body_pts), perim(ring)
+    if isinstance(pb, _Place):
+        return {"bone": None, "placement": pb.name, "at": at, "center": [round(x, 6) for x in c],
+                "axis": [round(x, 6) for x in pb.n], "ease": e, "offset": o, "bodyPerimeter": round(bp, 6),
+                "garmentPerimeter": round(gp, 6), "ratio": round(gp / bp, 6) if bp > 0 else None}
     return {"bone": pb.name, "at": at, "center": [round(x, 6) for x in c], "ease": e, "offset": o,
             "bodyPerimeter": round(bp, 6), "garmentPerimeter": round(gp, 6),
             "ratio": round(gp / bp, 6) if bp > 0 else None}
@@ -5262,8 +5449,8 @@ def op_loft_garment(params):
     reject_unknown(params, _LOFT_KEYS, "loft_garment")
     tail = "NOTHING was created."
     body = get_object(take(params, "body", required=True, kind=str), want_mesh=True)
-    arm = get_object(take(params, "armature", required=True, kind=str))
-    if arm.type != "ARMATURE":
+    arm = None if _rigfree_mode(params, tail) else get_object(take(params, "armature", required=True, kind=str))
+    if arm is not None and arm.type != "ARMATURE":
         raise MifOpError("'%s' is a %s, not an ARMATURE. %s" % (arm.name, arm.type, tail))
     try:
         segments = take_int(params, "segments", default=32)
@@ -5344,7 +5531,7 @@ def op_loft_garment(params):
 
 # --------------------------------------------------------------------------------------------- measure_garment_ease
 
-_MGE_KEYS = ("body", "garment", "armature", "rings", "segments", "evaluated")
+_MGE_KEYS = ("body", "garment", "armature", "rings", "segments", "evaluated", "axis", "center", "limb")
 
 
 def _median(values):
@@ -5360,12 +5547,12 @@ def _mge_dists(section, c, n, ux, angles, intersect_line_line_2d):
     segs = [((a - c).dot(ux), (a - c).dot(uy), (b - c).dot(ux), (b - c).dot(uy)) for a, b in section]
     out = []
     for ang in angles:
-        end = Vector((math.cos(ang) * 1e6, math.sin(ang) * 1e6))
+        dx, dy = math.cos(ang), math.sin(ang)
         best = None
         for ax, ay, bx, by in segs:
-            hit = intersect_line_line_2d(Vector((0.0, 0.0)), end, Vector((ax, ay)), Vector((bx, by)))
-            if hit is not None and (best is None or hit.length < best):
-                best = hit.length
+            hit = _ray_hit(dx, dy, ax, ay, bx, by)
+            if hit is not None and (best is None or hit < best):
+                best = hit
         out.append(best)
     return out
 
@@ -5390,8 +5577,8 @@ def op_measure_garment_ease(params):
     tail = "Nothing was changed."
     body = get_object(take(params, "body", required=True, kind=str), want_mesh=True)
     gar = get_object(take(params, "garment", required=True, kind=str), want_mesh=True)
-    arm = get_object(take(params, "armature", required=True, kind=str))
-    if arm.type != "ARMATURE":
+    arm = None if _rigfree_mode(params, tail) else get_object(take(params, "armature", required=True, kind=str))
+    if arm is not None and arm.type != "ARMATURE":
         raise MifOpError("'%s' is a %s, not an ARMATURE. %s" % (arm.name, arm.type, tail))
     if gar is body:
         raise MifOpError("body and garment are both '%s'. %s" % (body.name, tail))
@@ -5403,7 +5590,8 @@ def op_measure_garment_ease(params):
         raise MifOpError("segments is 8-512, got %r. %s" % (segments, tail))
     evaluated = take_bool(params, "evaluated", default=True)
     raw = params.get("rings")
-    rings = _lg_rings(raw, arm, tail, least=1)
+    rings = _lg_rings(raw, arm, tail, least=1,
+                      params=dict(params, garment=None, easeTable=None) if arm is None else None)
     regions = [r.get("region") for r in raw]
     from mathutils.geometry import intersect_line_line_2d   # noqa: PLC0415 - after the refusals (offline stub)
     angles = [2.0 * math.pi * s / segments for s in range(segments)]
@@ -5449,14 +5637,15 @@ def op_measure_garment_ease(params):
         if r["region"] is not None and r["complete"] and r.get("ease") is not None:
             by_region.setdefault(str(r["region"]), []).append(r["ease"])
     table = {reg: round(_median(v), 6) for reg, v in by_region.items()}
-    return {"ok": True, "op": "measure_garment_ease", "body": body.name, "garment": gar.name, "armature": arm.name,
+    return {"ok": True, "op": "measure_garment_ease", "body": body.name, "garment": gar.name,
+            "armature": arm.name if arm is not None else None,
             "segments": segments, "rings": rows, "table": table}
 
 
 # --------------------------------------------------------------------------------------------- attach_sleeve
 
 _SLEEVE_KEYS = ("object", "body", "armature", "rings", "ease", "offset", "edgeLength", "armholeRadius", "minFacing",
-                "evaluated", "garment", "easeTable")
+                "evaluated", "garment", "easeTable", "axis", "center", "limb")
 
 
 def _wrapped(a):
@@ -5492,7 +5681,7 @@ def op_attach_sleeve(params):
     try:
         obj = get_object(take(params, "object", required=True, kind=str), want_mesh=True)
         body = get_object(take(params, "body", required=True, kind=str), want_mesh=True)
-        arm = get_object(take(params, "armature", required=True, kind=str))
+        arm = None if _rigfree_mode(params, tail) else get_object(take(params, "armature", required=True, kind=str))
         ease0 = take_float(params, "ease", default=0.05)
         off0 = take_float(params, "offset", default=0.0)
         el = take_float(params, "edgeLength", default=None)
@@ -5501,7 +5690,7 @@ def op_attach_sleeve(params):
     except MifOpError as exc:
         raise MifOpError("%s %s" % (str(exc).rstrip("."), tail))
     evaluated = take_bool(params, "evaluated", default=True)
-    if arm.type != "ARMATURE":
+    if arm is not None and arm.type != "ARMATURE":
         raise MifOpError("'%s' is a %s, not an ARMATURE. %s" % (arm.name, arm.type, tail))
     if obj is body:
         raise MifOpError("object and body are both '%s'. %s" % (obj.name, tail))
@@ -5986,7 +6175,7 @@ def op_displace_by_rule(params):
 # --------------------------------------------------------------------------------------------- attach_hood
 
 _HOOD_KEYS = ("object", "body", "armature", "rings", "ease", "offset", "edgeLength", "neck", "front", "opening",
-              "crownLift", "evaluated")
+              "crownLift", "evaluated", "axis", "center", "limb")
 
 
 def _hood_point_at(order_pts, angs, a):
@@ -6045,7 +6234,7 @@ def op_attach_hood(params):
     try:
         obj = get_object(take(params, "object", required=True, kind=str), want_mesh=True)
         body = get_object(take(params, "body", required=True, kind=str), want_mesh=True)
-        arm = get_object(take(params, "armature", required=True, kind=str))
+        arm = None if _rigfree_mode(params, tail) else get_object(take(params, "armature", required=True, kind=str))
         ease0 = take_float(params, "ease", default=0.25)
         off0 = take_float(params, "offset", default=0.0)
         el = take_float(params, "edgeLength", default=None)
@@ -6053,7 +6242,7 @@ def op_attach_hood(params):
     except MifOpError as exc:
         raise MifOpError("%s %s" % (str(exc).rstrip("."), tail))
     evaluated = take_bool(params, "evaluated", default=True)
-    if arm.type != "ARMATURE":
+    if arm is not None and arm.type != "ARMATURE":
         raise MifOpError("'%s' is a %s, not an ARMATURE. %s" % (arm.name, arm.type, tail))
     if obj is body:
         raise MifOpError("object and body are both '%s'. %s" % (obj.name, tail))
@@ -6067,15 +6256,18 @@ def op_attach_hood(params):
     if len(front) != 3 or front.length < 1e-9:
         raise MifOpError("front is a world direction [x, y, z], not zero. %s" % tail)
     front.normalize()
-    rings = _lg_rings(params.get("rings"), arm, tail, least=1)
+    rings = _lg_rings(params.get("rings"), arm, tail, least=1, params=params if arm is None else None)
     opening = _hood_opening(params.get("opening"), tail)
+    if arm is None and opening is not None and opening.get("bone") is not None:
+        raise MifOpError("opening.bone names a bone, and these rings are placed without a rig - the opening runs along "
+                         "the last ring's centre line. %s" % tail)
     neck = params.get("neck")
     if neck is not None and (not isinstance(neck, dict) or set(neck) != {"near"}):
         raise MifOpError("neck is {near: [x, y, z]} (world), got %r. %s" % (neck, tail))
     near = Vector(finite_floats(list(neck["near"]), "neck.near")) if neck else None
     if near is not None and len(near) != 3:
         raise MifOpError("neck.near is [x, y, z]. %s" % tail)
-    if opening is not None:
+    if opening is not None and arm is not None:
         ob_name = opening["bone"] or rings[-1][0].name
         op_bone = arm.pose.bones.get(str(ob_name))
         if op_bone is None:
@@ -6108,7 +6300,8 @@ def op_attach_hood(params):
         loops = _pick_loops(bm)
         if not loops:
             raise MifOpError("'%s' has no open rim to grow a hood from. %s" % (obj.name, tail))
-        target = (near if near is not None else (arm.matrix_world @ pb0.head)) - shift
+        target = (near if near is not None else (pb0.c if isinstance(pb0, _Place) else
+                                                 arm.matrix_world @ pb0.head)) - shift
         cents = [(sum((v.co for v in vs), Vector()) / len(vs), (e, vs)) for e, vs in loops]
         cen, lp = min(cents, key=lambda x: (x[0] - target).length)
         rad_loop = sum((v.co - cen).length for v in lp[1]) / len(lp[1])
@@ -6214,8 +6407,15 @@ def op_attach_hood(params):
                     lp_[uv].uv = (u0 + perim * col / k, vpos[r_i])
         removed = 0
         if opening is not None:
-            ob = arm.pose.bones.get(str(opening["bone"] or rings[-1][0].name))
-            oh, ot = arm.matrix_world @ ob.head - shift, arm.matrix_world @ ob.tail - shift
+            if arm is None:
+                # THE LAST RING'S CENTRE LINE, from the ring up its axis by the distance from the first ring to it -
+                # the length a head bone gives the opening's bottom-top span on the armature route
+                last = rings[-1][0]
+                span = max((last.c - rings[0][0].c).length, 0.1)
+                oh, ot = last.c - shift, last.c + last.n * span - shift
+            else:
+                ob = arm.pose.bones.get(str(opening["bone"] or rings[-1][0].name))
+                oh, ot = arm.matrix_world @ ob.head - shift, arm.matrix_world @ ob.tail - shift
             on = (ot - oh)
             olen = on.length
             on.normalize()
@@ -6265,7 +6465,7 @@ def op_attach_hood(params):
 # --------------------------------------------------------------------------------------------- build_sole
 
 _SOLE_KEYS = ("body", "armature", "bone", "margin", "thickness", "heelThickness", "segments", "ground", "sampleHeight",
-              "evaluated", "name", "collection", "takeOverName", "last", "footprintTop", "heelLength")
+              "evaluated", "name", "collection", "takeOverName", "last", "footprintTop", "heelLength", "foot")
 _SOLE_LEVELS = 6
 
 
@@ -6485,7 +6685,11 @@ def op_build_sole(params):
     tail = "NOTHING was created."
     try:
         body = get_object(take(params, "body", required=True, kind=str), want_mesh=True)
-        arm = get_object(take(params, "armature", required=True, kind=str))
+        foot = params.get("foot")
+        if foot is not None and (params.get("armature") is not None or params.get("bone") is not None):
+            raise MifOpError("foot {heel, toe} places the sole without a rig; armature and bone place it at a bone - pass "
+                             "one. %s" % tail)
+        arm = None if foot is not None else get_object(take(params, "armature", required=True, kind=str))
         last_name = params.get("last")
         if last_name is not None and (not isinstance(last_name, str) or last_name not in SHOE_LAST):
             raise MifOpError("last %r has no measured table; the measured ones are: %s. Pass margin, thickness and "
@@ -6504,12 +6708,25 @@ def op_build_sole(params):
         raise MifOpError("heelLength must be above 0 (metres from the footprint's back along the bone), got %r. %s"
                          % (heel_len, tail))
     evaluated = take_bool(params, "evaluated", default=True)
-    if arm.type != "ARMATURE":
-        raise MifOpError("'%s' is a %s, not an ARMATURE. %s" % (arm.name, arm.type, tail))
-    bname = take(params, "bone", required=True, kind=str)
-    pb = arm.pose.bones.get(str(bname))
-    if pb is None:
-        raise MifOpError("'%s' has no bone %r. %s" % (arm.name, bname, tail))
+    if foot is not None:
+        # A FOOT WITHOUT A RIG (FOUND 2026-11-09): heel and toe points stand in for the foot bone's head and tail
+        if not isinstance(foot, dict) or set(foot) != {"heel", "toe"}:
+            raise MifOpError("foot is {heel: [x, y, z], toe: [x, y, z]} (world), got %r. %s" % (foot, tail))
+        fh = Vector(finite_floats(list(foot["heel"]), "foot.heel"))
+        ft = Vector(finite_floats(list(foot["toe"]), "foot.toe"))
+        if len(fh) != 3 or len(ft) != 3:
+            raise MifOpError("foot.heel and foot.toe are [x, y, z]. %s" % tail)
+
+        class _FootLine:
+            name = "foot"
+        pb = _FootLine()
+    else:
+        if arm.type != "ARMATURE":
+            raise MifOpError("'%s' is a %s, not an ARMATURE. %s" % (arm.name, arm.type, tail))
+        bname = take(params, "bone", required=True, kind=str)
+        pb = arm.pose.bones.get(str(bname))
+        if pb is None:
+            raise MifOpError("'%s' has no bone %r. %s" % (arm.name, bname, tail))
     if last_name is None:
         margin = 0.005 if margin is None else margin
         heel = thick if heel is None else heel
@@ -6519,7 +6736,7 @@ def op_build_sole(params):
         raise MifOpError("thickness and heelThickness must be above 0, got %r and %r. %s" % (thick, heel, tail))
     if not 8 <= segments <= 1024:
         raise MifOpError("segments is 8-1024, got %r. %s" % (segments, tail))
-    head, tl = arm.matrix_world @ pb.head, arm.matrix_world @ pb.tail
+    head, tl = (fh, ft) if foot is not None else (arm.matrix_world @ pb.head, arm.matrix_world @ pb.tail)
     dh = Vector((tl.x - head.x, tl.y - head.y))
     blen = dh.length
     if blen < 1e-6:

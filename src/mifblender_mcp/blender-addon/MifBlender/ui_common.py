@@ -48,6 +48,7 @@ FAMILY_OF_MODULE = {
     "ops_audio": "Audio", "ops_tree": "Create",
     "ops_nature": "Create",
     "ops_kit": "Create",
+    "ops_road": "Create",
     "ops_topology": "Mesh",
     "ops_image": "Materials",
     "ops_uv": "Mesh",
@@ -340,7 +341,19 @@ def health_checks(refresh_slow=False):
                  "detail": ("pid %d, %d client(s)" % (os.getpid(), getattr(server, "_clients", 0))) if running
                  else "Start it here, or turn on auto-start in the preferences.", "fix": None if running else "start"})
     token = (server.token if running else (settings.token if settings else "")) or ""
-    if not token:
+    source = getattr(server, "token_source", None) if running else None
+    if running and source == "per-install":
+        from . import TOKEN_STATE, token_store
+        mig = TOKEN_STATE.get("migrated") or {}
+        rows.append({"id": "token", "status": "warn" if TOKEN_STATE.get("error") else "ok",
+                     "text": "Per-install token · loopback only",
+                     "detail": (TOKEN_STATE["error"] if TOKEN_STATE.get("error") else
+                                "Kept in %s; the MifBridge MCP server reads it by itself.%s" % (
+                                    token_store.token_path(),
+                                    " Moved here from %s: a client that still sends 'dev' is told where it is."
+                                    % mig["from"] if mig.get("mode") == "AUTO" and mig.get("from") else "")),
+                     "fix": "prefs" if TOKEN_STATE.get("error") else None})
+    elif not token:
         rows.append({"id": "token", "status": "fail", "text": "No token: any local process can drive this",
                      "detail": "Set a token in the add-on preferences and the same one on the MCP server.",
                      "fix": "prefs"})
@@ -433,6 +446,20 @@ def health_checks(refresh_slow=False):
     else:
         rows.append({"id": "other_mcp", "status": "ok", "text": "No other Blender MCP found",
                      "detail": "No known MCP add-on enabled, nothing on :%d." % OTHER_MCP_PORT, "fix": None})
+    # WILL THIS LAST PAST A RESTART (FOUND 2026-11-09): with Auto-Save Preferences off, the add-on's enabled state and
+    # its settings live only until Blender quits unless they are saved (MifBlender.persist_preferences).
+    state = getattr(pkg, "PREFS_STATE", None) or {}
+    auto = bool(getattr(bpy.context.preferences, "use_preferences_save", True))
+    if state.get("saved") is False:
+        rows.append({"id": "prefs_saved", "status": "warn", "text": "Preferences could not be saved",
+                     "detail": "%s - MifBlender and its settings may be off on the next launch. Save the preferences, or "
+                               "turn on Auto-Save Preferences." % state.get("error"), "fix": "save_prefs"})
+    elif not auto:
+        rows.append({"id": "prefs_saved", "status": "warn" if not state.get("saved") else "info",
+                     "text": "Auto-Save Preferences is off" + (" · saved by MifBlender" if state.get("saved") else ""),
+                     "detail": "Blender writes preferences on quit only with Auto-Save on. MifBlender saves them when it is "
+                               "enabled and when run_python or the generative switch changes; other changes need "
+                               "Save Preferences.", "fix": "save_prefs"})
     jp = journal_path()
     disk_error = journal_status().get("diskError")
     if jp and disk_error:

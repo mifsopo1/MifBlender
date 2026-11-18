@@ -22,6 +22,7 @@ height.
 from __future__ import annotations
 
 import math
+import os
 import re
 
 import bpy
@@ -1392,6 +1393,326 @@ def _create_rig(lm, body_name):
     return {"name": obj.name, "bones": len(obj.data.bones)}
 
 
+# ---- refine_hands ------------------------------------------------------------------------------------------------------
+# A parametric body's fingers are smooth, nearly even tubes: knuckles and tendons exist only in its normal map. Measured on two
+# MetaHuman bodies (2026-11-08) the middle joints were 2.2 and 2.4 cm across against a reference of about 1.8-1.9 cm at that hand
+# length (below), so the hands read as chunky however good the skin is. This moves the skin vertices and nothing else: every vertex
+# stays, every UV and weight stays, so the same maps and the rig still fit. Each digit's breadth is narrowed about its bones, by
+# bone weight, against the reference; then a band of the height integrated from the character's own baked normal map pushes real
+# knuckles into the form. The relief's true scale is about 0.4 mm, which no mesh shows, so it is exaggerated. 4 was chosen by eye on one
+# hand, with skin on, and another body may want less: in plain clay 4 already shows knobby joints there, and about 14 read as swollen. A floor keeps the narrowing from becoming a claw.
+# References: NASA RP-1024 (1978), male: hand length 7.5 in, digit III interphalangeal joint breadth 0.7 in +- 0.05, digit I 0.9 in;
+# Shirato et al. 2017, J Phys Ther Sci (18 men): end joint breadth about 15.5 mm at hand length 181 mm.
+_RH_KEYS = {"object", "armature", "normalMap", "relief", "normalGreen", "sides", "jointSds", "endJointRatio", "shaft", "minScale",
+            "reliefCap", "dryRun"}
+_RH_FINGERS = ("index", "middle", "ring", "pinky")
+_RH_HAND_LEN, _RH_MID, _RH_MID_SD, _RH_THUMB = 7.5 * 2.54, 0.7 * 2.54, 0.05 * 2.54, 0.9 * 2.54
+
+
+def _rh_smooth_kernel(shape, sigma):
+    fy = np.fft.fftfreq(shape[0])[:, None]
+    fx = np.fft.rfftfreq(shape[1])[None, :]
+    return np.exp(-2.0 * (np.pi * sigma) ** 2 * (fx * fx + fy * fy))
+
+
+def _rh_relief_map(path, green, size=2048):
+    """Height from a tangent-space normal map (Frankot-Chellappa), in texels at size, band-passed to what a 2-3 mm mesh can hold."""
+    img = bpy.data.images.load(path, check_existing=False)
+    try:
+        img.colorspace_settings.name = "Non-Color"
+        if img.size[0] != size or img.size[1] != size:
+            img.scale(size, size)
+        px = np.zeros(size * size * 4, np.float32)
+        img.pixels.foreach_get(px)
+    finally:
+        bpy.data.images.remove(img)
+    px = px.reshape(size, size, 4)[::-1]   # Blender's pixels run from the bottom row: row 0 is now the image's top
+    nx, ny = px[..., 0] * 2.0 - 1.0, px[..., 1] * 2.0 - 1.0
+    if green == "OPENGL":
+        ny = -ny
+    nz = np.sqrt(np.clip(1.0 - nx * nx - ny * ny, 0.05, 1.0))
+    p, q = np.fft.rfft2(-nx / nz), np.fft.rfft2(-ny / nz)
+    fy = np.fft.fftfreq(size)[:, None]
+    fx = np.fft.rfftfreq(size)[None, :]
+    den = (2.0 * np.pi) ** 2 * (fx * fx + fy * fy)
+    den[0, 0] = 1.0
+    h = -(2j * np.pi * fx * p + 2j * np.pi * fy * q) / den
+    h[0, 0] = 0.0
+    band = h * (_rh_smooth_kernel((size, size), 2.0) - _rh_smooth_kernel((size, size), 30.0))
+    return np.fft.irfft2(band, s=(size, size)).astype(np.float32)
+
+
+def _rh_chain_param(chain, P):
+    seg = [chain[i + 1] - chain[i] for i in range(len(chain) - 1)]
+    lens = [float(np.linalg.norm(x)) for x in seg]
+    total = sum(lens)
+    best = np.full(len(P), 1e12)
+    tt, cp, acc = np.zeros(len(P)), np.zeros_like(P), 0.0
+    for i, d in enumerate(seg):
+        u = d / lens[i]
+        a = np.clip((P - chain[i]) @ u, 0.0, lens[i])
+        q = chain[i] + np.outer(a, u)
+        dist = np.linalg.norm(P - q, axis=1)
+        m = dist < best
+        best[m], tt[m], cp[m] = dist[m], (acc + a[m]) / total, q[m]
+        acc += lens[i]
+    st = [0.0]
+    for x in lens:
+        st.append(st[-1] + x / total)
+    return tt, cp, st
+
+
+def _rh_breadth(P, w, chain, axis, at):
+    tt, cp, _st = _rh_chain_param(chain, P)
+    m = (w > 0.5) & (np.abs(tt - at) < 0.03)
+    if int(m.sum()) < 4:
+        return None
+    x = (P[m] - cp[m]) @ axis
+    return float(x.max() - x.min())
+
+
+def op_refine_hands(params):
+    """Narrow a skinned body's fingers and thumb against a reference, and push real knuckles in from its own normal map.
+
+    params:
+      object (str)            the skinned mesh, an import of its FBX. MetaHuman bone names: hand_l, thumb_02_l, index_01_l ...
+      armature (str)          default the mesh's Armature modifier's
+      normalMap (str)         a file: the body's baked normal map. Without it, or relief 0, only the breadths change
+      relief (float)          how far to exaggerate the map's relief: 0-20, default 4 (see above); needs normalMap
+      normalGreen (str)       DIRECTX (Unreal's, default) | OPENGL
+      sides (list)            default ["l", "r"]
+      jointSds (float)        target middle joint: the reference + this many SD, default 1
+      endJointRatio (float)   end joint / middle joint, default 0.88
+      shaft (float)           shaft / neighboring joints, default 0.95
+      minScale (float)        never scale a joint below this, default 0.78 (a claw is the failure on this side)
+      a joint held here
+                              is reported in clamped
+      reliefCap (float)       the most relief may move a vertex, cm, default 0.22
+      dryRun (bool)           measure and answer, moving nothing
+
+    Only vertex positions change, and co-located copies along a UV seam move as one. The reply reads back: vertices, faces, UVs and
+    weights unchanged (compared), the breadths before and after at each joint, the scales used, how far vertices moved, what moved
+    outside the hands (nothing should), and for the relief its true size and whether its folds sit on the joints.
+    """
+    reject_unknown(params, _RH_KEYS, "refine_hands")
+    obj = get_object(params["object"] if "object" in params else None)
+    if obj.type != 'MESH':
+        raise MifOpError("object %r is a %s - refine_hands takes the skinned mesh." % (obj.name, obj.type))
+    arm = None
+    if params.get("armature") is not None:
+        arm = bpy.data.objects.get(str(params["armature"]))
+        if arm is None or arm.type != 'ARMATURE':
+            raise MifOpError("armature %r is not an armature in this file." % (params["armature"],))
+    else:
+        mod = next((m for m in obj.modifiers if m.type == 'ARMATURE' and m.object), None)
+        arm = mod.object if mod else (obj.parent if obj.parent and obj.parent.type == 'ARMATURE' else None)
+        if arm is None:
+            raise MifOpError("%r has no Armature modifier - pass armature." % obj.name)
+    relief = take_float(params, "relief", default=4.0)
+    if not 0.0 <= relief <= 20.0:
+        raise MifOpError("relief %g is 0 (none) to 20; 4 was chosen by eye on one hand, about 14 read as swollen." % relief)
+    green = str(params.get("normalGreen", "DIRECTX")).upper()
+    if green not in ("DIRECTX", "OPENGL"):
+        raise MifOpError("normalGreen %r is DIRECTX or OPENGL." % (params.get("normalGreen"),))
+    path = params.get("normalMap")
+    if path is not None and not (isinstance(path, str) and os.path.isfile(path)):
+        raise MifOpError("normalMap %r is not a file." % (path,))
+    if path is None and "relief" in params and relief > 0.0:
+        raise MifOpError("relief %g needs normalMap, the body's baked normal map; relief 0 narrows only." % relief)
+    sides = params.get("sides", ["l", "r"])
+    if not (isinstance(sides, list) and sides and all(s in ("l", "r") for s in sides)):
+        raise MifOpError("sides is a list of l and r, got %r." % (sides,))
+    joint_sds = take_float(params, "jointSds", default=1.0)
+    end_ratio = take_float(params, "endJointRatio", default=0.88)
+    shaft = take_float(params, "shaft", default=0.95)
+    min_scale = take_float(params, "minScale", default=0.78)
+    cap_cm = take_float(params, "reliefCap", default=0.22)
+    if not (0.5 <= end_ratio <= 1.0 and 0.8 <= shaft <= 1.0 and 0.6 <= min_scale <= 1.0 and 0.0 < cap_cm <= 0.5 and -3.0 <= joint_sds <= 3.0):
+        raise MifOpError("endJointRatio is 0.5-1, shaft 0.8-1, minScale 0.6-1, reliefCap above 0 to 0.5 cm, jointSds -3 to 3.")
+    dry = take_bool(params, "dryRun", default=False)
+    bones = arm.data.bones
+    names = []
+    for s in sides:
+        names += ["hand_" + s, "thumb_02_" + s, "thumb_03_" + s]
+        names += ["%s_0%d_%s" % (f, i, s) for f in _RH_FINGERS for i in (1, 2, 3)]
+    missing = [n for n in names if n not in bones]
+    if missing:
+        raise MifOpError("%r lacks the MetaHuman hand bones this reads: %s." % (arm.name, ", ".join(missing[:8])))
+    mesh = obj.data
+    n = len(mesh.vertices)
+    co0 = np.zeros(n * 3)
+    mesh.vertices.foreach_get("co", co0)
+    co0 = co0.reshape(-1, 3)
+    scale_cm = bpy.context.scene.unit_settings.scale_length * 100.0
+    MW = np.array(obj.matrix_world)
+    IMW = np.linalg.inv(MW)
+    P0 = (co0 @ MW[:3, :3].T + MW[:3, 3]) * scale_cm
+
+    def head(name):
+        return np.array(arm.matrix_world @ bones[name].head_local) * scale_cm
+
+    gi = {g.index: g.name for g in obj.vertex_groups}
+    rows = {}
+    for v in mesh.vertices:
+        for g in v.groups:
+            rows.setdefault(gi[g.group], []).append((v.index, g.weight))
+
+    def weight_of(pred):
+        a = np.zeros(n)
+        for name, row in rows.items():
+            if pred(name):
+                for i, w in row:
+                    a[i] += w
+        return np.clip(a, 0.0, 1.0)
+
+    hands = {}
+    for s in sides:
+        fw = {f: weight_of(lambda g, f=f, s=s: g.endswith("_" + s) and g.startswith((f + "_01", f + "_02", f + "_03"))) for f in _RH_FINGERS}
+        fw["thumb"] = weight_of(lambda g, s=s: g.endswith("_" + s) and g.startswith(("thumb_02", "thumb_03")))
+        if any(not (w > 0.5).any() for w in fw.values()):
+            raise MifOpError("%r has no vertices weighted to the %s digits - is this the body, with its LOD 0 weights?" % (obj.name, "left" if s == "l" else "right"))
+        chains = {f: [head("%s_0%d_%s" % (f, i, s)) for i in (1, 2, 3)] for f in _RH_FINGERS}
+        chains["thumb"] = [head("thumb_02_" + s), head("thumb_03_" + s)]
+        for f, c in chains.items():
+            ax = (c[-1] - c[-2]) / np.linalg.norm(c[-1] - c[-2])
+            m = fw[f] > 0.5
+            c.append(P0[m][int(np.argmax((P0[m] - c[-1]) @ ax))])
+        wrist = head("hand_" + s)
+        spread = chains["index"][0] - chains["pinky"][0]
+        spread = spread / np.linalg.norm(spread)
+        fdir = (chains["middle"][0] - wrist) / np.linalg.norm(chains["middle"][0] - wrist)
+        nrm = np.cross(spread, fdir)
+        nrm = nrm / np.linalg.norm(nrm)
+        hands[s] = dict(fw=fw, chains=chains, spread=spread, nrm=nrm, length=float(np.linalg.norm(chains["middle"][3] - wrist)),
+                        all=weight_of(lambda g, s=s: g.endswith("_" + s) and g.startswith(("hand_", "thumb_", "index_", "middle_", "ring_", "pinky_"))))
+    _p, GROUP = np.unique(np.round(P0, 3), axis=0, return_inverse=True)
+    GROUP = GROUP.ravel()
+
+    def welded(P):
+        cnt = np.bincount(GROUP)
+        return np.stack([(np.bincount(GROUP, P[:, k]) / cnt)[GROUP] for k in range(3)], axis=1)
+
+    P = P0.copy()
+    reply_sides = {}
+    for s, H in hands.items():
+        k = H["length"] / _RH_HAND_LEN
+        tt, cp, st = _rh_chain_param(H["chains"]["middle"], P0)
+        mid = H["fw"]["middle"]
+        now_j = _rh_breadth(P0, mid, H["chains"]["middle"], H["spread"], st[1])
+        now_e = _rh_breadth(P0, mid, H["chains"]["middle"], H["spread"], st[2])
+        tht, thc, thst = _rh_chain_param(H["chains"]["thumb"], P0)
+        m = (H["fw"]["thumb"] > 0.5) & (np.abs(tht - thst[1]) < 0.04)
+        if int(m.sum()) < 4 or not now_j or not now_e:
+            raise MifOpError("the %s hand's joints could not be measured: too few vertices there." % ("left" if s == "l" else "right"))
+        d = P0[m] - thc[m]
+        now_t = float(max(np.ptp(d @ H["spread"]), np.ptp(d @ H["nrm"])))
+        target = (_RH_MID + joint_sds * _RH_MID_SD) * k
+        want = {"joint": target / now_j, "end": target * end_ratio / now_e, "thumb": _RH_THUMB * k / now_t}
+        use = {"joint": float(np.clip(want["joint"], min_scale, 1.0)), "end": float(np.clip(want["end"], min_scale, 1.0)),
+               "thumb": float(np.clip(want["thumb"], min(min_scale + 0.05, 1.0), 1.0))}
+        before = {}
+        for f, c in H["chains"].items():
+            t_, c_, st_ = _rh_chain_param(c, P0)
+            before[f] = [_rh_breadth(P0, H["fw"][f], c, H["spread"], a) for a in st_[1:-1]]
+            if f == "thumb":
+                xs = [0.0, st_[1] * 0.5, st_[1], (st_[1] + 1.0) * 0.5, 1.0]
+                ys = [1.0, (1.0 + use["thumb"]) * 0.5 * shaft ** 0.5, use["thumb"], use["thumb"] * shaft ** 0.5, use["thumb"] * 0.98]
+            else:
+                xs = [0.0, st_[1] * 0.5, st_[1], (st_[1] + st_[2]) * 0.5, st_[2], (st_[2] + 1.0) * 0.5, 1.0]
+                ys = [1.0, use["joint"] * shaft, use["joint"], min(use["joint"], use["end"]) * shaft, use["end"], use["end"] * 0.97, use["end"] * 0.97]
+            sc = 1.0 - H["fw"][f] * (1.0 - np.interp(t_, xs, ys))
+            act = H["fw"][f] > 0
+            P[act] += (c_[act] + (P0[act] - c_[act]) * sc[act, None]) - P0[act]
+        reply_sides[s] = {"handLengthCm": round(H["length"], 2), "targetMiddleJointCm": round(target, 2), "scales": {a: round(b, 3) for a, b in use.items()},
+                          "clamped": [a for a in ("joint", "end") if want[a] < min_scale], "breadthBeforeCm": {f: [round(x, 2) if x else None for x in v] for f, v in before.items()}}
+    P = welded(P)
+    relief_reply = None
+    if path and relief > 0.0:
+        band = _rh_relief_map(path, green)
+        S = band.shape[0]
+        uvl = mesh.uv_layers.active.data if mesh.uv_layers.active else None
+        if uvl is None:
+            raise MifOpError("%r has no UVs to read the normal map through." % obj.name)
+        uv = np.zeros(len(uvl) * 2)
+        uvl.foreach_get("uv", uv)
+        uv = uv.reshape(-1, 2)
+        lv = np.zeros(len(mesh.loops), int)
+        mesh.loops.foreach_get("vertex_index", lv)
+        col = np.clip(((uv[:, 0] % 1.0) * S).astype(int), 0, S - 1)
+        row = np.clip(((1.0 - uv[:, 1] % 1.0) * S).astype(int), 0, S - 1)
+        ev = np.zeros(len(mesh.edges) * 2, int)
+        mesh.edges.foreach_get("vertices", ev)
+        ev = ev.reshape(-1, 2)
+        # Texels per cm, from this mesh: map length against world length along the hands' edges.
+        any_hand = np.max([H["all"] for H in hands.values()], axis=0) > 0.5
+        uvv = np.zeros((n, 2))
+        uvv[lv] = uv
+        ed = ev[any_hand[ev[:, 0]] & any_hand[ev[:, 1]]]
+        wl = np.linalg.norm(P0[ed[:, 0]] - P0[ed[:, 1]], axis=1)
+        ul = np.linalg.norm(uvv[ed[:, 0]] - uvv[ed[:, 1]], axis=1) * S
+        tex_cm = float(np.median(ul[wl > 1e-6] / wl[wl > 1e-6]))
+        if not tex_cm > 0.0:
+            raise MifOpError("the UVs give no scale for the normal map on the hands.")
+        hv = np.bincount(lv, band[row, col], n) / np.maximum(np.bincount(lv, None, n), 1) / tex_cm
+        hs = np.bincount(ev[:, 0], hv[ev[:, 1]], n) + np.bincount(ev[:, 1], hv[ev[:, 0]], n)
+        cn = np.bincount(ev[:, 0], None, n) + np.bincount(ev[:, 1], None, n)
+        hvs = 0.5 * hv + 0.5 * hs / np.maximum(cn, 1)
+        tri = np.array([p.vertices[:3] for p in mesh.polygons])
+        fn = np.cross(P[tri[:, 1]] - P[tri[:, 0]], P[tri[:, 2]] - P[tri[:, 0]])
+        vn = np.zeros_like(P)
+        for i in range(3):
+            np.add.at(vn, tri[:, i], fn)
+        vn = vn / np.maximum(np.linalg.norm(vn, axis=1, keepdims=True), 1e-9)
+        gate = np.max([H["all"] for H in hands.values()], axis=0)
+        P = welded(P + vn * (np.clip(hvs * relief, -cap_cm, cap_cm) * gate)[:, None])
+        true = hv[any_hand]
+        align = {}
+        for s, H in hands.items():
+            align[s] = {}
+            for f in _RH_FINGERS:
+                t_, c_, st_ = _rh_chain_param(H["chains"][f], P0)
+                m = H["fw"][f] > 0.5
+                prof = []
+                for b0 in np.arange(0.0, 1.0, 0.05):
+                    sel = m & (t_ >= b0) & (t_ < b0 + 0.05)
+                    prof.append(float(hv[sel].std()) if int(sel.sum()) > 2 else 0.0)
+                i_ = int(np.argmax(prof[int(st_[1] / 0.05) - 3 if st_[1] > 0.15 else 0:int(st_[1] / 0.05) + 4])) + (int(st_[1] / 0.05) - 3 if st_[1] > 0.15 else 0)
+                align[s][f] = {"middleJointAt": round(st_[1], 2), "foldPeakAt": round((i_ + 0.5) * 0.05, 2)}
+        relief_reply = {"relief": relief, "texelsPerCm": round(tex_cm, 1), "trueReliefMmP2P98": [round(float(x) * 10.0, 2) for x in np.percentile(true, [2, 98])], "foldsAtJoints": align}
+        if float(true.std()) < 1e-4:
+            relief_reply["warning"] = "the normal map holds no relief on the hands (a flat or placeholder map): only the breadths changed."
+    moved = np.linalg.norm(P - P0, axis=1)
+    in_hand = np.max([H["all"] for H in hands.values()], axis=0) > 0
+    reply = {"object": obj.name, "armature": arm.name, "dryRun": dry, "sides": reply_sides, "relief": relief_reply,
+             "movedCm": {"p50": round(float(np.percentile(moved[in_hand], 50)), 3), "p99": round(float(np.percentile(moved[in_hand], 99)), 3), "max": round(float(moved.max()), 3),
+                         "outsideHands": round(float(moved[~in_hand].max()) if (~in_hand).any() else 0.0, 4)}}
+    for s, H in hands.items():
+        reply_sides[s]["breadthAfterCm"] = {}
+        for f, c in H["chains"].items():
+            st_ = _rh_chain_param(c, P0)[2]
+            reply_sides[s]["breadthAfterCm"][f] = [round(_rh_breadth(P, H["fw"][f], c, H["spread"], a) or 0.0, 2) for a in st_[1:-1]]
+    if dry:
+        return reply
+    uvk = None
+    if mesh.uv_layers.active:
+        uvk = np.zeros(len(mesh.uv_layers.active.data) * 2)
+        mesh.uv_layers.active.data.foreach_get("uv", uvk)
+    new = (P / scale_cm) @ IMW[:3, :3].T + IMW[:3, 3]
+    mesh.vertices.foreach_set("co", new.ravel())
+    mesh.update()
+    back = np.zeros(n * 3)
+    mesh.vertices.foreach_get("co", back)
+    uv_same = True
+    if uvk is not None:
+        uv2 = np.zeros(len(uvk))
+        mesh.uv_layers.active.data.foreach_get("uv", uv2)
+        uv_same = bool(np.array_equal(uv2, uvk))
+    reply["readBack"] = {"vertices": len(mesh.vertices), "faces": len(mesh.polygons), "uvsUnchanged": uv_same, "maxErrorCm": round(float(np.abs(back - new.ravel()).max()) * scale_cm, 5)}
+    reply["note"] = "only positions moved. Send it to Unreal with set_skeletal_mesh_vertices(blender_object=...) on a COPY of the body first; LODs above 0 are not changed, so a far LOD still has the old shape."
+    return reply
+
+
 OPS = {
     "build_body": op_build_body,
+    "refine_hands": op_refine_hands,
 }

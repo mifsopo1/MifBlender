@@ -23,8 +23,8 @@ controls live in the 3D viewport N-panel under the "MifBridge" tab.
 bl_info = {
     "name": "MifBlender (MifBridge backend)",
     "author": "Mifsopo",
-    "version": (1, 3, 1),
-    "blender": (4, 4, 0),
+    "version": (1, 4, 0),
+    "blender": (3, 6, 0),
     "location": "View3D > Sidebar (N) > MifBridge",
     "description": "Framed-JSON socket backend so the MifBridge MCP server can drive "
                    "Blender alongside Unreal.",
@@ -33,6 +33,10 @@ bl_info = {
     "category": "Import-Export",
 }
 
+# THE FLOOR IS 3.6 SINCE 2026-11-09, the bottom of the certified range (the release's
+# claimed lowest Blender, which its version check holds this to). It said 4.4 until then, so the add-on list showed a 3.6 or 4.2 user an add-on
+# for a newer Blender while every suite passed there. The history below is why 4.4 was the first value.
+#
 # The 4.4 floor is now CONSERVATIVE rather than unverified. Measured 2026-08-27 with
 # tools/blender_probe.py and tools/test_blender_ops.py, on four real installs:
 #
@@ -55,7 +59,8 @@ bl_info = {
 # The floor stays at 4.4 anyway, and that is a decision rather than an oversight: the op
 # SUITE covers set_material_slots and the read ops around it, not the FBX mesh round
 # trip. The kwargs are proven present on 3.6; the round trip through them is not proven
-# on 3.6. Lower the floor when something exercises it.
+# on 3.6. Lower the floor when something exercises it. (It is exercised now: every release certifies the full
+# suite set, FBX round trips and the hand-off to Unreal included, on 3.6.)
 
 import importlib
 import os
@@ -147,6 +152,7 @@ SOURCE_HASH_AT_IMPORT = source_hash()
 
 from . import server as mif_server  # noqa: E402
 from . import journal as mif_journal  # noqa: E402
+from . import token_store  # noqa: E402
 
 # Module-level server handle -- do NOT hang this on bpy.types (breaks theme presets).
 _server = None
@@ -155,6 +161,36 @@ _server = None
 # ---------------------------------------------------------------------------
 # Preferences
 # ---------------------------------------------------------------------------
+
+# PREFERENCES THAT LAST (FOUND 2026-11-09: a user re-enabled MifBlender on every launch and found run_python back on).
+# Blender keeps an add-on's enabled state and its preferences in userpref.blend, written on quit only when Auto-Save
+# Preferences is on; with it off, enabling the add-on or changing a setting lasts one session. So when it is off,
+# MifBlender saves the preferences itself after it is enabled and after run_python or the generative switch changes,
+# and the panel says when that failed or when Auto-Save is off (ui_common.health_checks).
+PREFS_STATE = {"saved": None, "error": None, "at": None, "why": None}
+
+
+def persist_preferences(why, force=False):
+    """Write the user preferences (wm.save_userpref) when Blender will not: Auto-Save Preferences off, or force (the
+    panel's button, a test). Never in a background Blender unless forced. Returns PREFS_STATE."""
+    import time as _time
+    prefs_ = bpy.context.preferences
+    if not force and (bpy.app.background or getattr(prefs_, "use_preferences_save", False)):
+        return PREFS_STATE
+    try:
+        ok = "FINISHED" in bpy.ops.wm.save_userpref()
+        PREFS_STATE.update(saved=ok, error=None if ok else "wm.save_userpref did not finish", at=_time.time(), why=why)
+    except Exception as exc:   # noqa: BLE001 - reported in the panel, never raised into register or a property update
+        PREFS_STATE.update(saved=False, error=str(exc), at=_time.time(), why=why)
+    if not PREFS_STATE["saved"]:
+        print("[MifBlender] could not save the preferences (%s): MifBlender and its settings may be off on the next "
+              "launch. Save them from Edit > Preferences, or turn on Auto-Save Preferences." % PREFS_STATE["error"])
+    return PREFS_STATE
+
+
+def _persist_on_change(self, context):
+    persist_preferences("setting")
+
 
 def _hud_changed(self, context):
     from . import ui_hud  # local: the preferences class is built before the UI modules register
@@ -170,12 +206,24 @@ class MifBlenderPreferences(AddonPreferences):
                     "the unrelated third-party blender-mcp addon uses 9876",
         default=mif_server.DEFAULT_PORT, min=1024, max=65535,
     )
-    token: StringProperty(
+    # THE TOKEN (1.4, token_store.py). Per-install, the default: a random token in a per-user file the MCP server reads
+    # by itself. Custom: the Token field, which the MCP server must be given (MIF_BLENDER_TOKEN). None: no
+    # authentication. An install from before 1.4 has no token_mode stored; effective_token_mode reads its old Token
+    # field instead (empty -> None, "dev" or untouched -> Per-install, anything else -> Custom) and the first GUI start
+    # stores that, so a chosen secret keeps working and only the shipped "dev" is retired.
+    token_mode: EnumProperty(
         name="Token",
-        description="Shared secret. Must match MIF_BLENDER_TOKEN on the MCP server "
-                    "(which itself defaults to MIF_BRIDGE_TOKEN). Leaving it EMPTY "
-                    "disables authentication entirely",
-        default="dev", subtype="PASSWORD",
+        description="How this Blender authenticates the MCP server",
+        items=[("AUTO", "Per-install (recommended)", "A random token made on first start, kept in a per-user file "
+                                                       "the MifBridge MCP server reads by itself"),
+               ("CUSTOM", "Custom", "The token typed below. Give the MCP server the same one as MIF_BLENDER_TOKEN"),
+               ("NONE", "None (no authentication)", "Any program on this machine can drive this Blender")],
+        default="AUTO",
+    )
+    token: StringProperty(
+        name="Custom token",
+        description="Used when Token is Custom. Must match MIF_BLENDER_TOKEN on the MCP server",
+        default="", subtype="PASSWORD",
     )
     auto_start: BoolProperty(
         name="Start server automatically",
@@ -196,7 +244,7 @@ class MifBlenderPreferences(AddonPreferences):
         description="Lets the run_python op exec arbitrary Python inside Blender with "
                     "your user's privileges. The socket is loopback-only and token "
                     "gated, but turn this off if you do not need the escape hatch",
-        default=True,
+        default=True, update=_persist_on_change,
     )
     # GENERATIVE BY DEFAULT, A SWITCH YOU CAN SEE (ops_gen.py, 2026-10-01). The gen_* ops are the only ones that
     # run a trained model; off here, each is refused before it reads a parameter or contacts ComfyUI, in every file.
@@ -206,7 +254,7 @@ class MifBlenderPreferences(AddonPreferences):
         description="Lets the gen_* ops run generative models (Flux, Hunyuan3D-2) through a ComfyUI you run "
                     "yourself, in files whose project mode allows it. Off, this Blender is non-generative: those "
                     "ops are refused and nothing contacts ComfyUI",
-        default=True,
+        default=True, update=_persist_on_change,
     )
     job_timeout: IntProperty(
         name="Main-thread job timeout (s)",
@@ -280,7 +328,13 @@ class MifBlenderPreferences(AddonPreferences):
         layout = self.layout
         col = layout.column(align=True)
         col.prop(self, "port")
-        col.prop(self, "token")
+        mode = effective_token_mode(self)
+        col.prop(self, "token_mode")
+        if mode == "CUSTOM":
+            col.prop(self, "token")
+        elif mode == "AUTO":
+            col.label(text="Token file: %s" % token_store.token_path(), icon="LOCKED")
+            col.operator(MIFBLENDER_OT_copy_token.bl_idname, icon="COPYDOWN")
         col.prop(self, "job_timeout")
         layout.prop(self, "auto_start")
         layout.prop(self, "verbose")
@@ -298,8 +352,8 @@ class MifBlenderPreferences(AddonPreferences):
         box.label(text="gen_* ops may run generative models where the file's project mode allows it."
                   if self.allow_generative else "Non-generative: the gen_* ops are refused in every file.",
                   icon="INFO")
-        if not self.token:
-            layout.label(text="Token is empty: any local process can drive Blender.",
+        if mode == "NONE" or (mode == "CUSTOM" and not self.token):
+            layout.label(text="No token: any local process can drive Blender.",
                          icon="ERROR")
 
         box = layout.box()
@@ -345,15 +399,76 @@ def _status_line():
         "" if _server._clients == 1 else "s")
 
 
+def effective_token_mode(settings):
+    """AUTO | CUSTOM | NONE for these preferences, or None when there are none (the add-on imported by a script, not
+    enabled). An install from before 1.4 stored no token_mode: its old Token field decides (empty -> NONE, untouched or
+    the shipped "dev" -> AUTO, anything else -> CUSTOM), so nobody's chosen secret or choice is overridden."""
+    if settings is None:
+        return None
+    try:
+        if settings.is_property_set("token_mode"):
+            return settings.token_mode
+        token_set = settings.is_property_set("token")
+    except (AttributeError, TypeError):      # a preferences object without is_property_set: read the values
+        token_set = True
+    tok = getattr(settings, "token", "") or ""
+    if not token_set or tok == token_store.LEGACY_TOKEN:
+        return "AUTO"
+    return "CUSTOM" if tok else "NONE"
+
+
+TOKEN_STATE = {"source": None, "error": None, "migrated": None}
+
+
+def resolve_token(token=None, settings=None):
+    """(token, source) the server starts with. An explicit token wins; else the preference's mode. Per-install in a GUI
+    Blender reads or makes the token file. A headless Blender (blender -b, a command someone typed) and a script that
+    serves the add-on without enabling it keep "dev" unless the preference is Custom or None."""
+    if token is not None:
+        return token, "argument"
+    mode = effective_token_mode(settings)
+    if mode == "NONE":
+        return "", "none"
+    if mode == "CUSTOM":
+        return settings.token or "", "custom"
+    if mode is None or bpy.app.background:
+        return token_store.LEGACY_TOKEN, "default (headless)" if mode is not None else "default (no preferences)"
+    tok, err = token_store.read_or_create()
+    TOKEN_STATE["error"] = err
+    if err:
+        print("[MifBlender] %s: this session uses a random token nothing else knows. Fix the file, or set Token to "
+              "Custom in the preferences." % err)
+    return tok, "per-install"
+
+
+def _migrate_token_mode(settings):
+    """Store the mode an install from before 1.4 implies, once, so the panel shows it and it outlives the old field."""
+    if settings is None:
+        return
+    try:
+        if settings.is_property_set("token_mode"):
+            return
+    except (AttributeError, TypeError):
+        return
+    mode = effective_token_mode(settings)
+    old = settings.token if settings.is_property_set("token") else None
+    settings.token_mode = mode
+    # "from" only when a token was stored: an untouched preference cannot tell a new install from an old one
+    TOKEN_STATE["migrated"] = {"mode": mode, "from": None if old is None else "an empty token" if old == "" else
+                               ("the old default 'dev'" if old == token_store.LEGACY_TOKEN else "your own token")}
+
+
 def start_server(port=None, token=None, job_timeout=None, verbose=None):
     """Start (or restart) the socket server. Safe to call twice."""
     global _server
     settings = prefs()
     if _server is not None and _server.running:
         _server.stop()
+    tok, source = resolve_token(token, settings)
+    TOKEN_STATE["source"] = source
     _server = mif_server.MifBlenderServer(
         port=port if port is not None else getattr(settings, "port", mif_server.DEFAULT_PORT),
-        token=token if token is not None else getattr(settings, "token", "dev"),
+        token=tok, token_source=source,
         job_timeout=(job_timeout if job_timeout is not None
                      else getattr(settings, "job_timeout",
                                   mif_server.DEFAULT_JOB_TIMEOUT)),
@@ -397,6 +512,22 @@ class MIFBLENDER_OT_start(Operator):
         return {"CANCELLED"}
 
 
+class MIFBLENDER_OT_copy_token(Operator):
+    bl_idname = "mifblender.copy_token"
+    bl_label = "Copy Token"
+    bl_description = ("Copy this Blender's per-install token to the clipboard, for a client other than the MifBridge "
+                      "MCP server (which reads the token file by itself)")
+
+    def execute(self, context):
+        tok, err = token_store.read_or_create()
+        if err:
+            self.report({"ERROR"}, err)
+            return {"CANCELLED"}
+        context.window_manager.clipboard = tok
+        self.report({"INFO"}, "MifBlender: token copied")
+        return {"FINISHED"}
+
+
 class MIFBLENDER_OT_stop(Operator):
     bl_idname = "mifblender.stop_server"
     bl_label = "Stop MifBlender Server"
@@ -414,6 +545,7 @@ _CLASSES = (
     MifBlenderPreferences,
     MIFBLENDER_OT_start,
     MIFBLENDER_OT_stop,
+    MIFBLENDER_OT_copy_token,
 )
 _UI_MODULES = ("ui_common", "ui_panel", "ui_hud")
 
@@ -427,8 +559,10 @@ def _deferred_autostart():
     before we read them -- reading them inside register() is a coin flip on a
     fresh enable."""
     settings = prefs()
+    _migrate_token_mode(settings)       # before the server reads it; saved with the preferences below
     if settings is None or settings.auto_start:
         start_server()
+    persist_preferences("enabled")      # Auto-Save off: the enable would last this session only
     return None  # one-shot: do not re-arm
 
 

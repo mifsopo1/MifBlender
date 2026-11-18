@@ -25,7 +25,7 @@ import math
 import bmesh
 import bpy
 
-from .ops_common import (MifOpError, finite_float, finite_floats, get_object, reject_unknown, require_editable,
+from .ops_common import (MifOpError, finite_float, finite_floats, finite_int, get_object, reject_unknown, require_editable,
                          select_only, selection_restore, selection_snapshot, shared_data_note, take, take_bool,
                          take_float, take_int)
 from .ops_mesh import (_PACK_PINNED, _face_area_through, _face_uv_area, _run_pack_islands, _scale_layout_islands,
@@ -1396,6 +1396,196 @@ def op_uv_relax(params):
     return out
 
 
+
+# --------------------------------------------------------------------------------------------- export_uv_layout
+# THE GAP (filed 2026-11-09, built 2026-11-15). No typed tool wrote a UV layout, a usual deliverable beside a wireframe;
+# a build drew its own from its chart data with PIL. Blender's own UV > Export Layout needs edit mode and, for PNG, a
+# GPU offscreen, so this draws in numpy and saves through an image datablock it removes again - it runs the same in a
+# background Blender, with no window and no GPU.
+
+_UVL_KEYS = ("object", "file", "layer", "size", "fillColor", "lineColor", "background", "overwrite")
+
+
+def _rgba(raw, key, default):
+    if raw is None:
+        return default
+    if not isinstance(raw, (list, tuple)) or len(raw) not in (3, 4):
+        raise MifOpError("%s is [r, g, b] or [r, g, b, a] (0-1), got %r. NOTHING was written." % (key, raw))
+    v = finite_floats(list(raw), key)
+    if any(c < 0 or c > 1 for c in v):
+        raise MifOpError("%s values run 0-1, got %r. NOTHING was written." % (key, raw))
+    return v + [1.0] * (4 - len(v))
+
+
+def _raster_triangles(cov, tri):
+    """Mark every pixel whose center lies in a triangle; tri is (T, 3, 2) in pixel units. Small triangles are done
+    together by broadcasting their box's candidate pixels; big ones one at a time."""
+    import numpy as np                                   # noqa: PLC0415
+    h, w = cov.shape
+    if not len(tri):
+        return
+    lo = np.floor(tri.min(axis=1) - 0.5).astype(np.int64)
+    hi = np.ceil(tri.max(axis=1) - 0.5).astype(np.int64)
+    span = (hi - lo + 1).max(axis=1)
+
+    def mark(t, x0, y0, k):
+        gx, gy = np.meshgrid(np.arange(k), np.arange(k))
+        px = x0[:, None] + gx.ravel()[None, :]
+        py = y0[:, None] + gy.ravel()[None, :]
+        cx, cy = px + 0.5, py + 0.5
+        a, b, c = t[:, 0], t[:, 1], t[:, 2]
+
+        def edge(p, q):
+            return (q[:, 0:1] - p[:, 0:1]) * (cy - p[:, 1:2]) - (q[:, 1:2] - p[:, 1:2]) * (cx - p[:, 0:1])
+        e0, e1, e2 = edge(a, b), edge(b, c), edge(c, a)
+        inside = ((e0 >= 0) & (e1 >= 0) & (e2 >= 0)) | ((e0 <= 0) & (e1 <= 0) & (e2 <= 0))
+        inside &= (px >= 0) & (px < w) & (py >= 0) & (py < h)
+        cov[py[inside], px[inside]] = True
+
+    done = np.zeros(len(tri), dtype=bool)
+    for k in (2, 4, 8, 16, 32):
+        sel = (~done) & (span <= k)
+        idx = np.nonzero(sel)[0]
+        step = max(1, 2000000 // (k * k))
+        for s0 in range(0, len(idx), step):
+            ii = idx[s0:s0 + step]
+            mark(tri[ii], lo[ii, 0], lo[ii, 1], k)
+        done |= sel
+    for i in np.nonzero(~done)[0]:
+        x0, y0 = max(0, int(lo[i, 0])), max(0, int(lo[i, 1]))
+        x1, y1 = min(w - 1, int(hi[i, 0])), min(h - 1, int(hi[i, 1]))
+        if x1 < x0 or y1 < y0:
+            continue
+        for ys in range(y0, y1 + 1, 64):
+            ye = min(y1, ys + 63)
+            sub = np.zeros((ye - ys + 1, x1 - x0 + 1), dtype=bool)
+            gx, gy = np.meshgrid(np.arange(x0, x1 + 1) + 0.5, np.arange(ys, ye + 1) + 0.5)
+            a, b, c = tri[i]
+
+            def edge(p, q):
+                return (q[0] - p[0]) * (gy - p[1]) - (q[1] - p[1]) * (gx - p[0])
+            e0, e1, e2 = edge(a, b), edge(b, c), edge(c, a)
+            sub = ((e0 >= 0) & (e1 >= 0) & (e2 >= 0)) | ((e0 <= 0) & (e1 <= 0) & (e2 <= 0))
+            cov[ys:ye + 1, x0:x1 + 1] |= sub
+
+
+def op_export_uv_layout(params):
+    """A mesh's UV layout written as a PNG: faces filled, edges drawn, over a transparent or colored background - with
+    the fill measured.
+
+    params:
+      object (str, required)   a MESH
+      file (str, required)     a .png path (replaced by default, and said; overwrite false refuses)
+      layer (str)              the UV layer (default: the active one)
+      size (int | [w, h])      pixels, default 1024, 16 to 8192 a side
+      fillColor / lineColor / background ([r, g, b(, a)] 0-1)   defaults: a half-clear gray fill, white lines, clear
+    """
+    import os
+    import numpy as np                                   # noqa: PLC0415
+    from .ops_common import abs_output_path, check_output_path, file_before, replaced_fields
+    reject_unknown(params, _UVL_KEYS, "export_uv_layout")
+    tail = "NOTHING was written."
+    obj = get_object(take(params, "object", "name", required=True, kind=str), want_mesh=True)
+    mesh = obj.data
+    raw = take(params, "file", "filepath", "path", required=True, kind=str)
+    if not str(raw).lower().endswith(".png"):
+        raise MifOpError("file is a .png path, got %r. %s" % (raw, tail))
+    if not mesh.uv_layers:
+        raise MifOpError("'%s' has no UV layer - bl_uv_unwrap makes one. %s" % (obj.name, tail))
+    lname = take(params, "layer", "uvLayer", default=None, kind=str)
+    layer = mesh.uv_layers.active if lname is None else mesh.uv_layers.get(lname)
+    if layer is None:
+        raise MifOpError("'%s' has no UV layer %r (it has %s). %s"
+                         % (obj.name, lname, ", ".join(u.name for u in mesh.uv_layers), tail))
+    size = params.get("size", 1024)
+    if isinstance(size, (int, float)) and not isinstance(size, bool):
+        size = [size, size]
+    if not isinstance(size, (list, tuple)) or len(size) != 2:
+        raise MifOpError("size is a number of pixels or [width, height], got %r. %s" % (params.get("size"), tail))
+    w, h = (finite_int(v, "size") for v in size)
+    if not (16 <= w <= 8192 and 16 <= h <= 8192):
+        raise MifOpError("size runs 16 to 8192 pixels a side, got %dx%d. %s" % (w, h, tail))
+    fill = _rgba(params.get("fillColor"), "fillColor", [0.5, 0.5, 0.5, 0.5])
+    line = _rgba(params.get("lineColor"), "lineColor", [1.0, 1.0, 1.0, 1.0])
+    bg = _rgba(params.get("background"), "background", [0.0, 0.0, 0.0, 0.0])
+    # READ BEFORE the exists test, so a malformed overwrite is refused whether or not the file is there yet
+    overwrite = take_bool(params, "overwrite", default=True)
+    path = abs_output_path(raw)
+    check_output_path(raw, path, "written")
+    if os.path.exists(path) and not overwrite:
+        raise MifOpError("%s already exists and overwrite is false. %s" % (path, tail))
+    parent = os.path.dirname(path)
+    if parent and not os.path.isdir(parent):
+        os.makedirs(parent, exist_ok=True)
+
+    nl = len(mesh.loops)
+    uv = np.empty(nl * 2, dtype=np.float64)
+    layer.data.foreach_get("uv", uv)
+    uv = uv.reshape(nl, 2)
+    if not np.isfinite(uv).all():
+        raise MifOpError("UV layer '%s' holds a non-finite coordinate. %s" % (layer.name, tail))
+    mesh.calc_loop_triangles()
+    nt = len(mesh.loop_triangles)
+    tl = np.empty(nt * 3, dtype=np.int64)
+    mesh.loop_triangles.foreach_get("loops", tl)
+    tri_uv = uv[tl.reshape(-1, 3)]
+    scale = np.array([w, h], dtype=np.float64)
+    cov = np.zeros((h, w), dtype=bool)
+    _raster_triangles(cov, tri_uv * scale)
+    # THE EDGES OF THE FACES, not of the triangles: consecutive corners of each face, closed
+    nf = len(mesh.polygons)
+    starts = np.empty(nf, dtype=np.int64)
+    totals = np.empty(nf, dtype=np.int64)
+    mesh.polygons.foreach_get("loop_start", starts)
+    mesh.polygons.foreach_get("loop_total", totals)
+    a_idx = np.arange(nl)
+    order = np.concatenate([np.arange(s, s + t) for s, t in zip(starts.tolist(), totals.tolist())]) if nf else a_idx
+    pos = np.arange(len(order)) - np.repeat(np.concatenate([[0], np.cumsum(totals)[:-1]]), totals)
+    nxt_pos = (pos + 1) % np.repeat(totals, totals)
+    nxt = order[np.repeat(np.concatenate([[0], np.cumsum(totals)[:-1]]), totals) + nxt_pos]
+    p0, p1 = uv[order] * scale, uv[nxt] * scale
+    lines = np.zeros((h, w), dtype=bool)
+    if len(p0):
+        n = np.maximum(2, np.ceil(np.abs(p1 - p0).max(axis=1) * 1.5).astype(np.int64) + 1)
+        for s0 in range(0, len(n), 200000):
+            nn = n[s0:s0 + 200000]
+            rep = np.repeat(np.arange(len(nn)), nn)
+            tpar = (np.arange(nn.sum()) - np.repeat(np.concatenate([[0], np.cumsum(nn)[:-1]]), nn)) / \
+                np.repeat(nn - 1, nn)
+            pts = p0[s0:s0 + 200000][rep] + (p1[s0:s0 + 200000][rep] - p0[s0:s0 + 200000][rep]) * tpar[:, None]
+            xi = np.floor(pts[:, 0]).astype(np.int64)
+            yi = np.floor(pts[:, 1]).astype(np.int64)
+            ok = (xi >= 0) & (xi < w) & (yi >= 0) & (yi < h)
+            lines[yi[ok], xi[ok]] = True
+    pic = np.empty((h, w, 4), dtype=np.float32)
+    pic[:] = bg
+    pic[cov] = fill
+    pic[lines] = line
+    img = bpy.data.images.new("MifUVLayout", w, h, alpha=True)
+    before = file_before(path)
+    try:
+        img.pixels.foreach_set(pic.ravel())
+        img.filepath_raw = path
+        img.file_format = "PNG"
+        img.save()
+    finally:
+        bpy.data.images.remove(img)
+    d = tri_uv[:, 1:] - tri_uv[:, :1]
+    area = float(np.abs(d[:, 0, 0] * d[:, 1, 1] - d[:, 0, 1] * d[:, 1, 0]).sum() / 2.0) if nt else 0.0
+    outside = int(((uv < 0) | (uv > 1)).any(axis=1).sum())
+    fill_share = float(cov.mean())
+    out = {"object": obj.name, "file": path, "layer": layer.name, "size": [w, h], "faces": nf, "triangles": nt,
+           "fill": round(fill_share, 4), "fillFrom": "pixels covered by a face, of the whole 0-1 square",
+           "uvArea": round(area, 4),
+           "overlapShare": round(max(0.0, area - fill_share) / area, 4) if area > 0 else None,
+           "loopsOutsideUnitSquare": outside, "linePixels": int(lines.sum()),
+           "bytes": os.path.getsize(path) if os.path.isfile(path) else 0,
+           "note": ("uvArea adds every face's UV area, so faces stacked on each other count twice and overlapShare "
+                    "is roughly how much of it is stacked; a face outside the 0-1 square is not drawn.")}
+    out.update(replaced_fields(before))
+    return out
+
+
 OPS = {
     "uv_stitch": op_uv_stitch,
     "uv_set_texel_density": op_uv_set_texel_density,
@@ -1403,4 +1593,5 @@ OPS = {
     "uv_straighten_islands": op_uv_straighten_islands,
     "uv_move_vertices": op_uv_move_vertices,
     "uv_relax": op_uv_relax,
+    "export_uv_layout": op_export_uv_layout,
 }

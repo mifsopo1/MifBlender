@@ -3660,6 +3660,16 @@ def _parse_turn(raw):
     return {"axis": axis.normalized(), "degrees": deg, "pivot": pivot}
 
 
+def _write_pose_matrix(pb, matrix):
+    """pb.matrix = matrix, keeping the bone's own scale (FOUND 2026-11-11): Blender splits a written matrix into location,
+    rotation and scale against the parent's pose, and under a parent with non-uniform scale (a squash key on a pelvis)
+    that split put shear into the child's scale - a calf read y 0.92 and a foot z 5.0 after a move set that asked only for
+    rotations. The turn and IK writes are rotations, so the scale goes back to what it was."""
+    keep = pb.scale.copy()
+    pb.matrix = matrix
+    pb.scale = keep
+
+
 def _apply_turn(obj, pb, turn):
     from mathutils import Matrix   # noqa: PLC0415
     _, epb = _evaluated_bone(obj, pb.name)
@@ -3670,7 +3680,7 @@ def _apply_turn(obj, pb, turn):
     pa = _arm_point(obj, pivot_w)
     rot = (Matrix.Translation(pa) @ Matrix.Rotation(math.radians(turn["degrees"]), 4, _arm_dir(obj, turn["axis"]))
            @ Matrix.Translation(-pa))
-    pb.matrix = rot @ epb.matrix
+    _write_pose_matrix(pb, rot @ epb.matrix)
     _, epb = _evaluated_bone(obj, pb.name)
     head_after, tail_after = mw @ epb.head, mw @ epb.tail
     # the turn measured back: the angle between the tail's arm from the pivot before and after, seen along the axis
@@ -3762,9 +3772,15 @@ def _parse_ik(obj, pb, raw):
 def _aim(obj, pb, head, to):
     """Turn pose bone pb about `head` (armature space) by the smallest rotation that points its tail at `to`."""
     from mathutils import Matrix   # noqa: PLC0415
-    _, epb = _evaluated_bone(obj, pb.name)
-    q = (epb.tail - epb.head).normalized().rotation_difference((to - head).normalized())
-    pb.matrix = Matrix.Translation(head) @ q.to_matrix().to_4x4() @ Matrix.Translation(-head) @ epb.matrix
+    # A FEW PASSES: under a parent with non-uniform scale, keeping the bone's scale (_write_pose_matrix) leaves the aim
+    # a little off, and aiming again from where it landed closes it
+    for _ in range(6):
+        _, epb = _evaluated_bone(obj, pb.name)
+        q = (epb.tail - epb.head).normalized().rotation_difference((to - head).normalized())
+        if q.angle < 1e-7:
+            break
+        _write_pose_matrix(pb, Matrix.Translation(head) @ q.to_matrix().to_4x4() @ Matrix.Translation(-head)
+                           @ epb.matrix)
 
 
 def _apply_ik(obj, pb, ik):
@@ -3777,22 +3793,33 @@ def _apply_ik(obj, pb, ik):
     end_rot = {"current": e_end.matrix.to_3x3().normalized(), "rest": pb.bone.matrix_local.to_3x3().normalized(),
                "none": None}[ik["keep"]]
     end_rot_world = None if end_rot is None else (mw.to_3x3() @ end_rot).normalized()
-    er, em = ev.pose.bones[root.name], ev.pose.bones[mid.name]
-    p0 = Vector(er.head)
     t = _arm_point(obj, ik["target"])
-    la, lb = (er.tail - er.head).length, (em.tail - em.head).length
-    dist = (t - p0).length
-    d = (t - p0).normalized()
-    cos_a = max(-1.0, min(1.0, (la * la + dist * dist - lb * lb) / (2 * la * dist)))
-    knee = p0 + d * la * cos_a + ik["side"] * la * math.sqrt(max(0.0, 1 - cos_a * cos_a))
-    _aim(obj, root, p0, knee)
-    _, em = _evaluated_bone(obj, mid.name)
-    _aim(obj, mid, Vector(em.head), t)
+    reach = None
+    # SOLVED AGAIN FROM WHERE IT LANDED, a few times: under a parent with non-uniform scale the bones' posed lengths
+    # change with their direction, so one pass from the lengths read before it can miss by millimetres
+    for _ in range(4):
+        ev = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
+        er, em = ev.pose.bones[root.name], ev.pose.bones[mid.name]
+        p0 = Vector(er.head)
+        la, lb = (er.tail - er.head).length, (em.tail - em.head).length
+        if reach is None:
+            reach = (la, lb, (t - p0).length)
+        dist = (t - p0).length
+        d = (t - p0).normalized()
+        cos_a = max(-1.0, min(1.0, (la * la + dist * dist - lb * lb) / (2 * la * dist)))
+        knee = p0 + d * la * cos_a + ik["side"] * la * math.sqrt(max(0.0, 1 - cos_a * cos_a))
+        _aim(obj, root, p0, knee)
+        _, em = _evaluated_bone(obj, mid.name)
+        _aim(obj, mid, Vector(em.head), t)
+        _, e_now = _evaluated_bone(obj, pb.name)
+        if (Vector(e_now.head) - t).length < 1e-6 * max(la + lb, 1e-6):
+            break
+    la, lb, dist = reach
     if end_rot is not None:
         _, e_end = _evaluated_bone(obj, pb.name)
         m = end_rot.to_4x4() @ Matrix.Diagonal(e_end.matrix.to_scale()).to_4x4()
         m.translation = e_end.head
-        pb.matrix = m
+        _write_pose_matrix(pb, m)
     ev, e_end = _evaluated_bone(obj, pb.name)
     rot_err = None
     if end_rot_world is not None:
