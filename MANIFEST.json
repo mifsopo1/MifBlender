@@ -1,14 +1,14 @@
 {
  "package": "mifblender-mcp",
  "version": "1.5.0",
- "sourceCommit": "2febd0a2b8ba13222d0784758a29b57cb4c2a2fe",
+ "sourceCommit": "f37c31daeac44895ad808c637f2fccaea833f0f9",
  "sourceDirty": false,
  "tools": 469,
  "files": {
   ".gitattributes": "705fd4d6451a31d36b3df7de96f83f30ac976c9b4a6d1e51671d8e2f33e2d0da",
   ".github/ISSUE_TEMPLATE/bug_report.yml": "447f838e510eaa778a26ea3f0739f5df887249fd42cb77e21b7cd562daa8fe7d",
   ".github/release_check.py": "45656b023ae1509d6b24c8d0386c6bd770ed76e14c8bb2050f3dbe854560fb92",
-  ".github/workflows/publish.yml": "946277dc36c626b22a2731618c1a39b44243c928a8e48b4bfda40c1d0f4dd464",
+  ".github/workflows/publish.yml": "29ef4ce1c4f75af16eace47aa33e3d7f1dac5936337d91f88c7a01fe1c470232",
   "CONTRIBUTING.md": "11f337ae7d48628c99ad069834706b2557e805902aacc763866a70bb4d5d738e",
   "LICENSE.txt": "1bf348aaafafd7e171a75a029321d883d3148b1bba4a34620e8c98a578469ad9",
   "README.md": "431740ce93805f4bcdf3eeae7cc4ba19ab38f3198780ca32faec21b25ab87d98",

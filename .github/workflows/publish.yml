@@ -72,7 +72,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: gh release create "$GITHUB_REF_NAME" release/MifBlender-*.zip --draft --title "MifBlender ${GITHUB_REF_NAME#v}" --notes-file release/RELEASE_NOTES.md
-      - uses: pypa/gh-action-pypi-publish@76f52bc884231f62b9a034ebfe128415bbaabdfc  # v1.12.4
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3: Twine 7 reads core metadata 2.5, which hatchling 1.33 writes (v1.12.4 refused it, 2026-11-26)
       - name: Make the release public
         env:
           GH_TOKEN: ${{ github.token }}
