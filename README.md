@@ -1,21 +1,22 @@
 <!-- mcp-name: io.github.mifsopo1/mifblender -->
 <p align="center">
-  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.5.0/assets/crab_hero.jpg" alt="A plated crab walker on a desert stage at sunset, built and rendered in Blender" width="100%">
+  <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/readme/banner.jpg" alt="MifBlender: your AI assistant, working inside a running Blender. Every call checked and read back; every change one undo step. Beside it, a floating island rendered in Blender." width="100%">
 </p>
 
-<h1 align="center">MifBlender</h1>
-
-<p align="center"><b>Your AI assistant, working inside a running Blender.</b><br>
-It checks its own work: every tool validates its input and reads the result back.<br>
-Every change it makes to the scene is one undo step, so Ctrl+Z takes it back.</p>
+<p align="center">
+  <a href="https://pypi.org/project/mifblender-mcp/"><img alt="PyPI version" src="https://img.shields.io/pypi/v/mifblender-mcp?style=flat-square&label=PyPI&labelColor=1a1038&color=7C4DEB"></a>
+  <img alt="Blender 3.6 to 5.2" src="https://img.shields.io/badge/Blender-3.6%20to%205.2-7C4DEB?style=flat-square&labelColor=1a1038">
+  <a href="https://registry.modelcontextprotocol.io/v0/servers?search=io.github.mifsopo1/mifblender"><img alt="Listed on the MCP Registry" src="https://img.shields.io/badge/MCP%20Registry-listed-7C4DEB?style=flat-square&labelColor=1a1038"></a>
+  <img alt="Free" src="https://img.shields.io/badge/price-free-7C4DEB?style=flat-square&labelColor=1a1038">
+</p>
 
 <p align="center">
-  <a href="https://pypi.org/project/mifblender-mcp/"><img alt="PyPI" src="https://img.shields.io/pypi/v/mifblender-mcp"></a>
-  <img alt="Free" src="https://img.shields.io/badge/price-free-brightgreen">
-  <img alt="Blender 3.6 to 5.2" src="https://img.shields.io/badge/Blender-3.6.23%20%C2%B7%204.2.17%20%C2%B7%204.4.0%20%C2%B7%205.0.1%20%C2%B7%205.2.1-orange">
-  <img alt="Windows" src="https://img.shields.io/badge/tested%20on-Windows-blue">
-  <a href="https://glama.ai/mcp/servers/mifsopo1/MifBlender"><img alt="MifBlender MCP server on Glama" src="https://glama.ai/mcp/servers/mifsopo1/MifBlender/badges/score.svg"></a>
-  <a href="https://mcpservers.org/servers/mifsopo1/mifblender"><img alt="Listed on mcpservers.org" src="https://mcpservers.org/badge.svg"></a>
+  <a href="#install"><b>Install</b></a> ·
+  <a href="#connect-your-ai-app"><b>Connect your AI app</b></a> ·
+  <a href="#what-it-does"><b>What it does</b></a> ·
+  <a href="#gallery"><b>Gallery</b></a> ·
+  <a href="#settings-and-safety"><b>Settings and safety</b></a> ·
+  <a href="#license"><b>License</b></a>
 </p>
 
 <p align="center">
@@ -24,7 +25,13 @@ Every change it makes to the scene is one undo step, so Ctrl+Z takes it back.</p
 <p align="center"><sub>One prompt, "Model a cute boxy robot with antenna, round eyes and tank treads, lit for a nice render.":
 39 tool calls in under five minutes, ending in a Cycles render. Shown here as wireframe, clay and final.</sub></p>
 
-## Start in one line
+Free for any use, including commercial work. No account. Everything runs on your computer.
+
+<p align="center"><img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/readme/divider_install.png" alt="01 Install" width="100%"></p>
+
+## Install
+
+### In one line
 
 With [uv](https://docs.astral.sh/uv/) installed and Blender closed:
 
@@ -35,16 +42,90 @@ uvx mifblender-mcp setup
 Or with pip: `pip install mifblender-mcp`, then `mifblender-mcp setup`.
 
 It finds your Blender installs and AI apps, shows what it will do and asks first. Then it installs and enables the add-on,
-and adds MifBlender to the apps you pick. Restart your AI app, open Blender, and ask:
+and adds MifBlender to the apps you pick:
+
+<p align="center"><img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/readme/step_setup.png" alt="A Windows command prompt running uvx mifblender-mcp setup: it lists the Blender install it found, asks which to use, shows the plan (four AI apps and Blender 5.2), asks to continue, then reports the add-on 1.5.0 enabled and verified and each app connected" width="100%"></p>
+
+Restart your AI app, open Blender, and ask:
 
 > Call bl_status, then add a rounded cube with a brushed metal material and render a preview.
 
-Free for any use, including commercial work. No account. Everything runs on your computer.
+Useful setup options: `--dry-run` shows the plan and changes nothing, `--check` reports what is set up, `--upgrade` moves the
+add-on and the apps to this version together, and `--uninstall` removes them. `--no-addon` only connects the AI apps, and
+`--no-clients` only installs the add-on.
+
+### Or: add the add-on by hand
+
+1. Download `MifBlender-1.5.0.zip` from the [latest release](https://github.com/mifsopo1/MifBlender/releases/latest).
+   Leave it zipped.
+2. In Blender: **Edit > Preferences > Add-ons**, open the **⌄** menu at the top right, and pick **Install from Disk...**.
+   Choose the zip.
+
+   <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/readme/step_install_from_disk.png" alt="Blender 5.2 Preferences on the Add-ons page, with the Add-ons Settings menu open and its Install from Disk item" width="640">
+
+3. Tick **MifBlender** if it is not ticked already. Its preferences show the version and the port it listens on.
+
+   <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/readme/step_addon_enabled.png" alt="The MifBlender add-on ticked in Blender's add-on list, version 1.5.0" width="640">
+
+4. In the 3D viewport, press **N** and open the **MifBridge** tab. It says **Listening** with the port.
+
+   <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/readme/step_panel_listening.png" alt="The MifBlender panel in the 3D viewport's sidebar, saying Listening on :8792, with zero calls so far and its health checks all clear" width="480">
+
+5. Connect your AI app: `uvx mifblender-mcp setup --no-addon`, or by hand as below.
 
 **Already have another AI add-on in Blender?** Keep it. MifBlender listens on its own port (8792 by default, changeable),
 so both can be enabled in the same Blender.
 
-## How it checks its work
+<p align="center"><img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/readme/divider_connect.png" alt="02 Connect your AI app" width="100%"></p>
+
+## Connect your AI app
+
+`setup` does this for you. These are the same steps by hand, and how to check each one. A desktop app may not see your
+`PATH`, so `setup` writes uvx's full path; if the app cannot start `uvx`, do the same.
+
+### Claude Code
+
+```
+claude mcp add --scope user mifblender -- uvx mifblender-mcp
+```
+
+The entry holds no token: the server reads it from `~/.mifbridge/blender_token`, which the add-on writes. Check it with
+`claude mcp list`, or `/mcp` inside Claude Code:
+
+<p align="center"><img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/readme/step_claude_code.png" alt="A command prompt running claude mcp list, which shows mifblender as Connected" width="100%"></p>
+
+### Claude Desktop
+
+Add this to `claude_desktop_config.json` (on Windows, `%APPDATA%\Claude\`), then quit Claude Desktop fully and start it
+again:
+
+```json
+{
+  "mcpServers": {
+    "mifblender": { "command": "uvx", "args": ["mifblender-mcp"] }
+  }
+}
+```
+
+### Cursor
+
+Add the same `mifblender` entry to `~/.cursor/mcp.json`. Cursor lists its MCP servers under **Customize**.
+
+### Any other MCP client
+
+`setup` also knows Windsurf, VS Code and Codex. For any other client, start this as a stdio server:
+
+```
+uvx mifblender-mcp
+```
+
+<p align="center"><img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/readme/divider_what.png" alt="03 What it does" width="100%"></p>
+
+## What it does
+
+<p align="center"><img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/readme/cards_stats.png" alt="469 tools, counted from the 1.5.0 package. 5 Blender versions tested, 3.6 to 5.2. 1 undo step for each call that changes the scene. 127.0.0.1, the only address the add-on listens on." width="100%"></p>
+
+<p align="center"><img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/readme/cards_checks.png" alt="How it checks its work: 1, checked before it runs. 2, read back after it runs. 3, one call, one undo step. 4, looks at the result." width="100%"></p>
 
 - **Checked before it runs.** Every typed tool checks its parameters first, and an unknown key or a bad value is refused
   with the reason.
@@ -57,7 +138,22 @@ so both can be enabled in the same Blender.
 - **Look at the result.** Renders and viewport captures come back as images, and `bl_compare_to_reference` scores a
   render against a reference picture.
 
-## See what it can do
+| Area | Examples |
+|---|---|
+| **Modeling** | primitives, mesh editing, bevels, booleans, modular kit pieces, rocks and trees built by rule |
+| **Materials and UVs** | shader node graphs, texture sets, baking, unwrapping |
+| **Rigging and animation** | armatures, Rigify, poses, keyframes, walk cycles |
+| **Simulation** | rigid bodies, cloth, particles, geometry nodes |
+| **Rendering** | lights, cameras, Cycles and EEVEE stills and sequences, compositing |
+| **Checking** | mesh quality reports, comparing a render to a reference image, reading results back |
+
+A lean default sends only `find_tools`, `mif_call` and `run_python` up front and finds the rest on demand, so a long session
+stays small. Set `MIF_TOOL_PACKS=blender` to load all 469 tools, or name the packs you want; there are 14.
+
+<p align="center"><img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/readme/divider_gallery.png" alt="04 Gallery" width="100%"></p>
+
+## Gallery
+
 
 ### Smash Cut: a game's models, from a game jam
 
@@ -238,33 +334,10 @@ Scripted scenes, each built entirely from typed calls:
 |:---:|:---:|
 | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.5.0/assets/props_wear.jpg" alt="A table, crate, chair and barrel, clean and worn"> | <img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/v1.5.0/assets/props_wire.jpg" alt="Five game props in clay and wireframe"> |
 
-## What is in it
 
-| Area | Examples |
-|---|---|
-| **Modeling** | primitives, mesh editing, bevels, booleans, modular kit pieces, rocks and trees built by rule |
-| **Materials and UVs** | shader node graphs, texture sets, baking, unwrapping |
-| **Rigging and animation** | armatures, Rigify, poses, keyframes, walk cycles |
-| **Simulation** | rigid bodies, cloth, particles, geometry nodes |
-| **Rendering** | lights, cameras, Cycles and EEVEE stills and sequences, compositing |
-| **Checking** | mesh quality reports, comparing a render to a reference image, reading results back |
+<p align="center"><img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/readme/divider_settings.png" alt="05 Settings and safety" width="100%"></p>
 
-A lean default sends only `find_tools`, `mif_call` and `run_python` up front and finds the rest on demand, so a long session
-stays small. Set `MIF_TOOL_PACKS=blender` to load all 469 tools, or name the packs you want; there are 14.
-
-## AI apps
-
-`setup` knows Claude Code, Claude Desktop, Cursor, Windsurf, VS Code and Codex. For any other MCP client, start this as a stdio
-server:
-
-```
-uvx mifblender-mcp
-```
-
-Useful setup options: `--dry-run` shows the plan and changes nothing, `--check` reports what is set up, `--upgrade` moves the
-add-on and the apps to this version together, and `--uninstall` removes them. If several Blenders are found, it asks which.
-
-## Settings
+## Settings and safety
 
 Set these in the client's `env` block when you need them:
 
@@ -275,8 +348,6 @@ Set these in the client's `env` block when you need them:
 | `MIF_TOOL_PACKS` | `lean` | `lean`, `blender`, or a list of packs |
 | `MIF_BLENDER_TIMEOUT` | `180` | seconds one call may take |
 
-## Safety
-
 - Everything stays on your computer. The add-on listens on `127.0.0.1` only, and `setup` generates a private token that links
   it to your AI apps. Neither makes any network call of its own.
 - **`run_python` is on by default and runs any Python inside Blender.** Untick **Allow run_python** in the add-on's preferences
@@ -284,9 +355,10 @@ Set these in the client's `env` block when you need them:
 - The `bl_gen_*` tools are generative: they send a prompt to a ComfyUI you run yourself, and do nothing without one. Every other
   tool builds from explicit parameters. Set `MIF_GENERATIVE=off`, or untick **Allow generative tools**, to switch them off.
 
-## Tested on
+**Tested on** Blender 3.6.23, 4.2.17, 4.4.0, 5.0.1 and 5.2.1, on Windows. macOS and Linux have not been tested yet; reports
+are welcome.
 
-Blender 3.6.23, 4.2.17, 4.4.0, 5.0.1 and 5.2.1, on Windows. macOS and Linux have not been tested yet; reports are welcome.
+<p align="center"><img src="https://raw.githubusercontent.com/mifsopo1/MifBlender/main/assets/readme/divider_license.png" alt="06 License" width="100%"></p>
 
 ## License
 
@@ -294,9 +366,14 @@ Blender 3.6.23, 4.2.17, 4.4.0, 5.0.1 and 5.2.1, on Windows. macOS and Linux have
 unchanged through the channels its license names; you may not sell it or publish changed copies. It is not an open source
 license. See [LICENSE.txt](LICENSE.txt). Some comments cite internal documents that are not published.
 
-## MifBridge
+### MifBridge
 
 MifBlender is the Blender half of [MifBridge](https://mifshowcase.store/mifbridge), a paid product that adds Unreal Engine 5.3 to
 5.8 and the tools that move models between the two. MifBlender stands on its own and needs neither.
 
 Questions and bug reports: [open an issue](https://github.com/mifsopo1/MifBlender/issues).
+
+<p align="center"><sub>Also listed on</sub><br>
+  <a href="https://glama.ai/mcp/servers/mifsopo1/MifBlender"><img alt="MifBlender MCP server on Glama" src="https://glama.ai/mcp/servers/mifsopo1/MifBlender/badges/score.svg"></a>
+  <a href="https://mcpservers.org/servers/mifsopo1/mifblender"><img alt="Listed on mcpservers.org" src="https://mcpservers.org/badge.svg"></a>
+</p>
