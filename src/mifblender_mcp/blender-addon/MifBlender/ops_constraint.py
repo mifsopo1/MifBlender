@@ -113,6 +113,24 @@ def _constraint_fields(c, tgt):
 # and a false failure is worse than a false pass because it teaches the reader to ignore the field.
 _TARGET_OPTIONAL = ("PIVOT",)
 
+# THE KIND OF OBJECT A TYPE'S TARGET MUST BE, for the types that read is_valid False with any other kind. Measured
+# 2026-11-26 on 3.6.23, 4.2.17, 4.4.0, 5.0.1 and 5.2.1, every target-taking type against a MESH, CURVE, EMPTY,
+# ARMATURE, LATTICE and CAMERA target: these three are invalid with every kind but a curve, and Blender takes the wrong
+# one with no exception, so add_constraint answered ok over a constraint that does nothing. Every other type there is
+# valid with all six kinds except ACTION.
+_TARGET_KIND = {"FOLLOW_PATH": "CURVE", "CLAMP_TO": "CURVE", "SPLINE_IK": "CURVE"}
+
+# THE TYPES is_valid CANNOT SEE (FOUND 2026-11-26): a Shrinkwrap projects onto a mesh's surface and reads nothing from
+# any other kind, yet it reads is_valid True with an empty, curve, armature, lattice or camera target on 3.6.23, 4.2.17,
+# 4.4.0, 5.0.1 and 5.2.1 - with an empty at [3, 0, 0] the owner evaluated at the world origin. So the kind is read off
+# the target itself, before the is_valid check.
+_TARGET_KIND_UNSEEN = {"SHRINKWRAP": "MESH"}
+
+# ACTION reads is_valid False with EVERY target kind, with an empty action set too (same five builds): its validity is
+# the action datablock's, which add_constraint does not set (set_constraint does). Refusing it here would make an
+# Action constraint impossible to add with a target, so it keeps the old answer, isValid false in its row.
+_INVALID_UNTIL_SET = {"ACTION": "an action (set it with set_constraint)"}
+
 
 def _target_missing(c):
     """True when this constraint NEEDS a target and has none."""
@@ -342,7 +360,10 @@ def op_add_constraint(params):
                                CHILD_OF | LIMIT_LOCATION | DAMPED_TRACK | IK | ... validated
                                against this Blender's own enum
       bone (str)               put it on this pose bone instead of the object
-      target (str)             the object it follows
+      target (str)             the object it follows. One that leaves the constraint invalid is refused and the
+                               constraint removed, naming the kind the type needs (FOLLOW_PATH, CLAMP_TO and
+                               SPLINE_IK need a CURVE, SHRINKWRAP a MESH - read off the target, since its
+                               is_valid stays true); ACTION is exempt, its validity is the action's
       subtarget (str)          a bone on an ARMATURE target, or a vertex group on a MESH or LATTICE target -
                                checked against the target and refused naming what it has
       influence (float)        0..1, default 1
@@ -443,6 +464,23 @@ def op_add_constraint(params):
         con.target = target
         if sub:
             con.subtarget = str(sub)
+        unseen = _TARGET_KIND_UNSEEN.get(kind)
+        if unseen and target.type != unseen:
+            holder.constraints.remove(con)
+            raise MifOpError("a %s constraint needs a %s target, and '%s' is a %s - Blender stores it and the "
+                             "constraint reads VALID with nothing to project onto (an empty target leaves the owner at "
+                             "the world origin). NOTHING was added." % (kind, unseen, target.name, target.type))
+        # A TARGET THAT LEAVES THE CONSTRAINT INVALID IS REFUSED (2026-11-26). Blender takes a mesh as a Follow Path
+        # target with no exception and the constraint reads is_valid False and does nothing; this answered ok with
+        # isValid false in its row. add_modifier refuses the same mistake for a CURVE modifier. Read right after the
+        # target is set, so a target-less constraint (invalid until one is given) keeps today's answer.
+        if not bool(getattr(con, "is_valid", True)) and kind not in _INVALID_UNTIL_SET:
+            holder.constraints.remove(con)
+            need = _TARGET_KIND.get(kind)
+            raise MifOpError("a %s constraint %s, and '%s' is a %s - Blender stores it and the constraint reads "
+                             "invalid and does nothing. NOTHING was added."
+                             % (kind, ("needs a %s target" % need) if need else "reads invalid with this target",
+                                target.name, target.type))
     if influence is not None:
         con.influence = influence
 

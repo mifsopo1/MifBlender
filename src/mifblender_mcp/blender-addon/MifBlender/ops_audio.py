@@ -600,7 +600,7 @@ def _add_speaker(sc, snd, made_sound, frame, length_frames, name, location, valu
     obj = bpy.data.objects[made[0]]
     spk = obj.data
     if name:
-        # THROUGH assign_id_name, because 3.6 displaces an incumbent instead of suffixing the new block (ledger B12).
+        # THROUGH assign_id_name, because 3.6 displaces an incumbent instead of suffixing the new block.
         assign_id_name(obj, name, bpy.data.objects)
     assign_id_name(spk, obj.name, bpy.data.speakers)
     spk.sound = snd

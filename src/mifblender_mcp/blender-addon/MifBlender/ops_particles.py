@@ -135,7 +135,7 @@ def _apply_particle_settings(obj, psys, params, kind):
     if kind == "HAIR" and render_type and str(render_type).upper() not in _HAIR_RENDER_TYPES:
         raise MifOpError("renderType '%s' is not available on a HAIR system - HAIR takes %s, and HALO and LINE are "
                          "EMITTER-only. NOTHING was created." % (str(render_type).upper(), ", ".join(_HAIR_RENDER_TYPES)))
-    # GRID IS EMITTER-ONLY. First measured on 4.4.0 (ledger B17) - the same system accepts GRID as an EMITTER and
+    # GRID IS EMITTER-ONLY. First measured on 4.4.0 - the same system accepts GRID as an EMITTER and
     # refuses it as HAIR with ('JIT', 'RAND'), independent of emitFrom and physicsType - and on all five builds since.
     if kind == "HAIR" and dist and str(dist).upper() == "GRID":
         raise MifOpError("distribution 'GRID' is not available on a HAIR system - GRID is EMITTER-only, so a HAIR system "
@@ -610,7 +610,7 @@ def _set_child_count(st, n):
 # A HAIR system comes up as PATH on every build, so the default is only a trap on an emitter.
 #
 # ONE PREDICATE for renderNote and list_particles' rendersNothing. The listing had its own copy, and it had already
-# drifted twice: OBJECT only until 2026-09-14 (ledger B16), then OBJECT and COLLECTION with NONE and HALO still false.
+# drifted twice: OBJECT only until 2026-09-14, then OBJECT and COLLECTION with NONE and HALO still false.
 def _blank_render_reason(st):
     """Why this system renders nothing, as a sentence - or None when it draws something."""
     rt = st.render_type

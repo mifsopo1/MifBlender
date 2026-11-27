@@ -1,4 +1,4 @@
-"""Blender add-on extensions: ops a SEPARATE add-on registers into MifBlender's dispatcher (docs/32_EXTENSIONS.md section 8).
+"""Blender add-on extensions: ops a SEPARATE add-on registers into MifBlender's dispatcher.
 
 The Blender half of the extension API. An extension's server tools already reach every built-in op through api.blender;
 a NEW op needs code inside Blender. Instead of forking MifBlender, a separate add-on registers its ops here, and they
@@ -33,7 +33,7 @@ mifext.py uses ([a-z][a-z0-9]{1,15}_, not bl_ mif_ kr_ ue_ ext_), an op whose na
 or another provider's, a non-callable fn, a key named twice or reserved (readBack, op, previewId, dryRun), a required or
 capKey that is not an accepted key, an unknown undo class, an unknown descriptor key.
 
-NO bpy HERE: the module is pure so tools/test_wave3_w4e.py can drive it offline; the dispatcher integration is in
+NO bpy HERE: the module is pure so a dev test can drive it offline; the dispatcher integration is in
 server.py (_op_table), cap.py (targets_of / gate), ops_undo.py (read ops push no step) and ops_describe.py.
 """
 import re
@@ -45,7 +45,8 @@ SUPPORTED = (1,)                    # every version it accepts; a new one ADDS t
 UNDO_CLASSES = ("step", "read", "external")
 DESC_KEYS = ("name", "fn", "keys", "required", "capKeys", "undo", "summary")
 RESERVED_KEYS = ("readBack", "op", "previewId", "dryRun")
-RESERVED_PREFIXES = ("bl_", "mif_", "kr_", "ue_", "ext_")
+# The same list as mcp-server/mifext.py RESERVED_PREFIXES; tools/test_wave3_w4e.py W4E-BX1 fails when they differ.
+RESERVED_PREFIXES = ("bl_", "mif_", "kr_", "ue_", "ext_", "vfx_")
 _PREFIX = re.compile(r"^[a-z][a-z0-9]{1,15}_$")
 _NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 _PROVIDER = re.compile(r"^[A-Za-z][A-Za-z0-9_]{1,63}$")

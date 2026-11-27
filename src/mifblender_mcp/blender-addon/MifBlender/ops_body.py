@@ -133,7 +133,7 @@ PRESETS = {
 }
 
 _KEYS = ("armature", "bones", "preset", "height", "torso", "arms", "legs", "fingerCurl", "subdivisions", "gameReady",
-         "createArmature", "bind", "material", "name", "collection", "takeOverName")
+         "createArmature", "bind", "material", "name", "collection", "takeOverName", "memoryBudgetGB")
 _ROLES = ("upperarm", "lowerarm", "hand", "thigh", "calf", "foot")
 _ROLE_BASES = {
     "upperarm": ("upperarm", "upper_arm", "arm", "uparm"), "lowerarm": ("lowerarm", "lower_arm", "forearm"),
@@ -269,6 +269,8 @@ def _parse(params):
     bind = take_bool(params, "bind", default=False)
     if bind and arm is None and not create_arm:
         raise MifOpError("bind skins the body to its skeleton - pass armature, or createArmature true. %s" % TAIL)
+    if params.get("memoryBudgetGB") is not None and not bind:
+        raise MifOpError("memoryBudgetGB bounds the bind's heat weighting - it goes with bind true. %s" % TAIL)
     bones = params.get("bones")
     if bones is not None and arm is None:
         raise MifOpError("bones maps roles to the bones of an armature - pass armature too. %s" % TAIL)
@@ -1287,8 +1289,27 @@ def op_build_body(params):
     bound = None
     if opts["bind"] and target_arm is not None:
         from .ops_create import op_set_parent   # noqa: PLC0415
-        r = op_set_parent({"object": obj.name, "parent": target_arm.name, "type": "ARMATURE_AUTO",
-                           "fallback": "NEAREST"})
+        sp = {"object": obj.name, "parent": target_arm.name, "type": "ARMATURE_AUTO", "fallback": "NEAREST"}
+        if params.get("memoryBudgetGB") is not None:
+            sp["memoryBudgetGB"] = params["memoryBudgetGB"]
+        try:
+            r = op_set_parent(sp)
+        except MifOpError as exc:
+            # A REFUSED BIND ROLLS THE BUILD BACK (found 2026-11-18): it said "NOTHING was changed" with Body and its
+            # skeleton already in the scene. What this call made goes again - the body, and the armature when it made
+            # one - so the refusal is true; an armature the caller passed is theirs and stays.
+            from .ops_common import remove_objects   # noqa: PLC0415
+            made_names = [obj.name] + ([rig["name"]] if rig else [])
+            datas = [obj.data] + ([bpy.data.objects[rig["name"]].data] if rig and rig["name"] in bpy.data.objects else [])
+            remove_objects([o for o in (bpy.data.objects.get(n) for n in made_names) if o is not None])
+            for d in datas:
+                try:
+                    if d.users == 0:
+                        (bpy.data.meshes if isinstance(d, bpy.types.Mesh) else bpy.data.armatures).remove(d)
+                except ReferenceError:
+                    pass
+            raise MifOpError("%s The bind was refused, so what this call made - %s - was removed again; NOTHING is "
+                             "left of it." % (str(exc).replace(" NOTHING was changed.", ""), ", ".join(made_names)))
         bone_names = {b.name for b in target_arm.data.bones if b.use_deform}
         unweighted = sum(1 for v in obj.data.vertices
                          if not any(ge.weight > 0 and obj.vertex_groups[ge.group].name in bone_names for ge in v.groups))

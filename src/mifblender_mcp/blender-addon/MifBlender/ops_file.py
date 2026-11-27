@@ -28,7 +28,8 @@ import os
 import bpy
 
 from . import ops_undo
-from .ops_common import (remove_objects, MifOpError, check_output_path, reject_unknown, take, take_bool, take_int)
+from .ops_common import (remove_objects, MifOpError, check_output_path, finite_float, reject_unknown, take, take_bool,
+                         take_int)
 
 # The ID collections a save can purge. Not every bpy.data collection - only the ones that carry
 # authored work somebody would miss, which is the same judgement clear_scene's purge list makes.
@@ -501,6 +502,9 @@ def op_save_file(params):
       repointSession (bool)      default False. When false the session keeps its current filepath
                                  and this is a save-a-copy; when true, subsequent saves go here.
       compress (bool)            default False, Blender's own default.
+      keepUnused (bool|list)     default False. true gives every datablock with no users a fake user before the write,
+                                 so the file keeps it (a material made and not yet assigned); a list of type names
+                                 ("materials", "images", ...) limits it to those. keptUnused names each one.
 
     REFUSES BEFORE WRITING in every case, so a rejected call leaves the disk untouched.
 
@@ -508,8 +512,17 @@ def op_save_file(params):
     disk, naming the missing ones and the ones at absolute paths; externalFilesWarning says so when there are any (the
     file opens elsewhere with them missing) and names manage_external_data.
     """
-    reject_unknown(params, {"filepath", "path", "overwrite", "repointSession", "compress"},
+    reject_unknown(params, {"filepath", "path", "overwrite", "repointSession", "compress", "keepUnused"},
                    "save_file")
+    keep = params.get("keepUnused")
+    if isinstance(keep, list):
+        bad = [k for k in keep if not isinstance(k, str) or k not in _PURGEABLE]
+        if not keep or bad:
+            raise MifOpError("keepUnused takes true or a list of datablock types (%s), got %r. NOTHING was saved."
+                             % (", ".join(_PURGEABLE), keep))
+        keep_types = list(keep)
+    else:
+        keep_types = list(_PURGEABLE) if take_bool(params, "keepUnused", default=False) else []
     raw_path = take(params, "filepath", "path", default=None, kind=str)
     if not raw_path:
         raise MifOpError("'filepath' is required - where to write the .blend. NOTHING was saved.")
@@ -536,6 +549,18 @@ def op_save_file(params):
             raise MifOpError("cannot create the directory %s: %s. NOTHING was saved."
                              % (parent, exc))
 
+    # KEPT FIRST, WHEN ASKED (FOUND 2026-11-18): two materials made and not yet assigned were not in the saved file,
+    # and the live session still held them, so the next create_material of the same name got .001. A fake user is
+    # what keeps a datablock with no users in a .blend.
+    kept = {}
+    for coll_name in keep_types:
+        for db in getattr(bpy.data, coll_name, None) or ():
+            try:
+                if db.users == 0 and not db.use_fake_user:
+                    db.use_fake_user = True
+                    kept.setdefault(coll_name, []).append(db.name)
+            except AttributeError:
+                continue
     # COUNTED BEFORE THE WRITE, because afterwards they are gone and uncountable. See _orphans.
     orphans, orphan_total = _orphans()
     dirty_before = _is_dirty()
@@ -585,7 +610,20 @@ def op_save_file(params):
         ext_warning = ("%s - on another machine this file opens with them missing. manage_external_data PACK_ALL "
                        "packs them, MAKE_RELATIVE makes them relative to the .blend, FIND_MISSING looks for the missing "
                        "ones." % "; ".join(parts))
+    # THE ONES A CALLER MADE AND MEANT TO KEEP: a material, image, node group, action or world with no users is most
+    # often work in progress, and purgedOrphansByType alone read as a footnote. Named in a warning, with the way to
+    # keep them and why the live session's next create of the same name is suffixed.
+    unused = {k: v for k, v in orphans.items() if k in ("materials", "images", "node_groups", "actions", "worlds",
+                                                         "textures")}
+    unused_warning = None
+    if unused:
+        unused_warning = ("not in the saved file - no users, no fake user: %s. This session still holds them, so a "
+                          "create of the same name here is suffixed .001 (create_material reuse true returns the "
+                          "existing one). Assign them, or save again with keepUnused true to keep them."
+                          % "; ".join("%s %s" % (k, ", ".join(v[:10])) for k, v in sorted(unused.items())))
     return {
+        "notWrittenWarning": unused_warning,
+        "keptUnused": {k: sorted(v) for k, v in kept.items()} or None,
         "externalFiles": external,
         "externalFilesWarning": ext_warning,
         "filepath": path,
@@ -662,11 +700,22 @@ def op_open_file(params):
       filepath (str, required)
       discardUnsaved (bool)   required to be true when the current session is DIRTY. Without it an
                               open over unsaved work is refused, because there is no undo for it.
+      runScripts (bool)       default false: the file's scripts and Python drivers do not run, whatever the
+                              Auto Run Python Scripts preference says; true needs Allow run_python. The reply's
+                              scriptsRun says which was used.
 
     DESTRUCTIVE AND UNRECOVERABLE. Everything in the current session is gone - this is the one op
     here that can lose work that was never on disk, which is why the dirty check is not optional.
     """
-    reject_unknown(params, {"filepath", "path", "discardUnsaved"}, "open_file")
+    reject_unknown(params, {"filepath", "path", "discardUnsaved", "runScripts"}, "open_file")
+    # THE FILE'S SCRIPTS STAY OFF UNLESS ASKED (FOUND 2026-11-22). open_mainfile was called without use_scripts, so a
+    # .blend the caller named ran its registered text blocks and Python drivers whenever the user's Auto Run Python
+    # Scripts preference was on - code from the file, with Allow run_python off. runScripts true asks for them, behind
+    # that gate; the reply says which was used.
+    run_scripts = take_bool(params, "runScripts", default=False)
+    if run_scripts:
+        from .ops_scene import _require_run_python_gate   # noqa: PLC0415
+        _require_run_python_gate("open_file with runScripts")
     path = take(params, "filepath", "path", default=None, kind=str)
     if not path:
         raise MifOpError("'filepath' is required. NOTHING was opened.")
@@ -713,7 +762,7 @@ def op_open_file(params):
             % (len(ties), "; ".join("%s %s (poll %s)" % (t["kind"], t["jobId"], t["poll"]) for t in ties), path))
 
     try:
-        bpy.ops.wm.open_mainfile(filepath=path)
+        bpy.ops.wm.open_mainfile(filepath=path, use_scripts=run_scripts)
     except (RuntimeError, OSError) as exc:
         raise MifOpError("Blender could not open '%s': %s. The previous session may or may not "
                          "still be loaded - call file_info to find out." % (path, exc))
@@ -733,6 +782,7 @@ def op_open_file(params):
     return {
         "filepath": now,
         "opened": True,
+        "scriptsRun": run_scripts,
         "jobsStillRunning": file_jobs or None,
         "jobsNote": ("%d out-of-process job(s) keep running across the load and write only their own files; poll them "
                      "as before." % len(file_jobs)) if file_jobs else None,
@@ -904,7 +954,7 @@ def op_purge_orphans(params):
     `only` SCOPES IT (2026-09-20): a list of "type:name" entries takes exactly those orphans and leaves
     every other one - see _purge_named. Still unlink-then-purge: a named datablock with users is refused.
 
-    dryRun:true IS THE BULK PREVIEW (docs/15 section 5, 2026-10-09): every data-block the purge would take, with its users
+    dryRun:true IS THE BULK PREVIEW: every data-block the purge would take, with its users
     and fake user before, and a previewId - no confirm needed to look. {previewId} alone commits it and stands in for
     confirm:true: it is planned again, refused on any difference, and takes EXACTLY the previewed data-blocks (as
     `only`), never one the preview did not list. A recursive purge cannot be previewed - its later passes take what the
@@ -963,7 +1013,7 @@ def op_purge_orphans(params):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# THE BULK PREVIEW of purge_orphans (ops_preview.py; docs/15 section 5). One change per data-block, "type:name", deleted; the
+# THE BULK PREVIEW of purge_orphans. One change per data-block, "type:name", deleted; the
 # commit purges exactly those through `only`, so a data-block that became an orphan after the preview is not taken.
 # ---------------------------------------------------------------------------------------------------------------------
 _PURGE_NO_ROLLBACK = "a purged data-block is freed, and no inverse brings it back"
@@ -1727,6 +1777,319 @@ def _override_maintain(action, target, root, hier):
 PREVIEW = {"purge_orphans": {"plan": _plan_purge_orphans, "read": _read_purge_orphans, "capture": None,
                              "restore": None, "noRollback": _PURGE_NO_ROLLBACK}}
 
+# ------------------------------------------------------------------------------------------------------ open_for_review
+# FOUND 2026-11-19: a GUI hand-over showed an empty view three times. A 3D view's clip end belongs to its
+# SCREEN, and right after a startup script sets window.workspace, window.screen still answers the previous workspace's
+# screen inside the same timer call - so the clip end was set on the Layout screen and the Animation workspace the
+# person saw kept the default 1,000, and a creature larger than that vanished as they zoomed out to find it. What
+# worked: clip start and end from the scene's size on every VIEW_3D space of every screen, the view framed in a LATER
+# timer, the clip and frame set, then a capture of Blender's own window, looked at before saying it is ready.
+
+_REVIEW_SCRIPT = r"""
+import json, math, os, time
+import bpy
+P = json.loads(%r)
+
+
+def _status(d):
+    d["pid"] = os.getpid()
+    tmp = P["status"] + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(d, fh)
+    os.replace(tmp, P["status"])
+
+
+def _fail(msg):
+    _status({"ready": False, "error": msg})
+
+
+def _bounds(scene):
+    from mathutils import Vector
+    dg = bpy.context.evaluated_depsgraph_get()
+    pts = []
+    for ob in scene.objects:
+        if ob.type not in ("MESH", "CURVE", "SURFACE", "META", "FONT", "ARMATURE", "CURVES", "POINTCLOUD", "VOLUME",
+                           "GPENCIL", "GREASEPENCIL"):
+            continue
+        if not ob.visible_get():
+            continue
+        ev = ob.evaluated_get(dg)
+        pts += [ev.matrix_world @ Vector(c) for c in ev.bound_box]
+    if not pts:
+        return None
+    lo = Vector([min(p[i] for p in pts) for i in range(3)])
+    hi = Vector([max(p[i] for p in pts) for i in range(3)])
+    return (lo + hi) / 2, max((hi - lo).length / 2, 1e-4), [list(lo), list(hi)]
+
+
+def _views(screen):
+    for area in screen.areas:
+        if area.type == "VIEW_3D":
+            space = area.spaces.active
+            region = next((r for r in area.regions if r.type == "WINDOW"), None)
+            yield area, space, region
+
+
+def step1():
+    try:
+        win = bpy.context.window_manager.windows[0]
+        if P["workspace"]:
+            ws = bpy.data.workspaces.get(P["workspace"])
+            if ws is None:
+                _fail("the file has no workspace '%%s' (it has: %%s)" %% (P["workspace"], ", ".join(w.name for w in bpy.data.workspaces)))
+                return None
+            win.workspace = ws
+        scene = win.scene
+        if P["object"]:
+            ob = scene.objects.get(P["object"])
+            if ob is None:
+                _fail("the scene has no object '%%s'" %% P["object"])
+                return None
+            if P["action"]:
+                act = bpy.data.actions.get(P["action"])
+                if act is None:
+                    _fail("the file has no action '%%s'" %% P["action"])
+                    return None
+                ad = ob.animation_data or ob.animation_data_create()
+                ad.action = act
+                if "action_slot" in ad.bl_rna.properties and ad.action_slot is None:
+                    slot = next((s for s in act.slots if s.target_id_type == "OBJECT"), None)
+                    if slot is not None:
+                        ad.action_slot = slot
+                if P["frameRange"] is None:
+                    scene.frame_start, scene.frame_end = (int(round(v)) for v in act.frame_range)
+        if P["frameRange"] is not None:
+            scene.frame_start, scene.frame_end = P["frameRange"]
+        if P["frame"] is not None:
+            scene.frame_set(P["frame"])
+        b = _bounds(scene)
+        if b is None:
+            _fail("nothing visible in scene '%%s' to frame" %% scene.name)
+            return None
+        center, radius, box = b
+        end = max(radius * P["clipEndRadii"], 1.0)
+        start = max(end / P["clipRatio"], 1e-5)
+        n = 0
+        # EVERY VIEW_3D OF EVERY SCREEN: window.screen still answers the previous workspace's screen here (B383)
+        for screen in bpy.data.screens:
+            for area, space, _region in _views(screen):
+                space.clip_start, space.clip_end = start, end
+                n += 1
+        P["_state"] = {"radius": radius, "center": list(center), "box": box, "clipStart": start, "clipEnd": end,
+                       "viewsSet": n, "scene": scene.name, "frame": scene.frame_current,
+                       "frameRange": [scene.frame_start, scene.frame_end]}
+        bpy.app.timers.register(step2, first_interval=P["settle"])
+    except Exception as exc:
+        _fail("setup failed: %%r" %% exc)
+    return None
+
+
+def step2():
+    try:
+        win = bpy.context.window_manager.windows[0]
+        rows = []
+        for area, space, region in _views(win.screen):
+            r3d = space.region_3d
+            if r3d.view_perspective == "CAMERA" and win.scene.camera is None:
+                r3d.view_perspective = "PERSP"
+            if r3d.view_perspective != "CAMERA" and region is not None:
+                with bpy.context.temp_override(window=win, screen=win.screen, area=area, region=region):
+                    bpy.ops.view3d.view_all(center=False)
+            rows.append(area)
+        P["_areas"] = len(rows)
+        bpy.app.timers.register(step3, first_interval=P["settle"])
+    except Exception as exc:
+        _fail("framing failed: %%r" %% exc)
+    return None
+
+
+def step3():
+    try:
+        win = bpy.context.window_manager.windows[0]
+        with bpy.context.temp_override(window=win, screen=win.screen):
+            bpy.ops.screen.screenshot(filepath=P["capture"])
+        import numpy as np
+        img = bpy.data.images.load(P["capture"], check_existing=False)
+        w, h = img.size
+        px = np.empty(w * h * 4, dtype=np.float32)
+        img.pixels.foreach_get(px)
+        bpy.data.images.remove(img)
+        st = P["_state"]
+        views = []
+        for area, space, region in _views(win.screen):
+            r3d = space.region_3d
+            # the area's pixels in the capture (bottom-left origin, as both the window and the image count)
+            x0, y0 = max(0, area.x), max(0, area.y)
+            x1, y1 = min(w, area.x + area.width), min(h, area.y + area.height)
+            counts, total, cells = {}, 0, []
+            step = max(1, int(((x1 - x0) * (y1 - y0) / 40000.0) ** 0.5))
+            for y in range(y0 + 30, y1 - 30, step):
+                for x in range(x0 + 30, x1 - 30, step):
+                    i = (y * w + x) * 4
+                    c = (round(px[i] * 20), round(px[i + 1] * 20), round(px[i + 2] * 20))
+                    counts[c] = counts.get(c, 0) + 1
+                    cells.append(c)
+                    total += 1
+            bg = max(counts, key=counts.get) if counts else None
+            other = sum(1 for c in cells if max(abs(c[k] - bg[k]) for k in range(3)) > 1) if bg else 0
+            dist = r3d.view_distance
+            views.append({"screen": win.screen.name, "area": [area.x, area.y, area.width, area.height],
+                          "perspective": r3d.view_perspective, "viewDistance": round(dist, 4),
+                          "clipStart": space.clip_start, "clipEnd": space.clip_end,
+                          "unclipped": (r3d.view_perspective == "CAMERA") or (dist + st["radius"] < space.clip_end),
+                          "nonBackgroundPercent": round(100.0 * other / total, 3) if total else 0.0,
+                          "pixelsSampled": total})
+        st.update(ready=True, capture=P["capture"], views=views, workspace=win.workspace.name, screen=win.screen.name,
+                  windowSize=[w, h], blendFile=bpy.data.filepath, blender=bpy.app.version_string)
+        _status(st)
+    except Exception as exc:
+        _fail("capture failed: %%r" %% exc)
+    return None
+
+
+bpy.app.timers.register(step1, first_interval=P["settle"])
+"""
+
+_OFR_KEYS = ("filepath", "blender", "workspace", "object", "action", "frame", "frameRange", "capture", "timeout",
+             "factoryStartup", "clipEndRadii", "clipRatio", "minVisiblePercent", "settle")
+
+
+def op_open_for_review(params):
+    """Open a .blend in a new GUI Blender for a person to review: every 3D view's clip from the scene's size, the view
+    framed, an action and frame set - and Blender's own window captured and checked before it is called ready.
+
+    params:
+      filepath (str)            the .blend (required)
+      blender (str)             the Blender to open it in (default this one, bpy.app.binary_path)
+      workspace (str)           a workspace to show (e.g. Animation; default the file's own)
+      object, action (str)      assign action to object first (the action's range becomes the scene's unless frameRange)
+      frame (int), frameRange [s, e]   the frame shown and the scene's range
+      capture (str)             where the window capture is written (default a PNG beside the status file in temp)
+      timeout (float)           seconds to wait for the window to be ready (default 120)
+      factoryStartup (bool)     open with factory settings and no add-ons (default false: the person's own Blender)
+      clipEndRadii (float)      clip end = the scene's bounding radius x this (default 50, at least 1.0)
+      clipRatio (float)         clip start = clip end / this (default 100000)
+      minVisiblePercent (float) a 3D view showing fewer pixels off its background colour than this is called empty
+                                (default 0.5)
+      settle (float)            seconds between the timer steps (default 1.0)
+    THE STEPS, in the new Blender's timers: (1) set the workspace, action, range and frame, then clip start
+    and end on every VIEW_3D of EVERY screen - window.screen still answers the previous workspace's screen in that call;
+    (2) in a later timer, frame every 3D view of the window's screen on everything visible (view_all; a camera view
+    with no scene camera is set to perspective first, one with a camera is left on it); (3) capture the window with
+    screen.screenshot and measure each 3D view's share of pixels off its most common colour.
+    Reply: pid (the new Blender, left open for the person - close it by PID), capture, views [{screen, area,
+    perspective, viewDistance, clipStart, clipEnd, unclipped, nonBackgroundPercent}], workspace, frame, frameRange,
+    radius, box. REFUSED (the window left open, its PID named, to be looked at or closed): a view that shows nothing or
+    is clipped, a status that never came within timeout (that Blender is ended by PID).
+    """
+    import json        # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+    import tempfile    # noqa: PLC0415
+    import time        # noqa: PLC0415
+    from . import childproc   # noqa: PLC0415
+    reject_unknown(params, _OFR_KEYS, "open_for_review")
+    tail = "No Blender was started."
+    path = take(params, "filepath", required=True, kind=str)
+    path = os.path.abspath(bpy.path.abspath(path))
+    if not os.path.isfile(path) or not path.lower().endswith(".blend"):
+        raise MifOpError("filepath: no .blend at %s. %s" % (path, tail))
+    exe = take(params, "blender", default=None, kind=str) or bpy.app.binary_path
+    if not exe or not os.path.isfile(exe):
+        raise MifOpError("blender: no executable at %r. %s" % (exe, tail))
+    # ONLY A BLENDER, AND ANOTHER ONE ONLY BEHIND THE GATE (FOUND 2026-11-22): any existing file named here was started,
+    # with the user's privileges, while Allow run_python was off - a route to running a program that the switch did not
+    # close. The name must be Blender's, and a binary other than this Blender's own needs run_python allowed.
+    if os.path.basename(exe).lower() not in ("blender", "blender.exe", "blender-launcher.exe"):
+        raise MifOpError("blender: %r is not a Blender executable (blender or blender.exe). %s" % (exe, tail))
+    if os.path.normcase(os.path.abspath(exe)) != os.path.normcase(os.path.abspath(bpy.app.binary_path or "")):
+        from .ops_scene import _require_run_python_gate   # noqa: PLC0415
+        _require_run_python_gate("open_for_review with another Blender (blender: %s)" % exe)
+    fr = params.get("frameRange")
+    if fr is not None and (not isinstance(fr, list) or len(fr) != 2
+                           or any(isinstance(v, bool) or not isinstance(v, int) for v in fr) or fr[1] < fr[0]):
+        raise MifOpError("frameRange is [start, end] whole frames, got %r. %s" % (fr, tail))
+    frame = params.get("frame")
+    if frame is not None and (isinstance(frame, bool) or not isinstance(frame, int)):
+        raise MifOpError("frame is a whole frame, got %r. %s" % (frame, tail))
+    obj_name = take(params, "object", default=None, kind=str)
+    action = take(params, "action", default=None, kind=str)
+    if action is not None and obj_name is None:
+        raise MifOpError("action needs object - the one it is assigned to. %s" % tail)
+    timeout = finite_float(params.get("timeout", 120.0), "timeout")
+    radii = finite_float(params.get("clipEndRadii", 50.0), "clipEndRadii")
+    ratio = finite_float(params.get("clipRatio", 100000.0), "clipRatio")
+    min_vis = finite_float(params.get("minVisiblePercent", 0.5), "minVisiblePercent")
+    settle = finite_float(params.get("settle", 1.0), "settle")
+    if not (timeout > 0 and radii >= 1.0 and ratio > 1.0 and 0.0 <= min_vis < 100.0 and 0.1 <= settle <= 30.0):
+        raise MifOpError("timeout > 0, clipEndRadii >= 1, clipRatio > 1, minVisiblePercent 0-100, settle 0.1-30. %s"
+                         % tail)
+    work = tempfile.mkdtemp(prefix="mif_review_")
+    status = os.path.join(work, "status.json")
+    capture = take(params, "capture", default=None, kind=str) or os.path.join(work, "review_capture.png")
+    capture = os.path.abspath(capture)
+    os.makedirs(os.path.dirname(capture), exist_ok=True)
+    cfg = {"status": status, "capture": capture, "workspace": take(params, "workspace", default=None, kind=str),
+           "object": obj_name, "action": action, "frame": frame, "frameRange": fr, "clipEndRadii": radii,
+           "clipRatio": ratio, "settle": settle}
+    script = os.path.join(work, "review_startup.py")
+    with open(script, "w", encoding="utf-8") as fh:
+        fh.write(_REVIEW_SCRIPT % json.dumps(cfg))
+    args = [exe] + (["--factory-startup"] if take_bool(params, "factoryStartup", default=False) else []) + \
+        [path, "--python", script]
+    log = open(os.path.join(work, "review_blender.log"), "w", encoding="utf-8", errors="replace")
+    # the console stays hidden (CREATE_NO_WINDOW); Blender's own window opens for the person
+    proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                            **childproc.hidden({}, new_group=True))
+    log.close()
+    t0 = time.time()
+    st = None
+    while time.time() - t0 < timeout:
+        if os.path.isfile(status):
+            try:
+                with open(status, encoding="utf-8") as fh:
+                    st = json.load(fh)
+                break
+            except (OSError, ValueError):
+                pass
+        if proc.poll() is not None:
+            break
+        time.sleep(0.25)
+    log_path = os.path.join(work, "review_blender.log")
+    if st is None:
+        alive = proc.poll() is None
+        if alive:
+            childproc.kill_tree(proc.pid)
+        try:
+            with open(log_path, encoding="utf-8", errors="replace") as fh:
+                last = fh.read()[-600:]
+        except OSError:
+            last = ""
+        raise MifOpError("the review Blender (PID %d) %s before it said it was ready; log %s ends: %s"
+                         % (proc.pid, "did not answer within %.0f s and was ended by PID" % timeout if alive
+                            else "exited with code %s" % proc.returncode, log_path, last.strip()))
+    if st.get("pid") != proc.pid:
+        raise MifOpError("the status came from PID %s, not the Blender started (PID %d) - not ours, nothing to trust. "
+                         "Close PID %d. Log: %s" % (st.get("pid"), proc.pid, proc.pid, log_path))
+    if not st.get("ready"):
+        raise MifOpError("the review Blender (PID %d, left open) could not be set up: %s. Close it by PID. Log: %s"
+                         % (proc.pid, st.get("error"), log_path))
+    views = st.get("views") or []
+    if not views:
+        raise MifOpError("the review Blender (PID %d, left open) shows no 3D view in workspace '%s' - nothing was "
+                         "framed or checked. Capture: %s" % (proc.pid, st.get("workspace"), capture))
+    empty = [v for v in views if v["nonBackgroundPercent"] < min_vis]
+    clipped = [v for v in views if not v["unclipped"]]
+    if empty or clipped:
+        raise MifOpError("the review Blender (PID %d) is open but not ready: %d of %d 3D views %s. Look at %s, then "
+                         "close it by PID." % (proc.pid, len(empty) + len(clipped), len(views),
+                                               "show nothing (under %.2f%% off background)" % min_vis if empty
+                                               else "clip the scene", capture))
+    st.update(pid=proc.pid, statusFile=status, log=log_path, startedWith=args[:-2] + ["--python", "<startup>"],
+              seconds=round(time.time() - t0, 2),
+              note="left open for the person; close it by PID %d when done" % proc.pid)
+    return st
+
+
 OPS = {
     "purge_orphans": op_purge_orphans,
     "file_info": op_file_info,
@@ -1738,4 +2101,5 @@ OPS = {
     "list_libraries": op_list_libraries,
     "set_library": op_set_library,
     "library_override": op_library_override,
+    "open_for_review": op_open_for_review,
 }

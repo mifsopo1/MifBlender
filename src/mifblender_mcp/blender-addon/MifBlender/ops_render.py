@@ -52,6 +52,9 @@ _SETTINGS_KEYS = {
     "cyclesCurves",
     # THE CYCLES TEXTURE CACHE, 5.2 AND LATER (2026-10-05): GENERATE or CLEAR the .tx files, and measure a preview
     "textureCache", "textureCacheMemory",
+    # WORKBENCH'S LOOK (1.4, FOUND 2026-11-18): scene.display by identifier, its shading struct dotted - shading.light,
+    # shading.color_type, shading.single_color, render_aa - unreachable while silhouettes were made outside Blender
+    "display",
 }
 
 # THE ENGINES' OWN SETTINGS, BY RNA IDENTIFIER (2026-09-21). This op curated fourteen keys and nothing reached the
@@ -75,6 +78,7 @@ _ENGINE_CURATED = {
     "image": {"file_format": "fileFormat", "color_depth": "colorDepth", "color_mode": "colorMode",
               "media_type": "fileFormat"},
     "cyclesCurves": {},
+    "display": {},
 }
 # A VIDEO'S CONTAINER, CODECS AND SOUNDTRACK (2026-09-23): scene.render.ffmpeg, the fourth group - format, codec,
 # audio_codec, audio_bitrate, audio_mixrate, audio_channels and every other setting there, by identifier. A video with
@@ -87,8 +91,8 @@ _ENGINE_CURATED = {
 # typed route. The sixth group, the same writer as the others; absent with the add-on off.
 _GROUP_PATH = {"eevee": "scene.eevee", "cycles": "scene.cycles", "render": "scene.render",
                "ffmpeg": "scene.render.ffmpeg", "image": "scene.render.image_settings",
-               "cyclesCurves": "scene.cycles_curves"}
-_GROUPS = ("eevee", "cycles", "render", "ffmpeg", "image", "cyclesCurves")
+               "cyclesCurves": "scene.cycles_curves", "display": "scene.display"}
+_GROUPS = ("eevee", "cycles", "render", "ffmpeg", "image", "cyclesCurves", "display")
 
 
 def _group_holder(sc, group):
@@ -178,7 +182,9 @@ _RENDER_ELSEWHERE = {"fps": "set_frame_range", "fps_base": "set_frame_range", "f
                      "use_sequencer": "set_compositing"}
 _RENDER_KEYS = {"filePath", "output", "frame", "samples", "resolutionX", "resolutionY",
                 "percentage", "writeStill", "returnImage", "previewMaxPx",
-                "previewMaxBytes", "allowSimulation", "computeBackend", "region", "regionPx", "crop"}
+                "previewMaxBytes", "allowSimulation", "computeBackend", "region", "regionPx", "crop",
+                # REVIEW RENDERS (1.4): ops_lookdev.REVIEW_KEYS, spelt out for parity_check's static read
+                "mode", "clayColor", "wireColor", "wirePx", "silhouette", "preview", "soloLight", "castCheck"}
 _STILL_BACKENDS = ("NONE", "OPTIX", "CUDA", "HIP", "METAL", "ONEAPI")
 
 
@@ -194,9 +200,11 @@ def _still_backend(sc, params):
     if raw is None:
         return None
     backend = str(raw).upper()
+    # CPU IS NONE (FOUND 2026-11-18 by three builds): Blender's enum spells the CPU NONE, and every caller wrote CPU first
+    backend = "NONE" if backend == "CPU" else backend
     if backend not in _STILL_BACKENDS:
-        raise MifOpError("computeBackend must be one of %s, got %r. NOTHING was rendered."
-                         % (", ".join(_STILL_BACKENDS), raw))
+        raise MifOpError("computeBackend must be one of CPU (or NONE, Blender's own word for it), %s, got %r. NOTHING was "
+                         "rendered." % (", ".join(_STILL_BACKENDS[1:]), raw))
     if sc.render.engine != "CYCLES":
         raise MifOpError("computeBackend chooses Cycles' device and the scene renders with %s. Set engine CYCLES "
                          "(set_render_settings) first. NOTHING was rendered." % sc.render.engine)
@@ -1589,7 +1597,9 @@ def op_set_render_settings(params):
     resolved_path = None
     if out_path:
         resolved_path = bpy.path.abspath(str(out_path))
-        check_output_path(out_path, resolved_path, "changed")
+        # STORED, NOT WRITTEN: the write roots are checked where the file is written (render_still, render_animation), so
+        # a scene's own default output ('/tmp/') can be put back; the rest of the check still runs here (2026-11-22)
+        check_output_path(out_path, resolved_path, "changed", confine=False)
 
     # COLOUR MODE, CHECKED HERE FOR THE REASON THE BLOCK ABOVE GIVES. It used to be a bare
     # assignment two hundred lines down, so `{percentage: 33, colorMode: "CMYK"}` wrote the
@@ -1977,6 +1987,8 @@ def op_render_still(params):
                                  tail="NOTHING was rendered, and the frame did not move.")
     backend_plan = _still_backend(sc, params)
     region = _parse_region(params, sc, "NOTHING was rendered.")
+    from .ops_lookdev import cast_check, review_apply, review_plan, review_restore   # noqa: PLC0415
+    review = review_plan(params, sc)
 
     still_before = _still_settings(sc)
     try:
@@ -2022,6 +2034,17 @@ def op_render_still(params):
         except OSError:
             pass
 
+    # THE REVIEW WRITES, for this render only (ops_lookdev): a clay / wire override, a silhouette, Bevel and AO out of
+    # the shading, one light alone; the cast check renders its grey sphere first and puts the scene back itself.
+    cast_reply, review_reply, review_undo = None, None, []
+    try:
+        if review["castThreshold"] is not None:
+            cast_reply = cast_check(sc, review["castThreshold"])
+        review_reply = review_apply(sc, review, review_undo)
+    except Exception:
+        review_restore(review_undo)
+        _restore_still_settings(sc, still_before)
+        raise
     region_saved = _apply_region(sc, region) if region is not None else None
     t0 = time.time()
     try:
@@ -2032,6 +2055,7 @@ def op_render_still(params):
     finally:
         if region_saved is not None:
             _restore_region(sc, region_saved)
+        review_failed = review_restore(review_undo)
     elapsed = time.time() - t0
 
     # THE MEASUREMENT. render() returns FINISHED whether or not anything reached disk, so the file
@@ -2110,6 +2134,17 @@ def op_render_still(params):
                              sceneBorderRestored=True)
     if backend_reply is not None:
         out["computeBackend"] = backend_reply
+    if review_reply is not None:
+        out["review"] = dict(review_reply, sceneRestored=review_failed == 0)
+    if cast_reply is not None:
+        out["castCheck"] = cast_reply
+    # THE THREAD MODE (FOUND 2026-11-18): previews at 75 s each took 16 s with render threads FIXED 8 on a machine other
+    # sessions were rendering on - AUTO takes every core and competes. Named so a slow render says where to look.
+    out["threads"] = {"mode": sc.render.threads_mode, "count": int(sc.render.threads)}
+    if sc.render.threads_mode == "AUTO" and elapsed > 10.0:
+        out["threadNote"] = ("render threads are AUTO (every core). On a machine other renders share, set_render_settings "
+                             "render {threads_mode: 'FIXED', threads: N} measured about 4x faster (75 s -> 16 s a "
+                             "preview, 2026-11-18); preview: true takes Bevel and AO nodes out for a draft.")
     if result_preview:
         out["previewNote"] = (
             "image is a compact base64 PNG preview, not the artifact. It is downscaled to "
@@ -2386,7 +2421,7 @@ def _log_tail(path, lines):
         return []
 
 
-# UNBAKED SIMULATIONS, OUT OF PROCESS. MEASURED 2026-09-16 on 3.6.23, 4.2.17, 4.4.0, 5.0.1 and 5.2.1 (docs/22 B61): a saved
+# UNBAKED SIMULATIONS, OUT OF PROCESS. MEASURED 2026-09-16 on 3.6.23, 4.2.17, 4.4.0, 5.0.1 and 5.2.1: a saved
 # file rendered by a second Blender with this op's own argv shape (-b file -s 1 -e 40 -j 1 -a), Workbench 64 px, frame 1
 # against frame 40. An unbaked rigid body and an unbaked soft body read 0.0 - they do not move - where the same scenes
 # baked moved 0.076-0.085. An unbaked cloth matched its bake when the render started at its cache start; rendered from

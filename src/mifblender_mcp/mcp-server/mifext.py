@@ -1,9 +1,9 @@
-"""MifBridge extensions - third parties add tools, tool packs and native endpoints without forking. docs/32_EXTENSIONS.md.
+"""MifBridge extensions - third parties add tools, tool packs and native endpoints without forking. the internal notes.
 
 An extension is a LOCAL FOLDER: nothing here downloads, asks a registry or touches the network. It holds a manifest
 (mifextension.json), a Python module whose register(api) adds MCP tools that compose existing endpoints and Blender ops,
 and optionally native/<Plugin>/ - an Unreal plugin that registers endpoints through MifBridgeExtensionApi.h - and
-blender/<AddOn>/ - a Blender add-on that registers ops into MifBlender's dispatcher (mifblender_api, docs/32 section 8).
+blender/<AddOn>/ - a Blender add-on that registers ops into MifBlender's dispatcher.
 
     python mifext.py new <name> [--prefix p_] [--native] [--dir D]   write a working skeleton
     python mifext.py validate <folder> [--load]                      every check the loader makes, and the native half's

@@ -1440,7 +1440,7 @@ def op_load_clip(params):
         raise MifOpError("'%s' loaded with no frames or no size - not a movie or image Blender can read. %s"
                          % (path, _ADDED))
     if name is not None:
-        assign_id_name(clip, name, bpy.data.movieclips)   # 3.6 renames the OTHER clip on a clash (ledger B12)
+        assign_id_name(clip, name, bpy.data.movieclips)   # 3.6 renames the OTHER clip on a clash
     if cs is not None:
         try:
             clip.colorspace_settings.name = cs

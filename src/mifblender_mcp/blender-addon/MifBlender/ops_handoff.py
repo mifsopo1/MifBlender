@@ -226,7 +226,11 @@ def op_export_actions(params):
 _URP_MAPS = {"BC": ("_BaseMap", None), "N": ("_BumpMap", "_NORMALMAP"), "MS": ("_MetallicGlossMap", "_METALLICSPECGLOSSMAP"),
              "E": ("_EmissionMap", "_EMISSION"), "R": (None, None), "M": (None, None)}
 _EMT_KEYS = ("objects", "object", "materials", "folder", "directory", "pattern", "normalConvention", "packOrm",
-             "format", "overwrite", "profile")
+             "format", "overwrite", "profile", "size")
+# Roblox's SurfaceAppearance reads each map on its own (no packing) and normal maps in OpenGL only (the SurfaceAppearance
+# page, read 2026-11-21); an upload keeps up to 4096 a side (RB1300).
+_ROBLOX_MAPS = {"BC": "ColorMap", "N": "NormalMap", "R": "RoughnessMap", "M": "MetalnessMap", "E": None}
+ROBLOX_MAX_PX = 4096
 _INPUTS = {   # map -> the Principled input names that feed it, newest first
     "BC": ("Base Color",), "N": ("Normal",), "R": ("Roughness",), "M": ("Metallic",),
     "E": ("Emission Color", "Emission"), "A": ("Alpha",),
@@ -299,6 +303,216 @@ def _trace(sock, depth=0):
     return ("procedural", n.type)
 
 
+# ----------------------------------------------------------------------------- a normal map's convention
+# FOUND ON A GAME (2026-11-21): a set of rigs shipped DirectX normal maps, each .blend inverting green (1 - G) on its way
+# into the Normal Map node so the files work as they are in Unreal. One was resized and uploaded to Roblox straight from
+# the file, and Roblox reads OpenGL only ("Roblox only supports OpenGL format - Tangent Space normal maps", the
+# SurfaceAppearance page, read 2026-11-21): its relief was lit from the wrong side, and nothing said so. The file's
+# convention is in the material that reads it: each channel is followed from the Normal Map node's Color back to the
+# image as a straight line out = a * file + b, through the nodes such a chain is made of; green with a = -1, b = 1 means
+# the file is DirectX. A channel the walk cannot follow is answered unknown, never guessed.
+_NAME_DX = re.compile(r"(?i)(^|[_\-. ])(dx|directx|d3d|normaldx|nrm_?dx)([_\-. ]|$)")
+_NAME_GL = re.compile(r"(?i)(^|[_\-. ])(gl|ogl|opengl|normalgl|nrm_?gl)([_\-. ]|$)")
+_CH_NAMES = {"Red": "R", "Green": "G", "Blue": "B", "R": "R", "G": "G", "B": "B"}
+
+
+def _lin(sock, ch, depth=0):
+    """A scalar of channel ch at sock, as (image, image channel, a, b): out = a * file + b. ("const", v) for a constant;
+    None when the chain holds a node this walk does not follow."""
+    if depth > 24:
+        return None
+    if not sock.is_linked:
+        v = getattr(sock, "default_value", None)
+        try:
+            v = [float(x) for x in v]
+            v = v["RGB".index(ch)] if ch in "RGB" and len(v) >= 3 else v[0]
+        except TypeError:
+            v = float(v) if v is not None else None
+        return ("const", v) if v is not None else None
+    link = sock.links[0]
+    n, out = link.from_node, link.from_socket
+    t = n.type
+    if t == "REROUTE":
+        return _lin(n.inputs[0], ch, depth + 1)
+    if t == "TEX_IMAGE":
+        if n.image is None or out.name == "Alpha":
+            return None
+        return (n.image, ch, 1.0, 0.0)
+    if t in ("SEPARATE_COLOR", "SEPRGB", "SEPARATE_RGB"):
+        if getattr(n, "mode", "RGB") != "RGB" or _CH_NAMES.get(out.name) is None:
+            return None
+        return _lin(n.inputs[0], _CH_NAMES[out.name], depth + 1)
+    if t in ("COMBINE_COLOR", "COMBRGB", "COMBINE_RGB"):
+        if getattr(n, "mode", "RGB") != "RGB":
+            return None
+        return _lin(n.inputs["RGB".index(ch)], ch, depth + 1)
+    if t == "INVERT":
+        fac, src = _lin(n.inputs["Fac"], ch, depth + 1), _lin(n.inputs["Color"], ch, depth + 1)
+        if not fac or fac[0] != "const" or not src:
+            return None
+        f = fac[1]                                          # out = f (1 - c) + (1 - f) c = (1 - 2 f) c + f
+        return ("const", (1 - 2 * f) * src[1] + f) if src[0] == "const" else (src[0], src[1], (1 - 2 * f) * src[2],
+                                                                               (1 - 2 * f) * src[3] + f)
+    if t == "MATH":
+        op = n.operation
+        x = [_lin(s, ch, depth + 1) for s in list(n.inputs)[:3]]
+        if op in ("ADD", "SUBTRACT", "MULTIPLY", "MULTIPLY_ADD"):
+            if any(v is None for v in x[:3 if op == "MULTIPLY_ADD" else 2]):
+                return None
+            var = [v for v in x[:3 if op == "MULTIPLY_ADD" else 2] if v[0] != "const"]
+            if len(var) > 1:
+                return None
+            if op == "ADD":
+                a, b = x[:2]
+                return (("const", a[1] + b[1]) if not var else
+                        (var[0][0], var[0][1], var[0][2], var[0][3] + (b[1] if a is var[0] else a[1])))
+            if op == "SUBTRACT":
+                a, b = x[:2]
+                if not var:
+                    return ("const", a[1] - b[1])
+                return ((a[0], a[1], a[2], a[3] - b[1]) if a is var[0] else (b[0], b[1], -b[2], a[1] - b[3]))
+            if op == "MULTIPLY":
+                a, b = x[:2]
+                if not var:
+                    return ("const", a[1] * b[1])
+                k = b[1] if a is var[0] else a[1]
+                return (var[0][0], var[0][1], var[0][2] * k, var[0][3] * k)
+            a, m, add = x                                   # MULTIPLY_ADD: a * m + add, one of a / m varying
+            if add[0] != "const" or (a[0] != "const" and m[0] != "const"):
+                return None
+            if a[0] == "const" and m[0] == "const":
+                return ("const", a[1] * m[1] + add[1])
+            v, k = (a, m[1]) if a[0] != "const" else (m, a[1])
+            return (v[0], v[1], v[2] * k, v[3] * k + add[1])
+        return None
+    if t == "CURVE_RGB":
+        src = _lin(n.inputs["Color"], ch, depth + 1)
+        fac = _lin(n.inputs["Fac"], ch, depth + 1)
+        if not src or src[0] == "const" or not fac or fac[0] != "const":
+            return None
+        mp = n.mapping
+        try:
+            mp.initialize()
+            curve = mp.curves["RGB".index(ch)]
+            whole = mp.curves[3]
+
+            def f(v):
+                return mp.evaluate(whole, mp.evaluate(curve, v))
+            y0, y5, y1 = f(0.0), f(0.5), f(1.0)
+        except (AttributeError, IndexError, RuntimeError, TypeError):
+            return None
+        if abs(y5 - (y0 + y1) / 2) > 0.02:
+            return None                                     # not a straight line: not a convention, a grade
+        k = fac[1]
+        a, b = k * (y1 - y0) + (1 - k), k * y0
+        return (src[0], src[1], src[2] * a, src[3] * a + b)
+    return None
+
+
+def normal_map_convention(mat):
+    """The convention of the file a material's normal map reads: {image, file, convention DIRECTX | OPENGL | None, how,
+    nameSays, channels}. None (no row) when the material has no tangent Normal Map node on its Principled Normal."""
+    p = _principled(mat)
+    sock = _socket(p, _INPUTS["N"]) if p is not None else None
+    node = None
+    while sock is not None and sock.is_linked:
+        n = sock.links[0].from_node
+        if n.type == "REROUTE":
+            sock = n.inputs[0]
+            continue
+        node = n if n.type == "NORMAL_MAP" else None
+        break
+    if node is None:
+        return None
+    row = {"material": mat.name, "normalMapNode": node.name, "space": node.space, "image": None, "file": None,
+           "convention": None}
+    chans = {c: _lin(node.inputs["Color"], c) for c in "RGB"}
+    imgs = {v[0].name for v in chans.values() if v and v[0] != "const"}
+    if len(imgs) != 1 or any(v is None or v[0] == "const" for v in chans.values()):
+        row["how"] = ("the Normal Map node's Color does not come from one image through nodes this check follows "
+                      "(Separate/Combine Color, Invert, Math add/subtract/multiply, RGB Curves, reroutes)")
+        return row
+    im = chans["G"][0]
+    row.update(image=im.name, file=bpy.path.abspath(im.filepath) if im.filepath else None,
+               channels={c: {"from": v[1], "scale": round(v[2], 4), "offset": round(v[3], 4)} for c, v in chans.items()})
+    straight = all(chans[c][1] == c and abs(chans[c][2] - 1) < 0.02 and abs(chans[c][3]) < 0.02 for c in "RB")
+    g = chans["G"]
+    node_dx = str(getattr(node, "convention", "OPENGL")).upper() == "DIRECTX"   # a Normal Map node that reads DirectX
+    if straight and g[1] == "G" and abs(g[2] - 1) < 0.02 and abs(g[3]) < 0.02:
+        row["convention"] = "DIRECTX" if node_dx else "OPENGL"
+        row["how"] = ("straight into a Normal Map node set to DirectX" if node_dx else
+                      "straight into the Normal Map node, which reads OpenGL (green up)")
+    elif straight and g[1] == "G" and abs(g[2] + 1) < 0.02 and abs(g[3] - 1) < 0.02:
+        row["convention"] = "OPENGL" if node_dx else "DIRECTX"
+        row["how"] = "green inverted (1 - G) on its way into the Normal Map node%s" % (
+            ", which is itself set to DirectX" if node_dx else ": the file is DirectX (green down)")
+    else:
+        row["how"] = "the chain does more than invert green (scale or offset off 1 and 0, or channels swapped)"
+    base = os.path.splitext(os.path.basename(row["file"] or im.name))[0]
+    row["nameSays"] = "DIRECTX" if _NAME_DX.search(base) else "OPENGL" if _NAME_GL.search(base) else None
+    if row["nameSays"] and row["convention"] and row["nameSays"] != row["convention"]:
+        row["warning"] = ("the file's name says %s but the material reads it as %s: one of them is wrong - the "
+                          "material is what renders, so check the file" % (row["nameSays"], row["convention"]))
+    return row
+
+
+_NMC_KEYS = ("objects", "object", "materials")
+
+
+def _materials_of(params, tail):
+    mats = []
+    if params.get("materials") is not None:
+        raw = params["materials"]
+        if not isinstance(raw, list) or not raw or not all(isinstance(n, str) for n in raw):
+            raise MifOpError("materials is a list of material names. %s" % tail)
+        for n in dict.fromkeys(raw):
+            m = bpy.data.materials.get(n)
+            if m is None:
+                raise MifOpError("no material named '%s'. %s" % (n, tail))
+            mats.append(m)
+        return mats
+    raw = params.get("objects", params.get("object"))
+    names = [raw] if isinstance(raw, str) else raw
+    if not isinstance(names, list) or not names:
+        raise MifOpError("give objects (whose materials are read) or materials. %s" % tail)
+    for n in names:
+        for s in get_object(n).material_slots:
+            if s.material is not None and s.material not in mats:
+                mats.append(s.material)
+    if not mats:
+        raise MifOpError("%s use no material. %s" % (names, tail))
+    return mats
+
+
+def op_normal_map_convention(params):
+    """Which convention each material's normal map FILE is in, read from the node graph that reads it - DirectX when its
+    green is inverted (1 - G) on the way into the Normal Map node, OpenGL when it goes in straight (or the reverse under a
+    Normal Map node set to DirectX). Read only.
+
+    params:
+      objects / object (list)   the objects whose materials are read, or
+      materials (list)          materials by name
+    Each row: material, image, file, convention (DIRECTX, OPENGL, or null with how when the chain is one this does not
+    follow), how, channels (each of R, G, B as scale x file channel + offset), nameSays (what the file's name claims: _DX,
+    _GL ...) and a warning when the name and the graph disagree. Materials with no tangent Normal Map node are listed in
+    noNormalMap. Roblox, Unity and glTF read OpenGL; Unreal reads DirectX. A material set with no normal map at all fails.
+    """
+    reject_unknown(params, _NMC_KEYS, "normal_map_convention")
+    tail = "NOTHING was read."
+    mats = _materials_of(params, tail)
+    rows, none = [], []
+    for m in mats:
+        r = normal_map_convention(m)
+        (rows.append(r) if r is not None else none.append(m.name))
+    if not rows:
+        raise MifOpError("none of %s reads a normal map through a Normal Map node: there is no convention to read. %s"
+                         % ([m.name for m in mats], tail))
+    return {"materials": rows, "noNormalMap": none,
+            "unknown": [r["material"] for r in rows if r["convention"] is None],
+            "note": "the convention is the FILE's: what the material does to it before its Normal Map node says which "
+                    "way the file's green points. Roblox, Unity and glTF read OpenGL (green up), Unreal DirectX."}
+
+
 def _surface_shader(mat):
     """The node wired to the active output's Surface, or None."""
     nt = mat.node_tree if mat.use_nodes else None
@@ -364,6 +578,37 @@ def _blend_mode(mat, row):
     return "Translucent" if c.get("opacity", 1.0) < 1.0 or c.get("transmission", 0.0) > 0.0 else "Opaque"
 
 
+def _renormalize_normal_file(path, tail):
+    """Each texel of a written normal map set back to unit length (a resize averages vectors, which shortens them), and
+    the file written again. -> {texels, meanLengthBefore, meanLengthAfter}."""
+    import numpy as np                                          # noqa: PLC0415 - Blender bundles it
+    from .ops_common import abs_output_path                     # noqa: PLC0415
+    path = abs_output_path(path)
+    im = bpy.data.images.load(path, check_existing=False)
+    try:
+        im.colorspace_settings.name = "Non-Color"
+        w, h = im.size
+        px = np.empty(w * h * 4, dtype=np.float32)
+        im.pixels.foreach_get(px)
+        px = px.reshape(-1, 4)
+        v = px[:, :3] * 2.0 - 1.0
+        ln = np.linalg.norm(v, axis=1)
+        before = float(ln.mean()) if ln.size else 0.0
+        ok = ln > 1e-6
+        v[ok] /= ln[ok][:, None]
+        v[~ok] = (0.0, 0.0, 1.0)
+        px[:, :3] = np.clip(v * 0.5 + 0.5, 0.0, 1.0)
+        im.pixels.foreach_set(px.ravel())
+        im.filepath_raw = path
+        im.save()
+        after = float(np.linalg.norm(px[:, :3] * 2.0 - 1.0, axis=1).mean()) if ln.size else 0.0
+    except (RuntimeError, ValueError) as exc:
+        raise MifOpError("the normal map %s did not renormalize (%s). %s" % (path, exc, tail))
+    finally:
+        bpy.data.images.remove(im)
+    return {"texels": int(w * h), "meanLengthBefore": round(before, 4), "meanLengthAfter": round(after, 4)}
+
+
 def op_export_material_textures(params):
     """Save every image a material's Principled inputs read, with engine names and conventions - the textures half of a
     send to Unreal (a mesh used to arrive with material slots and no textures).
@@ -378,13 +623,23 @@ def op_export_material_textures(params):
                                 and _M separately
       format (str)              PNG (default) | TARGA
       overwrite (bool)          default true
-      profile (str)             unreal (what no profile means) or unity. Under unity, for URP Lit: normalConvention
+      size (int)                every map resized to size x size (bilinear), 1-16384; a normal map is renormalized after
+                                the resize (each texel's vector back to length 1: averaging shortens it)
+      profile (str)             unreal (what no profile means), unity or roblox. Under roblox (SurfaceAppearance):
+                                normalConvention is OPENGL (Roblox reads no other), roughness and metallic are written
+                                as their own _R and _M maps (packOrm refused), the normal map is named _N_GL, each map
+                                names its SurfaceAppearance property, and size is at most 4096 (RB1300).
+                                Under unity, for URP Lit: normalConvention
                                 defaults to OPENGL, and in place of ORM one _MS map holds metallic in R, G and B and
                                 smoothness (1 - roughness) in A, since a dielectric's ORM read as a mirror there (measured).
                                 packOrm is refused. Each map names its URP property, and a .meta beside it sets the
                                 texture type and sRGB, an existing .meta being kept. Occlusion is not carried: the
                                 Principled BSDF has no input for it.
     Maps: BC (base color, with the Alpha input's image alpha when it reads one), N, ORM (or R, M), E (emission color).
+    THE NORMAL MAP'S OWN CONVENTION is read from the material (normal_map_convention): a file whose green the material
+    inverts before its Normal Map node is DirectX, and is written flipped only when the target differs - the row says
+    sourceConvention, convention and greenFlipped. Found on a game: a DirectX file read through 1 - G was uploaded to
+    Roblox unflipped and lit from the wrong side.
     A channel read straight from an image (or an image's R/G/B through Separate Color, or a Normal Map node's image) is
     carried; anything else - a ramp, a math node, a procedural texture - is listed in notCarried (bl_bake_texture or
     bl_bake_texture_set bakes it). An unlinked input is reported as a constant for the material instance: baseColor, roughness,
@@ -396,8 +651,21 @@ def op_export_material_textures(params):
     reject_unknown(params, _EMT_KEYS, "export_material_textures")
     tail = "NOTHING was written."
     from .ops_mesh import export_profile                        # noqa: PLC0415 - the one list of profiles
-    profile = export_profile(params, tail)
+    from .ops_mesh import EXPORT_MESH_PROFILES                  # noqa: PLC0415 - roblox is a mesh profile too
+    profile = export_profile(params, tail, EXPORT_MESH_PROFILES)
     unity = profile == "unity"
+    roblox = profile == "roblox"
+    if roblox and params.get("packOrm") is not None:
+        raise MifOpError("packOrm is Unreal's layout; Roblox's SurfaceAppearance reads roughness and metallic as maps of "
+                         "their own, which profile roblox writes. Drop packOrm. %s" % tail)
+    if roblox and params.get("normalConvention") is not None and str(params["normalConvention"]).upper() != "OPENGL":
+        raise MifOpError("Roblox reads OpenGL normal maps only (the SurfaceAppearance page); profile roblox writes "
+                         "OPENGL. Drop normalConvention. %s" % tail)
+    size = take_int(params, "size", default=None)
+    if size is not None and not 1 <= size <= (ROBLOX_MAX_PX if roblox else 16384):
+        raise MifOpError("size is 1-%d%s, got %d. %s" % (ROBLOX_MAX_PX if roblox else 16384,
+                                                          " (Roblox keeps up to 4096 a side, RB1300)" if roblox else "",
+                                                          size, tail))
     if unity and params.get("packOrm") is not None:
         raise MifOpError("packOrm is Unreal's layout; profile unity writes URP's _MS map (metallic in R, smoothness in A) "
                          "instead. Drop packOrm. %s" % tail)
@@ -426,14 +694,14 @@ def op_export_material_textures(params):
             raise MifOpError("%s use no material. %s" % (names, tail))
     folder = _out_dir(params, tail)
     pattern = take(params, "pattern", default="T_{material}_{suffix}", kind=str)
-    conv = str(take(params, "normalConvention", default="OPENGL" if unity else "DIRECTX", kind=str)).upper()
+    conv = str(take(params, "normalConvention", default="OPENGL" if unity or roblox else "DIRECTX", kind=str)).upper()
     if conv not in ("DIRECTX", "OPENGL"):
         raise MifOpError("normalConvention is DIRECTX or OPENGL, got %r. %s" % (conv, tail))
     fmt = str(take(params, "format", default="PNG", kind=str)).upper()
     if fmt not in ("PNG", "TARGA"):
         raise MifOpError("format is PNG or TARGA, got %r. %s" % (fmt, tail))
     ext = ".png" if fmt == "PNG" else ".tga"
-    pack_orm = take_bool(params, "packOrm", default=True)
+    pack_orm = take_bool(params, "packOrm", default=not roblox)
     overwrite = take_bool(params, "overwrite", default=True)
     made_images = []
     rows = []
@@ -458,12 +726,21 @@ def op_export_material_textures(params):
                 fp = path_of(suffix)
                 req = {"channels": chans, "name": "MifTex_%s_%s" % (_safe(mat.name), suffix), "filepath": fp,
                        "format": fmt, "overwrite": overwrite, "fakeUser": False}
+                if size is not None:
+                    req.update(width=size, height=size)
                 got = op_channel_pack_image(req)
                 made_images.append(got["image"])
                 r = {"map": suffix, "file": got["file"], "bytes": got.get("bytes"), "size": got["size"],
                      "srgb": srgb, "channels": {c: {k: v for k, v in got["channels"][c].items() if k != "written"}
                                                 for c in got["channels"]}}
                 r.update(extra or {})
+                if size is not None and suffix.startswith("N"):
+                    r["renormalized"] = _renormalize_normal_file(fp, tail)
+                if roblox:
+                    r["roblox"] = {"property": _ROBLOX_MAPS.get(suffix[:1] if suffix != "BC" else "BC")}
+                    if suffix == "E":
+                        r["roblox"]["note"] = ("SurfaceAppearance has no emission colour map: EmissiveMaskContent is a "
+                                               "grayscale mask times EmissiveTint (bl_roblox_pbr_bake writes the mask)")
                 if unity:
                     prop = _URP_MAPS[suffix]
                     normal = suffix == "N"
@@ -492,21 +769,26 @@ def op_export_material_textures(params):
                 row["notCarried"].append({"input": "Base Color", "why": "driven by %s" % (bc[1],)})
             # N
             nm = src["N"]
+            nconv = normal_map_convention(mat) if nm[0] == "normalmap" else None
             if nm[0] == "normalmap":
-                inner = nm[1]
-                if inner[0] == "image" and inner[2] == "RGB" and nm[2] == "TANGENT":
-                    im = inner[1].name
-                    write("N", {"R": {"image": im, "channel": "R"},
-                                "G": {"image": im, "channel": "G", "invert": conv == "DIRECTX"},
-                                "B": {"image": im, "channel": "B"}}, False,
-                          {"source": im, "convention": conv, "greenFlipped": conv == "DIRECTX",
-                           "strength": nm[3]})
+                if nconv is not None and nconv.get("convention") and nm[2] == "TANGENT":
+                    im = nconv["image"]
+                    flip = nconv["convention"] != conv
+                    write("N_GL" if roblox else "N", {"R": {"image": im, "channel": "R"},
+                                                      "G": {"image": im, "channel": "G", "invert": flip},
+                                                      "B": {"image": im, "channel": "B"}}, False,
+                          {"source": im, "convention": conv, "sourceConvention": nconv["convention"],
+                           "sourceHow": nconv["how"], "greenFlipped": flip, "strength": nm[3]})
+                    if nconv.get("warning"):
+                        row.setdefault("warnings", []).append(nconv["warning"])
                     if abs(nm[3] - 1.0) > 1e-6:
                         row["notCarried"].append({"input": "Normal", "why": "Normal Map strength %g is not in the "
                                                   "texture - set it on the material in %s"
                                                   % (nm[3], "Unity (_BumpScale)" if unity else "Unreal")})
                 else:
-                    row["notCarried"].append({"input": "Normal", "why": "a %s-space normal map, or not an image" % nm[2]})
+                    row["notCarried"].append({"input": "Normal", "why": "a %s-space normal map, or not an image%s" % (
+                        nm[2], "" if nconv is None or nconv.get("convention") else
+                        " (its file's convention could not be read: %s)" % nconv.get("how"))})
             elif nm[0] not in ("none", "value"):
                 row["notCarried"].append({"input": "Normal", "why": "driven by %s (a bump or a node chain)" % (nm[1],)})
             # ORM / R / M
@@ -1101,7 +1383,7 @@ def op_heightmap_from_mesh(params):
 # Each map is written as its own file - a packed channel split out to grayscale, a DirectX normal's green inverted - so
 # export_material_textures can read it straight back, and import_pbr_texture_set wires the folder (its colour spaces:
 # sRGB for base colour and emission only).
-_MFM_KEYS = ("material", "folder", "maps", "overwrite")
+_MFM_KEYS = ("material", "folder", "maps", "overwrite", "aoTo", "emissionStrength")
 _MFM_ROLES = {"baseColor": "basecolor", "normal": "normal", "roughness": "roughness", "metallic": "metallic",
               "ao": "ao", "alpha": "opacity", "emissive": "emission"}
 _MFM_COLOR = ("baseColor", "normal", "emissive")
@@ -1121,7 +1403,17 @@ def op_material_from_maps(params):
                           default for baseColor, normal, emissive) | R | G | B | A (a scalar role's default is R);
                           directX (normal only): the file is DirectX-convention (green down) and is flipped to OpenGL
       overwrite (bool)    default true
-    Reply: per role the file written with its channel means, and import_pbr_texture_set's wiring.
+      aoTo (str)          "gltf" (the default since 2026-11-25) | "multiply" | "none": where an ao map goes. "gltf" wires
+                          it to a "glTF Material Output" group's Occlusion (a glTF's occlusionTexture) and leaves the
+                          base colour straight to its input, so an FBX embeds it; "multiply" is import_pbr_texture_set's
+                          Mix into base colour, which an FBX carries neither image of (FOUND 2026-11-16)
+      emissionStrength (number)
+                          the Principled Emission Strength an emissive map is wired with: default 1.0 when it reads 0
+                          (Blender 4.0+'s default, FOUND 2026-11-18: a visor that did not glow), else kept
+    A RELATIVE map file resolves against folder (FOUND 2026-11-18: it resolved against the worker's own cwd); a '//'
+    path against the open .blend. Reply: per role the file written with its channel means (`deliverable`: the copy
+    under <folder>/<material> the material reads, which is what ships - `from` is the source, which nothing reads),
+    import_pbr_texture_set's wiring, where AO went and the emission strength.
     """
     import shutil                                                   # noqa: PLC0415
     import numpy as np                                              # noqa: PLC0415 - Blender bundles it
@@ -1136,6 +1428,14 @@ def op_material_from_maps(params):
     if not isinstance(maps, list) or not maps or not all(isinstance(m, dict) for m in maps):
         raise MifOpError("maps is a non-empty list of {file, role, channel?, directX?}. %s" % tail)
     overwrite = take_bool(params, "overwrite", default=True)
+    from .ops_material import AO_TO, principled_socket          # noqa: PLC0415
+    ao_to = str(take(params, "aoTo", default="gltf", kind=str)).lower()
+    if ao_to not in AO_TO:
+        raise MifOpError("aoTo is one of %s, got %r. %s" % (", ".join(AO_TO), params.get("aoTo"), tail))
+    strength = take_float(params, "emissionStrength")
+    if strength is not None and strength < 0:
+        raise MifOpError("emissionStrength is 0 or more, got %s. %s" % (strength, tail))
+    base_dir = os.path.abspath(bpy.path.abspath(str(params.get("folder") or params.get("directory") or "")))
     plan, seen = [], set()
     for m in maps:
         extra = set(m) - {"file", "role", "channel", "directX"}
@@ -1157,9 +1457,15 @@ def op_material_from_maps(params):
             raise MifOpError("directX is true or false, got %r. %s" % (m.get("directX"), tail))
         if m.get("directX") and role != "normal":
             raise MifOpError("directX belongs to the normal map, not %s. %s" % (role, tail))
-        src = os.path.abspath(bpy.path.abspath(str(m.get("file") or "")))
+        # A RELATIVE FILE IS RELATIVE TO folder (FOUND 2026-11-18): os.path.abspath resolved it against the pool
+        # worker's temp cwd, and the refusal named .../mif_blender_workers_cwd/T_...png
+        raw_file = str(m.get("file") or "")
+        src = bpy.path.abspath(raw_file) if raw_file.startswith("//") else raw_file
+        src = os.path.abspath(src if os.path.isabs(src) or not raw_file else os.path.join(base_dir, src))
         if not os.path.isfile(src):
-            raise MifOpError("%s: no file '%s'. %s" % (role, src, tail))
+            raise MifOpError("%s: no file '%s'%s. %s" % (
+                role, src, " (a relative file is read from folder; give an absolute path for one elsewhere)"
+                if raw_file and not os.path.isabs(raw_file) and not raw_file.startswith("//") else "", tail))
         plan.append((role, ch, m.get("directX") is True, src))
     folder = os.path.join(_out_dir(params, tail), _safe(mat.name))
     prefix = _safe(mat.name) + "_"
@@ -1227,7 +1533,7 @@ def op_material_from_maps(params):
         written.append({"role": role, "file": out, "from": src, "channel": ch, "how": how,
                         "mean": [round(float(rgba[..., c].mean()), 4) for c in range(3)]})
     try:
-        wired = op_import_pbr_texture_set({"material": mat.name, "folder": staging})
+        wired = op_import_pbr_texture_set({"material": mat.name, "folder": staging, "aoTo": ao_to})
         moved = {}
         for row in written:
             dst = final(row["role"])
@@ -1248,8 +1554,33 @@ def op_material_from_maps(params):
                         w[k] = moved[src_]
     finally:
         shutil.rmtree(staging, ignore_errors=True)
-    return {"material": mat.name, "folder": folder, "maps": written, "wired": wired.get("wired"),
-            "kinds": wired.get("kinds"), "skipped": wired.get("skipped"), "notes": wired.get("notes")}
+    for row in written:
+        row["deliverable"] = row["file"]
+    for w in (wired.get("wired") or {}).values():
+        if isinstance(w, dict) and w.get("node") in mat.node_tree.nodes:
+            img = mat.node_tree.nodes[w["node"]].image
+            w["image"] = img.name if img is not None else w.get("image")
+    out = {"material": mat.name, "folder": folder, "maps": written, "wired": wired.get("wired"),
+           "kinds": wired.get("kinds"), "skipped": wired.get("skipped"), "notes": wired.get("notes"),
+           "deliverables": [r["file"] for r in written],
+           "deliverableNote": "the material reads the copies under %s - those are the files to ship; each map's "
+                              "'from' is only where it was read" % folder}
+    ao_row = (wired.get("wired") or {}).get("ao")
+    if ao_row:
+        out["ao"] = {"aoTo": ao_to, "how": ao_row.get("how")}
+    if "emissive" in seen:
+        p = _principled(mat)
+        sock = principled_socket(p, "Emission Strength") if p is not None else None
+        if sock is not None:
+            before = float(sock.default_value)
+            if strength is not None:
+                sock.default_value = strength
+            elif before <= 0.0:
+                sock.default_value = 1.0
+            out["emission"] = {"strength": round(float(sock.default_value), 4), "was": round(before, 4),
+                               "how": "emissionStrength given" if strength is not None else
+                               ("set to 1 - it read 0, so the map would not glow" if before <= 0.0 else "kept")}
+    return out
 
 
 # ============================================================================================================ uefn_check
@@ -1299,7 +1630,7 @@ _UEFN_FORMATS = (".fbx", ".glb", ".gltf")
 _HULL_PREFIXES = ("UCX_", "UBX_", "USP_", "UCP_")
 _LOD_SUFFIX = re.compile(r"_LOD(\d+)$")
 _UC_KEYS = ("objects", "object", "file", "overwrite", "generateLods", "assetFolder", "strict", "embedTextures",
-            "includeHulls", "animations")
+            "includeHulls", "animations", "packOrm")
 _UC_NOTES = {
     "actions": "animations true (the default) writes every action that keys a rigged mesh's bones, one file each "
                "through export_actions; false names them in export.notWritten.",
@@ -1313,7 +1644,7 @@ _UC_NOTES = {
 # THE ESTIMATE'S RATES (not from an Epic page; each is the size of the format UE picks by default for that kind of
 # source). A float source imports as TC_HDR (5.8 Editor/UnrealEd/Private/Factories/EditorFactories.cpp:3463), RGBA16F:
 # 8 bytes a pixel. A normal map is BC5, a source with an alpha channel BC3, anything else BC1: 1, 1 and 0.5 bytes a
-# pixel. A full mip chain adds a third; a texture that is not a power of two is counted without one, which is what
+# pixel - an alpha channel counted only when its pixels are not all opaque (_alpha_min). A full mip chain adds a third; a texture that is not a power of two is counted without one, which is what
 # Epic's "power-of-2 ... makes it possible to do mipmapping" implies.
 _BYTES_PER_PIXEL = {"hdr": 8.0, "normal": 1.0, "alpha": 1.0, "color": 0.5}
 # A static mesh vertex: position 12 bytes, packed normal and tangent 8, 4 per UV channel (half precision), 4 for a
@@ -1547,23 +1878,96 @@ def _pow2(n):
     return n > 0 and n & (n - 1) == 0
 
 
+# AN ALPHA CHANNEL IS JUDGED BY ITS PIXELS (2026-11-25): a TC_Default texture compresses as AutoDXT, resolved to DXT5
+# (BC3) when the image has alpha and DXT1 (BC1) when not (5.3-5.8 Developer/TextureFormatDXT/Private/TextureFormatDXT.cpp
+# GetEncodedPixelFormat: "return bImageHasAlphaChannel ? PF_DXT5 : PF_DXT1"), and the alpha is detected from the pixels -
+# transparent when the least alpha is at or under 254.5/255 (5.5-5.8 TextureCompressorModule.cpp FloatNonOpaqueAlpha,
+# "the same test as FImageCore::DetectAlphaChannel"). Read from the engine's source, not yet measured on an import.
+_OPAQUE_ALPHA = 254.5 / 255.0
+
+
+def _alpha_min(img):
+    """The least alpha of an image's pixels, or None when they cannot be read."""
+    import numpy as np                                          # noqa: PLC0415 - bundled with Blender
+    try:
+        w, h, ch = int(img.size[0]), int(img.size[1]), int(img.channels)
+        if ch < 4 or w * h == 0:
+            return None
+        px = np.empty(w * h * ch, dtype=np.float32)
+        img.pixels.foreach_get(px)
+        return float(px[3::ch].min())
+    except (RuntimeError, ValueError, AttributeError):
+        return None
+
+
 def _texture_row(img, kinds):
     w, h = (int(img.size[0]), int(img.size[1]))
     pow2 = _pow2(w) and _pow2(h)
+    alpha = None
     if img.is_float:
         kind = "hdr"
     elif "normal" in kinds:
         kind = "normal"
     elif int(getattr(img, "depth", 0) or 0) in (32, 64, 128):
-        kind = "alpha"
+        amin = _alpha_min(img)
+        alpha = {"min": round(amin, 4) if amin is not None else None,
+                 "opaque": amin is not None and amin > _OPAQUE_ALPHA}
+        kind = "color" if alpha["opaque"] else "alpha"
     else:
         kind = "color"
     mips = 4.0 / 3.0 if pow2 else 1.0
     src = bpy.path.abspath(img.filepath) if img.filepath else ""
     return {"image": img.name, "width": w, "height": h, "powerOfTwo": pow2, "kind": kind,
             "source": img.source, "file": src or None, "fileExists": bool(src) and os.path.isfile(src),
-            "packed": img.packed_file is not None,
+            "packed": img.packed_file is not None, "alphaChannel": alpha,
             "estimatedBytes": int(w * h * _BYTES_PER_PIXEL[kind] * mips)}
+
+
+# A PROP'S TEXEL DENSITY (2026-11-25, FOUND 2026-11-18 on an 88 cm barrel carrying four 2048 maps): THIS OP'S RULE, not
+# an Epic number - 10.24 texels a centimetre (1024 a metre) across the object's largest side, the texture taken to
+# span that side once. A texture larger than the power of two that keeps it is advice, with what the smaller one saves.
+UEFN_TEXELS_PER_CM = 10.24
+
+
+def _image_users(objs):
+    """{image name: [object names]} - which objects' materials read each image, nested groups included."""
+    out = {}
+    for o in objs:
+        trees, done = [s.material.node_tree for s in getattr(o, "material_slots", [])
+                       if s.material is not None and s.material.node_tree is not None], set()
+        while trees:
+            t = trees.pop()
+            if t.as_pointer() in done:
+                continue
+            done.add(t.as_pointer())
+            for n in t.nodes:
+                if n.type == "TEX_IMAGE" and n.image is not None:
+                    users = out.setdefault(n.image.name, [])
+                    if o.name not in users:
+                        users.append(o.name)
+                elif n.type == "GROUP" and getattr(n, "node_tree", None) is not None:
+                    trees.append(n.node_tree)
+    return out
+
+
+def _gltf_output(mat):
+    """The "glTF Material Output" (or "glTF Settings") group node in a material, or None."""
+    t = mat.node_tree if mat.use_nodes else None
+    if t is None:
+        return None
+    return next((n for n in t.nodes if n.type == "GROUP" and n.node_tree is not None and (
+        n.node_tree.name.lower().startswith("gltf material output") or n.node_tree.name.lower().startswith(
+            "gltf settings")) and "Occlusion" in n.inputs), None)
+
+
+def _orm_sources(mat):
+    """{"ao", "roughness", "metallic"}: each a _trace tuple - AO read off the glTF output group's Occlusion."""
+    p = _principled(mat)
+    if p is None:
+        return None
+    g = _gltf_output(mat)
+    return {"ao": _trace(g.inputs["Occlusion"]) if g is not None else ("none",),
+            "roughness": _trace(_socket(p, _INPUTS["R"])), "metallic": _trace(_socket(p, _INPUTS["M"]))}
 
 
 def _check(checks, cid, severity, src, quote, message, **extra):
@@ -1682,6 +2086,52 @@ def _uefn_judge(targets, asset_folder, out_name, ext=None):
                    "'%s' is %d x %d, over %d." % (name, row["width"], row["height"], UEFN_TEXTURE_MAX), image=name,
                    value=max(row["width"], row["height"]), limit=UEFN_TEXTURE_MAX)
 
+    # A TEXTURE TOO HEAVY FOR ITS OBJECT, and MAPS ONE ORM WOULD CARRY (FOUND 2026-11-18: an 88 cm barrel passed with no
+    # advice at 13.7 MiB, 13.3 of it four separate 2048 maps). Both are advice, with what each change saves.
+    users = _image_users(every)
+    unit = bpy.context.scene.unit_settings.scale_length or 1.0
+    by_tex = {t["image"]: t for t in textures}
+    for t in textures:
+        objs_ = [o for o in (bpy.data.objects.get(n) for n in users.get(t["image"], [])) if o is not None]
+        side = max((max(o.dimensions) * unit * 100.0 for o in objs_), default=0.0)
+        big = max(t["width"], t["height"])
+        if side <= 0.0 or big == 0 or not t["powerOfTwo"]:
+            continue
+        need = 1
+        while need < side * UEFN_TEXELS_PER_CM:
+            need *= 2
+        need = max(need, 64)
+        if big > need:
+            k = (need / float(big)) ** 2
+            saves = t["estimatedBytes"] * (1.0 - k)
+            _check(checks, "textureDensity", "advice", "memory",
+                   "You cannot publish your island if it exceeds the 300 MiB publishing memory budget.",
+                   "'%s' is %d x %d for %s, %.0f cm on its largest side: %d keeps %.2f texels a cm (this op's rule, "
+                   "the texture spanning that side once) and saves %.2f MiB (resize_image)."
+                   % (t["image"], t["width"], t["height"], ", ".join(o.name for o in objs_), side, need,
+                      UEFN_TEXELS_PER_CM, saves / 1048576.0),
+                   image=t["image"], value=big, limit=need, sizeCm=round(side, 1),
+                   savesMiB=round(saves / 1048576.0, 3))
+    for mat in sorted({s.material for o in every for s in o.material_slots if s.material is not None},
+                      key=lambda m: m.name):
+        srcs = _orm_sources(mat)
+        if not srcs:
+            continue
+        imgs = {}
+        for role, src in srcs.items():
+            if src[0] == "image" and src[1].name in by_tex:
+                imgs.setdefault(src[1].name, []).append(role)
+        if len(imgs) < 2:
+            continue
+        rows = [by_tex[n] for n in imgs]
+        saves = sum(r["estimatedBytes"] for r in rows) - max(r["estimatedBytes"] for r in rows)
+        _check(checks, "unpackedMaps", "advice", "memory",
+               "You cannot publish your island if it exceeds the 300 MiB publishing memory budget.",
+               "material '%s' reads %s from %d separate maps (%s) - one ORM (R occlusion, G roughness, B metallic) "
+               "carries them in one texture and saves %.2f MiB. packOrm true packs it for the export."
+               % (mat.name, ", ".join(r for v in imgs.values() for r in v), len(imgs), ", ".join(sorted(imgs)),
+                  saves / 1048576.0), material=mat.name, images=sorted(imgs), savesMiB=round(saves / 1048576.0, 3))
+
     # TWO TEXTURES, ONE ASSET NAME (FOUND 2026-11-16 on 58 assets: every material's maps were baseColor.png, normal.png
     # ...): UEFN names a texture asset after its file, so two images whose files share a name land on one asset name
     by_name = {}
@@ -1749,7 +2199,8 @@ def _uefn_judge(targets, asset_folder, out_name, ext=None):
               "shareOfBudget": round(mib / UEFN_PUBLISH_BUDGET_MIB, 4),
               "note": "an ESTIMATE by this op, not UEFN's figure: UEFN calculates publishing memory from cooked data, "
                       "for the whole island (devices, landscape and every other asset count too). Textures at the "
-                      "format UE picks by default - BC1 0.5 B/px, BC3 or BC5 1 B/px, a float source RGBA16F 8 B/px - "
+                      "format UE picks by default - BC1 0.5 B/px, BC3 (an alpha that is not all opaque) or BC5 1 B/px, a "
+                      "float source RGBA16F 8 B/px - "
                       "with a full mip chain (+1/3) on a power-of-two texture; mesh vertices at 20 bytes plus 4 per UV "
                       "channel and 4 for a color, indices 2 or 4 bytes; a skinned mesh's bone weights at its "
                       "influences (rounded up to 4 or 8) times a 1-byte weight and a 1-byte bone index (2 past 256 "
@@ -1958,6 +2409,30 @@ def _read_fbx(path):
             "sockets": sorted({m["name"] for m in models.values() if (m["name"] or "").startswith("SOCKET_")})}
 
 
+def _gltf_slots(doc, images):
+    """{material: {slot: image name, ..., emissiveFactor}} - which image each glTF material slot reads (2026-11-25: an
+    AO wired to the glTF Material Output group reads back as occlusionTexture, or its absence is seen)."""
+    tex = doc.get("textures", [])
+
+    def name(ref):
+        try:
+            return images[tex[ref["index"]]["source"]]["name"]
+        except (KeyError, IndexError, TypeError):
+            return None
+    out = {}
+    for m in doc.get("materials", []):
+        pbr = m.get("pbrMetallicRoughness") or {}
+        row = {k: name(v) for k, v in (("baseColorTexture", pbr.get("baseColorTexture")),
+                                       ("metallicRoughnessTexture", pbr.get("metallicRoughnessTexture")),
+                                       ("normalTexture", m.get("normalTexture")),
+                                       ("occlusionTexture", m.get("occlusionTexture")),
+                                       ("emissiveTexture", m.get("emissiveTexture"))) if v is not None}
+        if m.get("emissiveTexture") is not None:
+            row["emissiveFactor"] = m.get("emissiveFactor", [0.0, 0.0, 0.0])
+        out[m.get("name") or "?"] = row
+    return out
+
+
 def _read_gltf(path):
     """What a .glb or .gltf holds: every mesh's vertices and triangles per its accessors (glTF stores one vertex per
     distinct corner, so this IS the count an importer starts from), UV sets, bounds in centimeters, materials and
@@ -2030,6 +2505,7 @@ def _read_gltf(path):
     return {"format": "glTF", "generator": (doc.get("asset") or {}).get("generator"),
             "meshes": sorted(meshes, key=lambda r: r["name"] or ""), "lodGroups": [],
             "materials": sorted({m.get("name") for m in doc.get("materials", []) if m.get("name")}),
+            "materialSlots": _gltf_slots(doc, images),
             "textures": images, "extensionsUsed": doc.get("extensionsUsed") or [],
             "animations": [a.get("name") for a in doc.get("animations", [])]}
 
@@ -2085,6 +2561,100 @@ class _NormalSwap:
         if self._dir:
             import shutil                                           # noqa: PLC0415
             shutil.rmtree(self._dir, ignore_errors=True)
+
+
+class _OrmSwap:
+    """packOrm (2026-11-25): each exported material's roughness, metallic and AO packed into one ORM file beside the
+    export (R occlusion, G roughness, B metallic) and wired for the write - straight to Roughness and Metallic for an
+    FBX, whose exporter embeds only an image wired straight to an input (an ORM read through Separate Color was left
+    out, FOUND 2026-11-18); through Separate Color to Roughness, Metallic and the glTF output group's Occlusion for a
+    glTF, which writes that as one metallicRoughnessTexture and an occlusionTexture. Put back after the write."""
+
+    def __init__(self):
+        self.rows, self.replaced, self._links, self._nodes, self._images = [], set(), [], [], []
+
+    def restore(self):
+        for tree, node in self._nodes:
+            try:
+                tree.nodes.remove(node)
+            except (ReferenceError, RuntimeError):
+                pass
+        for tree, a, b in self._links:
+            try:
+                tree.links.new(a, b)
+            except (ReferenceError, RuntimeError):
+                pass
+        for img in self._images:
+            try:
+                bpy.data.images.remove(img)
+            except ReferenceError:
+                pass
+
+
+def _orm_swap(targets_objs, out_dir, gltf, overwrite):
+    from .ops_image import op_channel_pack_image                     # noqa: PLC0415 - the one channel packer
+    swap = _OrmSwap()
+    mats = sorted({s_.material for o in targets_objs for s_ in o.material_slots if s_.material is not None},
+                  key=lambda m: m.name)
+    try:
+        for mat in mats:
+            srcs = _orm_sources(mat)
+            if not srcs or not any(srcs[k][0] == "image" for k in ("roughness", "metallic", "ao")):
+                continue
+
+            def chan(src, dflt):
+                if src[0] == "image":
+                    return {"image": src[1].name, "channel": "R" if src[2] == "RGB" else src[2]}
+                return float(src[1]) if src[0] == "value" and isinstance(src[1], float) else dflt
+            fp = os.path.join(out_dir, "%s_ORM.png" % _safe(mat.name))
+            got = op_channel_pack_image({"channels": {"R": chan(srcs["ao"], 1.0), "G": chan(srcs["roughness"], 0.5),
+                                                      "B": chan(srcs["metallic"], 0.0)},
+                                         "name": "%s_ORM" % _safe(mat.name), "filepath": fp, "overwrite": overwrite,
+                                         "fakeUser": False})
+            img = bpy.data.images[got["image"]]
+            swap._images.append(img)
+            img.colorspace_settings.name = "Non-Color"
+            tree = mat.node_tree
+            p = _principled(mat)
+            node = tree.nodes.new("ShaderNodeTexImage")
+            node.image = img
+            node.location = (p.location[0] - 600, p.location[1] - 300)
+            swap._nodes.append((tree, node))
+            targets = [_socket(p, _INPUTS["R"]), _socket(p, _INPUTS["M"])]
+            g = _gltf_output(mat)
+            if gltf:
+                sep = tree.nodes.new("ShaderNodeSeparateColor" if bpy.app.version >= (3, 3, 0) else
+                                     "ShaderNodeSeparateRGB")
+                swap._nodes.append((tree, sep))
+                tree.links.new(node.outputs["Color"], sep.inputs[0])
+                outs = list(sep.outputs)
+                feeds = [(outs[1], targets[0]), (outs[2], targets[1])]
+                if g is not None:
+                    feeds.append((outs[0], g.inputs["Occlusion"]))
+            else:
+                feeds = [(node.outputs["Color"], targets[0]), (node.outputs["Color"], targets[1])]
+            for src_sock, dst in feeds:
+                if dst is None:
+                    continue
+                for lk in list(dst.links):
+                    swap._links.append((tree, lk.from_socket, lk.to_socket))
+                    tree.links.remove(lk)
+                tree.links.new(src_sock, dst)
+            for k in ("roughness", "metallic", "ao"):
+                if srcs[k][0] == "image":
+                    swap.replaced.add(srcs[k][1].name)
+            swap.rows.append({"material": mat.name, "file": got["file"], "image": img.name,
+                              "layout": "R occlusion, G roughness, B metallic",
+                              "from": {k: (srcs[k][1].name + (":" + srcs[k][2] if srcs[k][2] != "RGB" else ""))
+                                       if srcs[k][0] == "image" else (srcs[k][1] if srcs[k][0] == "value" else None)
+                                       for k in ("ao", "roughness", "metallic")},
+                              "wiredForTheWrite": "Separate Color to Roughness (G), Metallic (B)%s" % (
+                                  " and the glTF output group's Occlusion (R)" if gltf and g is not None else "")
+                              if gltf else "straight to Roughness and Metallic, so the FBX embeds it"})
+    except Exception:
+        swap.restore()
+        raise
+    return swap
 
 
 def _directx_normals(textures):
@@ -2164,6 +2734,9 @@ def op_uefn_check(params):
     strict = take_bool(params, "strict", default=False)
     embed = take_bool(params, "embedTextures", default=True)
     with_hulls = take_bool(params, "includeHulls", default=True)
+    pack_orm = take_bool(params, "packOrm", default=False)
+    if pack_orm and raw is None:
+        raise MifOpError("packOrm packs the ORM for the export - pass file too. NOTHING was changed.")
     # A RIGGED MESH'S CLIPS (FOUND 2026-11-16): the mesh went out through export_mesh with bakeAnim off, so its actions
     # stayed behind and the reply did not say so. animations true writes each action keying its bones, one file each
     # through export_actions (an FBX); false names them in export.notWritten.
@@ -2315,6 +2888,13 @@ def op_uefn_check(params):
         from .ops_mesh import op_export_mesh                      # noqa: PLC0415 - the one FBX writer
         swap = _directx_normals(textures) if embed else None
         try:
+            orm = _orm_swap(targets, os.path.dirname(os.path.abspath(bpy.path.abspath(raw))), False, overwrite) \
+                if pack_orm else None
+        except Exception:
+            if swap is not None:
+                swap.restore()
+            raise
+        try:
             written = op_export_mesh(sub)
             written_files.append(written["file"])
             # A SKINNED CHAIN'S LODS GO ONE FILE EACH, as build_lod_chain writes them and a skeletal mesh imports them
@@ -2336,6 +2916,8 @@ def op_uefn_check(params):
                                       "bytes": got.get("fileSizeBytes"),
                                       "meshesInFile": [x["name"] for x in lrb["meshes"]]})
         finally:
+            if orm is not None:
+                orm.restore()
             if swap is not None:
                 swap.restore()
         out["export"] = {"through": "export_mesh", "params": sub, "file": written.get("file"),
@@ -2378,7 +2960,13 @@ def op_uefn_check(params):
         if rigs and not with_anims:
             sub["animation"] = False
         from .ops_io import op_export_scene                       # noqa: PLC0415 - the one glTF writer
-        written = op_export_scene(sub)
+        orm = _orm_swap(targets, os.path.dirname(os.path.abspath(bpy.path.abspath(raw))), True, overwrite) \
+            if pack_orm else None
+        try:
+            written = op_export_scene(sub)
+        finally:
+            if orm is not None:
+                orm.restore()
         written_files.append(written["file"])
         out["export"] = {"through": "export_scene", "params": sub, "file": written.get("file"),
                          "bytes": written.get("bytes"), "overwrote": written.get("overwrote")}
@@ -2408,6 +2996,15 @@ def op_uefn_check(params):
                 not_written["animations"] = missing
     if not_written:
         out["export"]["notWritten"] = not_written
+    if orm is not None:
+        held_names = {t.get("name") for t in rb["textures"] if ext != ".fbx" or t.get("embeddedBytes")}
+        for row in orm.rows:
+            row["inFile"] = os.path.splitext(os.path.basename(row["file"]))[0] in held_names or row["image"] in \
+                held_names
+            written_files.append(row["file"])
+        out["export"]["orm"] = orm.rows or None
+        if not orm.rows:
+            out["export"]["ormNote"] = "packOrm found no material reading roughness, metallic or AO from an image"
     rb["foundAgain"] = _judge_file(rb)
     # every LOD the main file should hold: a LodGroup's whole chain on FBX, LOD0 alone on glTF and for a skinned chain
     want = set()
@@ -2430,6 +3027,31 @@ def op_uefn_check(params):
     wired = _wired_images([bpy.data.objects[r["object"]] for m in meshes for r in m["lods"]])
     dropped = [t["image"] for t in textures if t["image"] in wired and t["image"] not in flagged and t["width"] and t["height"]
                and t["image"] not in held and os.path.splitext(os.path.basename(t["file"] or ""))[0] not in held]
+    # PACKED INTO THE ORM, or AO ON THE glTF OUTPUT GROUP ALONE (2026-11-25): an FBX has no occlusion slot, so an AO image
+    # read only by that group is not dropped from it - it ships as its own file, named in an advice row
+    replaced = orm.replaced if orm is not None else set()
+    occl_only = set()
+    if ext == ".fbx":
+        for o in {bpy.data.objects[r["object"]] for m in meshes for r in m["lods"]}:
+            for slot in o.material_slots:
+                g = _gltf_output(slot.material) if slot.material is not None else None
+                if g is None:
+                    continue
+                src = _trace(g.inputs["Occlusion"])
+                if src[0] == "image" and not any(
+                        lk.to_node != g for n in slot.material.node_tree.nodes if n.type == "TEX_IMAGE"
+                        and n.image is src[1] for out_ in n.outputs for lk in out_.links):
+                    occl_only.add(src[1].name)
+    dropped = [d for d in dropped if d not in replaced and d not in occl_only]
+    left_ao = sorted(occl_only - replaced)
+    files_of = {t["image"]: t["file"] or t["image"] for t in textures}
+    if left_ao:
+        _check(checks, "occlusionBeside", "advice", "import", "Materials and textures are imported by default with FBX",
+               "%s %s the glTF output group's Occlusion alone - an FBX has no occlusion slot, so %s is not in the "
+               "file: import %s as %s own texture, or packOrm true packs it into an ORM the FBX embeds." % (
+                   ", ".join(left_ao), "is read by" if len(left_ao) == 1 else "are read by",
+                   "it" if len(left_ao) == 1 else "they", ", ".join(files_of.get(n, n) for n in left_ao),
+                   "its" if len(left_ao) == 1 else "their"), images=left_ao)
     if dropped:
         _check(checks, "imageNotInFile", "warn", "import", "Materials and textures are imported by default with FBX",
                "the written file %s %s - the exporter left %s out (an image reaches a file only wired straight to a "
@@ -2463,6 +3085,7 @@ OPS = {
     "heightmap_from_mesh": op_heightmap_from_mesh,
     "export_actions": op_export_actions,
     "export_material_textures": op_export_material_textures,
+    "normal_map_convention": op_normal_map_convention,
     "export_camera": op_export_camera,
     "export_groom": op_export_groom,
     "uefn_check": op_uefn_check,

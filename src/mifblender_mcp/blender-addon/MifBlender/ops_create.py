@@ -103,8 +103,30 @@ CREATE_PRIMITIVE_PARAMS = (
     "kind", "type", "name", "size", "radius", "location", "rotation", "align",
     "segments", "ringCount", "subdivisions", "vertices", "depth",
     "radius1", "radius2", "xSubdivisions", "ySubdivisions", "fillType",
-    "majorRadius", "minorRadius", "majorSegments", "minorSegments", "collection",
+    "majorRadius", "minorRadius", "majorSegments", "minorSegments", "collection", "alignZ", "alignUp",
 )
+
+
+def _align_z_euler(z_raw, up_raw, tail):
+    """The XYZ euler that turns local +Z onto z_raw, with local +Y as near up_raw as it can be (default world +Z, or world
+    +Y when the direction is vertical) - (euler, the up used)."""
+    from mathutils import Matrix, Vector              # noqa: PLC0415
+    z = Vector(finite_floats(list(z_raw), "alignZ")) if isinstance(z_raw, (list, tuple)) and len(z_raw) == 3 else None
+    if z is None or z.length < 1e-9:
+        raise MifOpError("alignZ is a direction [x, y, z] that is not zero, got %r. %s" % (z_raw, tail))
+    z.normalize()
+    if up_raw is not None:
+        if not isinstance(up_raw, (list, tuple)) or len(up_raw) != 3:
+            raise MifOpError("alignUp is a direction [x, y, z], got %r. %s" % (up_raw, tail))
+        up = Vector(finite_floats(list(up_raw), "alignUp"))
+    else:
+        up = Vector((0.0, 0.0, 1.0)) if abs(z.z) < 0.999 else Vector((0.0, 1.0, 0.0))
+    y = up - z * up.dot(z)
+    if y.length < 1e-6:
+        raise MifOpError("alignUp %s is parallel to alignZ, so it cannot set the roll. %s" % (list(up), tail))
+    y.normalize()
+    x = y.cross(z)
+    return Matrix((x, y, z)).transposed().to_euler("XYZ"), [round(v, 6) for v in up]
 
 
 def _vec3(params, key, default):
@@ -156,6 +178,11 @@ def op_create_primitive(params):
 
     rotation IS RADIANS (Euler XYZ), said in the reply as rotationUnit; a component past a full turn (2*pi) is refused as
     a degrees value, with the radians it would be.
+
+    alignZ [x, y, z] (2026-11-25) points the primitive's local +Z along a direction - an eye's pole on the gaze, a claw
+    or a horn along its growth - with local +Y as near alignUp as it can be (default world +Z, or +Y for a vertical
+    direction). Found 2026-11-18: the euler for a gaze was computed driver-side. It replaces rotation and align, which
+    are refused beside it; the reply measures the angle between the object's +Z and the direction (alignZErrorDeg).
 
     REFUSED IN EDIT MODE, because primitive_*_add welds into the edited mesh there - a destructive
     outcome dressed up as a failure.
@@ -232,6 +259,15 @@ def op_create_primitive(params):
         raise MifOpError("rotation %s is in RADIANS, and a value past a full turn (2*pi = 6.2832) looks like degrees. "
                          "Read as degrees it is %s radians; pass those. NOTHING was created."
                          % (rnd(kwargs["rotation"]), rnd([math.radians(v) for v in kwargs["rotation"]])))
+    align_z = params.get("alignZ")
+    if align_z is None and params.get("alignUp") is not None:
+        raise MifOpError("alignUp sets the roll of alignZ, which was not passed. NOTHING was created.")
+    if align_z is not None:
+        if params.get("rotation") is not None or align is not None:
+            raise MifOpError("alignZ sets the rotation from a direction; rotation and align would set it again. Send "
+                             "one. NOTHING was created.")
+        euler, up_used = _align_z_euler(align_z, params.get("alignUp"), "NOTHING was created.")
+        kwargs["rotation"] = tuple(euler)
     if align is not None:
         kwargs["align"] = align
     if not spec.get("noEnterEditmode"):
@@ -254,7 +290,7 @@ def op_create_primitive(params):
             # of the two colliding objects sorts first, so when the operator's default name sorts
             # after the caller's - "Torus" against "MifT_Clash" - the object that ALREADY had the
             # name is the one silently renamed, and that is the one direction the nameNote below
-            # cannot see. See ops_common.assign_id_name and ledger B12. The DATA name goes the same
+            # cannot see. See ops_common.assign_id_name and the internal notes. The DATA name goes the same
             # way for the same reason: meshes are IDs too, and a displaced mesh is just as invisible.
             assign_id_name(obj, name, bpy.data.objects)
             assign_id_name(obj.data, obj.name, bpy.data.meshes)
@@ -276,6 +312,14 @@ def op_create_primitive(params):
     # here and nested there would be two shapes for one thing, and an agent that creates a
     # primitive and then re-reads it would get different keys for identical data.
     out = {"object": object_info(obj), "created": True, "kind": kind, "rotationUnit": "radians"}
+    if align_z is not None:
+        from mathutils import Vector                  # noqa: PLC0415
+        bpy.context.view_layer.update()
+        got = (obj.matrix_world.to_3x3() @ Vector((0.0, 0.0, 1.0))).normalized()
+        out["alignZ"] = rnd(list(Vector(align_z).normalized()))
+        out["alignUp"] = up_used
+        # MEASURED off the object, not the euler written: the angle between its world +Z and the direction asked for.
+        out["alignZErrorDeg"] = round(math.degrees(got.angle(Vector(align_z).normalized(), 0.0)), 6)
     # ECHOED FROM THE OBJECT. Blender appends .001 on a collision and never says so. Duplicated at
     # top level because the name is the identity every op reports, not just a geometry fact.
     out["name"] = obj.name
@@ -283,7 +327,7 @@ def op_create_primitive(params):
     # THE CANONICAL SPELLING, alongside the note. Ten other ops report requestedName and
     # nameWasSuffixed, and a caller that has to look for a differently-named field on every creation
     # op cannot write one check. nameWasSuffixed is now answerable on all five builds: before
-    # assign_id_name it was silently False on 3.6 whatever happened (ledger B12).
+    # assign_id_name it was silently False on 3.6 whatever happened.
     out["requestedName"] = name or None
     out["collections"] = [c.name for c in obj.users_collection]
     out["nameWasSuffixed"] = bool(name and obj.name != name)
@@ -309,8 +353,14 @@ def op_transform_object(params):
 
     `after` IS DERIVED FROM matrix_world, not from the field that was written, so it cannot agree
     with the request by construction.
+
+    pivot (2026-11-25): the point rotation and scale turn about - "origin" (the default, as before), "bounds" (the
+    centre of the object's own bounding box, in world space) or a world point [x, y, z]. Found 2026-11-18: rotating a
+    part in place after apply_transform had moved its origin to the world origin needed set_origin first. The object's
+    origin moves so the pivot stays where it was (pivotHeld measures it). A pivot with an absolute location is refused
+    - one says where the origin goes and the other moves it; a relative location is applied after the turn.
     """
-    reject_unknown(params, ("object", "name", "location", "rotation", "scale", "relative"),
+    reject_unknown(params, ("object", "name", "location", "rotation", "scale", "relative", "pivot"),
                    "transform_object")
     obj = get_object(take(params, "object", "name", required=True))
     # A LINKED OBJECT CANNOT BE MOVED BY THIS FILE. Measured on 5.0.1: this accepted the move,
@@ -337,8 +387,10 @@ def op_transform_object(params):
         want_rot = _vec3(params, "rotation", (0, 0, 0)) if "rotation" in params else None
     except MifOpError as exc:
         raise MifOpError("%s NOTHING was changed." % str(exc).rstrip("."))
+    pivot_world, pivot_shown = _transform_pivot(obj, params.get("pivot"), want_loc, want_rot, want_scale, relative)
+    pivot_local = obj.matrix_world.inverted_safe() @ pivot_world if pivot_world is not None else None
 
-    if want_loc is not None:
+    if want_loc is not None and pivot_world is None:
         v = want_loc
         obj.location = [a + b for a, b in zip(obj.location, v)] if relative else v
     if want_scale is not None:
@@ -352,8 +404,24 @@ def op_transform_object(params):
     # Blender does not refresh matrix_world until the depsgraph runs, and a caller reading the world
     # transform straight afterwards would get the stale one.
     bpy.context.view_layer.update()
+    pivot_held = None
+    if pivot_world is not None:
+        # THE ORIGIN MOVES SO THE PIVOT STAYS: where the pivot's local point landed after the turn, shifted back.
+        mw = obj.matrix_world.copy()
+        mw.translation += pivot_world - (mw @ pivot_local)
+        obj.matrix_world = mw
+        if want_loc is not None:                     # relative only (_transform_pivot refused an absolute one)
+            obj.location = [a + b for a, b in zip(obj.location, want_loc)]
+        bpy.context.view_layer.update()
+        if want_loc is None:
+            pivot_held = round((obj.matrix_world @ pivot_local - pivot_world).length, 6)
 
     out = {"object": object_info(obj), "name": obj.name, "before": before, "relative": relative}
+    if pivot_world is not None:
+        out["pivot"] = pivot_shown
+        out["pivotWorld"] = rnd(list(pivot_world))
+        # MEASURED: how far the pivot's point moved (0 when it held); None when a relative location moved it on purpose.
+        out["pivotHeld"] = pivot_held
     # READ BACK OFF matrix_world, so this reports where the object IS rather than what was asked
     # for. That is the whole difference between the two claims the docstring distinguishes.
     out["after"] = {
@@ -389,6 +457,28 @@ def op_transform_object(params):
     return out
 
 
+def _transform_pivot(obj, raw, want_loc, want_rot, want_scale, relative):
+    """transform_object's pivot: (world point, how it was named), or (None, None) for the origin."""
+    from mathutils import Vector                      # noqa: PLC0415
+    if raw is None or (isinstance(raw, str) and raw.strip().lower() == "origin"):
+        return None, None
+    tail = "NOTHING was changed."
+    if want_rot is None and want_scale is None:
+        raise MifOpError("pivot is the point rotation and scale turn about; pass rotation or scale with it. %s" % tail)
+    if want_loc is not None and not relative:
+        raise MifOpError("pivot moves the origin so the pivot stays put, and an absolute location says where the origin "
+                         "goes - one of them would be overruled. Send the location in its own call, or relative:true. "
+                         "%s" % tail)
+    if isinstance(raw, str) and raw.strip().lower() == "bounds":
+        corners = [Vector(c) for c in obj.bound_box]
+        centre = sum(corners, Vector((0.0, 0.0, 0.0))) / 8.0
+        return obj.matrix_world @ centre, "bounds"
+    if isinstance(raw, (list, tuple)) and len(raw) == 3:
+        point = finite_floats(list(raw), "pivot")
+        return Vector(point), point
+    raise MifOpError("pivot is \"origin\", \"bounds\" or a world point [x, y, z], got %r. %s" % (raw, tail))
+
+
 _TRANSFORM_OBJECTS_KEYS = ("objects", "pivot", "rotation", "translation", "dryRun", "previewId", "previewTtlSeconds")
 
 
@@ -399,7 +489,7 @@ def op_transform_objects(params):
     inputs and all target objects are checked before the first write. Parented objects are
     refused because changing a parent's matrix would also move unlisted children.
 
-    dryRun:true is the BULK PREVIEW (docs/15 section 5): every object's world transform before and after, and a
+    dryRun:true is the BULK PREVIEW: every object's world transform before and after, and a
     previewId that {previewId} alone commits - planned again, refused on any difference, read back, rolled back.
     """
     reject_unknown(params, _TRANSFORM_OBJECTS_KEYS, "transform_objects")
@@ -470,7 +560,7 @@ def _transform_objects_resolve(params):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# THE BULK PREVIEW of transform_objects (ops_preview.py; docs/15 section 5): one change per object, its world transform
+# THE BULK PREVIEW of transform_objects: one change per object, its world transform
 # before and after; the inverse sets the matrix back.
 # ---------------------------------------------------------------------------------------------------------------------
 def _world_transform(matrix):
@@ -766,9 +856,12 @@ def _parent_vertices(parent, ptype, raw):
 # BONE HEAT'S MEMORY (FOUND 2026-11-09: heat on a 910,104 vertex mesh peaked at 11 GB and then failed). Measured on
 # 5.0.1, the peak private commit of set_parent ARMATURE_AUTO on closed cylinders: 10,752 bytes a vertex at 10,000 and
 # 10,090 at 40,000 - about 11 KB a vertex, as the large case's 12 KB. The estimate takes 12 KB; over available memory
-# less a 4 GB reserve, or memoryBudgetGB, the heat run is refused before it starts.
+# less a reserve, or memoryBudgetGB, the heat run is refused before it starts.
+# THE RESERVE FITS THE JOB (found 2026-11-18): a fixed 4 GB refused a ~0.1 GB heat job on a 64 GB machine reporting 3 GB
+# free. It is the job's own estimate, kept between 0.5 GB and 4 GB.
 _HEAT_BYTES_PER_VERTEX = 12 * 1024
 _HEAT_RESERVE = 4 * 1024 ** 3
+_HEAT_RESERVE_MIN = 512 * 1024 ** 2
 
 
 def _heat_memory_guard(obj, params):
@@ -779,16 +872,19 @@ def _heat_memory_guard(obj, params):
         raise MifOpError("memoryBudgetGB is a size in GB above 0, got %r. NOTHING was changed." % budget_gb)
     from . import childproc                                     # noqa: PLC0415
     avail = childproc.available_memory_bytes()
-    budget = int(budget_gb * 1024 ** 3) if budget_gb is not None else (
-        None if avail is None else max(0, avail - _HEAT_RESERVE))
     estimate = len(obj.data.vertices) * _HEAT_BYTES_PER_VERTEX
+    reserve = min(_HEAT_RESERVE, max(_HEAT_RESERVE_MIN, estimate))
+    budget = int(budget_gb * 1024 ** 3) if budget_gb is not None else (
+        None if avail is None else max(0, avail - reserve))
     if budget is not None and estimate > budget:
         raise MifOpError(
-            "heat weighting '%s' (%d vertices) is estimated to take %.1f GB at its peak (about 12 KB a vertex, "
-            "measured), over the %.1f GB %s. Weight a decimated copy and transfer the weights (transfer_mesh_data), "
-            "use type ARMATURE_NAME with a fallback, or pass memoryBudgetGB if the machine can spare it. NOTHING was "
-            "changed." % (obj.name, len(obj.data.vertices), estimate / 1024 ** 3, budget / 1024 ** 3,
-                          "budget you gave" if budget_gb is not None else "of memory free now less a 4 GB reserve"))
+            "heat weighting '%s' (%d vertices) is estimated to take %.1f GB at its peak (12 KB a vertex; 10-11 KB "
+            "was measured), over the %.1f GB %s. Weight a decimated copy and copy its weights back by proximity "
+            "(transfer_weights), use type ARMATURE_NAME with a fallback, or pass memoryBudgetGB if the machine can "
+            "spare it. NOTHING was changed." % (obj.name, len(obj.data.vertices), estimate / 1024 ** 3, budget / 1024 ** 3,
+                          "budget you gave" if budget_gb is not None else
+                          "of memory free now (%.1f GB) less a %.1f GB reserve" % ((avail or 0) / 1024 ** 3,
+                                                                                  reserve / 1024 ** 3)))
 
 
 def _vertices_nearest(obj, rig, names):
@@ -1884,9 +1980,14 @@ def op_join_objects(params):
     Unreal plugin's merge_static_mesh_actors counts the same way: the merged mesh and its actor, plus each piece only
     when keepInputs false destroys it. kept names the sources still there. Mesh targets only.
     """
-    reject_unknown(params, ("target", "objects", "sources", "renameSuffix", "keepSources"), "join_objects")
+    # previewId is the change cap's commit (cap.PREVIEWABLE): server.py hands {previewId} alone to cap.take_commit, which
+    # swaps in the stored request before this runs, so the op never reads it - it is listed so the declared contract
+    # (describe_op, parity_check) matches what a caller sends, as every other previewed op lists it.
+    reject_unknown(params, ("target", "objects", "sources", "renameSuffix", "keepSources", "visible", "previewId"),
+                   "join_objects")
     _require_object_mode("join_objects")
     keep = take_bool(params, "keepSources", default=False)
+    visible = take_bool(params, "visible", default=False)
     probe = get_object(take(params, "target", required=True))
     if probe.type == "ARMATURE":
         if keep:
@@ -1924,6 +2025,10 @@ def op_join_objects(params):
 
     slots_before = [s.material.name if s.material else None for s in target.material_slots]
     counts_before = mesh_counts(target)
+    # A SOURCE'S MODIFIERS DO NOT SURVIVE A JOIN (found 2026-11-18): join() keeps the target's stack and drops every
+    # source's, so a Smooth by Angle set_shading added to each part was gone from all but the target and the shading
+    # changed with no word. Read before the join, reported after it.
+    dropped_mods = {s.name: ["%s (%s)" % (m.name, m.type) for m in s.modifiers] for s in sources if len(s.modifiers)}
 
     # THE COPIES JOIN, NOT THE SOURCES, with keepSources: each a copy of the object and of its mesh, in the source's
     # collections, so join() takes them exactly as it would have taken the source (transform, modifiers dropped alike).
@@ -1982,8 +2087,13 @@ def op_join_objects(params):
             % (len(gone), len(names), ", ".join(left)))
 
     slots_after = [s.material.name if s.material else None for s in target.material_slots]
+    if visible:
+        target.hide_render = False                  # visible: the joined mesh renders (a hidden part made it keep hide_render)
     return {
         "target": target.name,
+        "hideRender": target.hide_render,
+        "hideRenderNote": ("the joined mesh is hidden from render, as the target was - a bake on it fails 'not enabled "
+                           "for rendering'; visible true clears it" if target.hide_render else None),
         "joined": list(names),
         # MEASURED from which objects actually disappeared, never echoed from the request. With keepSources nothing
         # named was consumed: the copies were, and kept lists the sources, every one measured as still there.
@@ -1998,6 +2108,12 @@ def op_join_objects(params):
         "slotNote": ("join MERGES the material slot lists and remaps every face's slot index, so "
                      "the result's slot ORDER is not either input's order. Slot order is what "
                      "lines up against Unreal's material array - check it before export."),
+        "sourceModifiersDropped": dropped_mods or None,
+        "modifierWarning": ("the join kept '%s''s modifier stack and dropped every source's: %s. Their geometry "
+                            "joined without them - re-add on the target what it still needs (a Smooth by Angle, "
+                            "a Weighted Normal), or apply them on the sources before joining."
+                            % (target.name, "; ".join("%s: %s" % (k, ", ".join(v)) for k, v in dropped_mods.items())))
+        if dropped_mods else None,
     }
 
 
@@ -2260,17 +2376,23 @@ def op_separate_mesh(params):
     source counts.
     """
     # A LITERAL TUPLE: parity_check reads the accepted keys statically and refuses an expression it cannot read.
+    # previewId is the change cap's commit (cap.PREVIEWABLE): server.py hands {previewId} alone to cap.take_commit, which
+    # swaps in the stored request before this runs, so the op never reads it - it is listed so the declared contract
+    # (describe_op, parity_check) matches what a caller sends, as every other previewed op lists it.
     reject_unknown(params, ("object", "name", "mode", "faces", "vertexGroup", "minWeight", "loop", "duplicate",
-                            "newName"), "separate_mesh")
+                            "newName", "previewId"), "separate_mesh")
     _require_object_mode("separate_mesh")
     obj = get_object(take(params, "object", "name", required=True), want_mesh=True)
-    mode = (take(params, "mode", default="loose", kind=str) or "loose").lower()
+    extra = [k for k in _SEP_SELECT_KEYS if params.get(k) is not None]
+    # A SELECTOR ALONE MEANS mode "selection" (found 2026-11-18: vertexGroup with no mode was refused with wording that
+    # read as a sentence, not as the value to send). An explicit other mode beside a selector is still refused.
+    implied = params.get("mode") is None and any(params.get(k) is not None for k in ("faces", "vertexGroup", "loop"))
+    mode = "selection" if implied else (take(params, "mode", default="loose", kind=str) or "loose").lower()
     if mode not in ("loose", "material", "selection"):
         raise MifOpError("mode must be \"loose\", \"material\" or \"selection\", got '%s'" % mode)
-    extra = [k for k in _SEP_SELECT_KEYS if params.get(k) is not None]
     if mode != "selection" and extra:
-        raise MifOpError("%s %s for mode selection. NOTHING was changed." % (", ".join(extra),
-                                                                            "are" if len(extra) > 1 else "is"))
+        raise MifOpError("%s %s for mode \"selection\" (mode %r was sent; leave mode out and a selector implies it). "
+                         "NOTHING was changed." % (", ".join(extra), "are" if len(extra) > 1 else "is", mode))
     if mode == "selection":
         new_obj, dup = _separate_selection(params, obj)
         nc, sc = mesh_counts(new_obj), mesh_counts(obj)
@@ -2627,7 +2749,7 @@ def op_convert_object(params):
       shared data    every object using the same datablock converts with it, so they are named in the response.
       the old data   is left with no users. It is REMOVED here when nothing else holds it: create_curve names a curve's
                      data after its object, so an orphan keeping that name pushes the next curve of the same name to
-                     "<name>.001" - the name-reservation trap ledger B6 records.
+                     "<name>.001" - the name-reservation trap the internal notes records.
     TARGETS ARE READ OFF THE OPERATOR, never listed: 3.6 and 4.2 offer GPENCIL, 4.4 onward GREASEPENCIL, 5.0 onward
     POINTCLOUD as well.
 
@@ -3526,7 +3648,7 @@ def op_create_curve(params):
     # bpy.data.curves.new, so Blender's own enum check fired on an object that already existed and
     # the op refused with a TypeError having left an orphaned curve behind.
     #
-    # WHY THAT IS WORSE THAN AN UNTIDY FILE: by ledger B6 an orphan keeps its NAME reserved. A
+    # WHY THAT IS WORSE THAN AN UNTIDY FILE: by the internal notes an orphan keeps its NAME reserved. A
     # caller who mistypes, reads the error and retries gets "<name>.001" with nameWasSuffixed:true,
     # and every later lookup by the name they actually asked for finds nothing. The old refusal did
     # not even say what had happened, because the message was Blender's rather than ours.
@@ -3542,7 +3664,7 @@ def op_create_curve(params):
     # AND THE REST OF THE SETTINGS, FOR THE SAME REASON - the fourth time. cyclic, bevelDepth, extrude,
     # bevelResolution, resolution and usePath were read AFTER bpy.data.curves.new: {cyclic: "flase"} was
     # refused with the curve datablock left behind holding the name (measured on 5.0.1, 2026-09-21), so the
-    # retry the refusal invites came back as "<name>.001" - ledger B6.
+    # retry the refusal invites came back as "<name>.001" - the internal notes.
     try:
         cyclic = take_bool(params, "cyclic", default=False)
         use_path = take_bool(params, "usePath", default=True)
@@ -5368,7 +5490,72 @@ def op_create_texture(params):
 # ---------------------------------------------------------------------------
 
 _CREATE_MESH_KEYS = {"name", "vertices", "faces", "edges", "materialIndices", "materials", "uvs", "vertexGroups",
-                     "smooth", "location", "rotation", "scale", "collection", "takeOverName", "file", "replaceData"}
+                     "smooth", "location", "rotation", "scale", "collection", "takeOverName", "file", "replaceData",
+                     "recalcNormals"}
+
+
+_ORIENT_CHECK_FACES = 250000
+
+
+def _closed_part_orientation(mesh, fix):
+    """Every CLOSED loose part of mesh (each edge on exactly two of its faces) by signed volume: (rows of inside-out
+    parts, closed part count, faces flipped). With fix, a closed part's winding is made consistent and outward
+    (bmesh recalc_face_normals, then reversed if its volume is still negative); open parts are left as wound.
+
+    WHY (found 2026-11-18 by two builds): a closed blade came out inside-out from its vertex order with no word at
+    create time - only mesh_quality caught it, later. build_lathe orients by signed volume; this is the same check."""
+    import bmesh                                          # noqa: PLC0415
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(mesh)
+        bm.faces.ensure_lookup_table()
+        seen, parts = set(), []
+        for f in bm.faces:
+            if f.index in seen:
+                continue
+            stack, part = [f], []
+            seen.add(f.index)
+            while stack:
+                g = stack.pop()
+                part.append(g)
+                for v in g.verts:
+                    for h in v.link_faces:
+                        if h.index not in seen:
+                            seen.add(h.index)
+                            stack.append(h)
+            parts.append(part)
+
+        def volume(part):
+            vol = 0.0
+            for g in part:
+                a = g.verts[0].co
+                for k in range(1, len(g.verts) - 1):
+                    vol += a.dot(g.verts[k].co.cross(g.verts[k + 1].co))
+            return vol / 6.0
+        rows, closed, flipped = [], 0, 0
+        for i, part in enumerate(parts):
+            edges = {e for g in part for e in g.edges}
+            if not all(len(e.link_faces) == 2 for e in edges):
+                continue
+            closed += 1
+            vol = volume(part)
+            if vol >= 0.0 and not fix:
+                continue
+            if fix:
+                before = [tuple(v.index for v in g.verts) for g in part]
+                bmesh.ops.recalc_face_normals(bm, faces=part)
+                if volume(part) < 0.0:
+                    bmesh.ops.reverse_faces(bm, faces=part)
+                flipped += sum(1 for g, b in zip(part, before) if tuple(v.index for v in g.verts) != b)
+            if vol < 0.0:
+                rows.append({"part": i, "faces": len(part), "firstFace": min(g.index for g in part),
+                             "signedVolume": round(vol, 9)})
+        if fix and flipped:
+            bm.to_mesh(mesh)
+            mesh.update()
+        return rows, closed, flipped
+    finally:
+        bm.free()
 # The keys a geometry file may hold: the same names the call takes inline.
 # read_mesh_data's file (ops_meshdata, 2026-11-15) adds metadata beside them, which the reader drops by this format tag
 _MESH_FILE_FORMAT = "mifbridge.mesh/1"
@@ -5701,6 +5888,10 @@ def op_create_mesh(params):
                                          nameHeldBy names each object or mesh already holding the name, its users and
                                          whether it is an orphan (2026-10-05: a rebuild after a delete that left the
                                          mesh behind came back '.001' with nothing saying why)
+      recalcNormals (bool)               default false. The reply's insideOutParts lists every CLOSED loose part whose
+                                         signed volume is negative (its faces point in) with a warning; true makes each
+                                         closed part's winding consistent and outward first (normalsFlipped counts the
+                                         faces turned). Open parts are left as wound
       takeOverName (bool)                default false; true removes the ORPHAN object and/or mesh holding the name
                                          (no users, no fake user) so both get it exactly, listed in nameTakenOverFrom;
                                          a holder in use is refused by name and nothing is created or removed
@@ -5765,6 +5956,8 @@ def op_create_mesh(params):
                                  wanted, "; ".join("%s '%s' (%d user%s%s)" % (
                                      r["kind"], r["name"], r["users"], "" if r["users"] == 1 else "s",
                                      ", a fake user" if r["fakeUser"] else "") for r in live), tail))
+    # READ BEFORE THE MESH IS MADE: a malformed recalcNormals refused after meshes.new left the new mesh behind.
+    fix = take_bool(params, "recalcNormals", default=False)
 
     mesh = bpy.data.meshes.new(wanted)
     mesh.from_pydata(verts, edges, faces)
@@ -5794,10 +5987,27 @@ def op_create_mesh(params):
         for _ in range(max(mat_idx) + 1):
             mesh.materials.append(None)
     mesh.update()
+    if fix or len(mesh.polygons) <= _ORIENT_CHECK_FACES:
+        inside_out, closed_parts, flipped = _closed_part_orientation(mesh, fix)
+        orient = {"closedParts": closed_parts, "insideOutParts": inside_out or None,
+                  "normalsFlipped": flipped if fix else None}
+    else:
+        # SAID, NOT SKIPPED IN SILENCE: the part walk is Python, about a second per 100k faces.
+        inside_out, orient = [], {"closedParts": None, "insideOutParts": None, "normalsFlipped": None,
+                                  "normalsNote": "%d faces, over %d: the inside-out check was not run; recalcNormals:true "
+                                                 "runs it (and turns closed parts out)." % (len(mesh.polygons),
+                                                                                            _ORIENT_CHECK_FACES)}
+    if inside_out and not params.get("recalcNormals"):
+        orient["normalsWarning"] = ("%d closed part(s) are inside out - their faces point in (negative signed volume): "
+                                    "the winding is clockwise seen from outside. recalcNormals:true turns them out."
+                                    % len(inside_out))
+    elif inside_out:
+        orient["normalsNote"] = "%d closed part(s) came in inside out and were turned to face out." % len(inside_out)
     if target is not None:
         out = _replace_mesh_data(target, mesh, groups, materials is not None or mat_idx is not None, params, _placed,
                                  want_scale)
         out["fromFile"] = from_file
+        out.update(orient)
         return out
 
     # TAKING THE NAME OVER happens last, once nothing below can refuse: the orphans go (the object first - it may be
@@ -5841,6 +6051,7 @@ def op_create_mesh(params):
         "vertexCount": len(mesh.vertices), "edgeCount": len(mesh.edges), "faceCount": len(mesh.polygons),
         "looseEdgeCount": sum(1 for e in mesh.edges if e.is_loose),
         "edgesOnFaces": on_faces[:50] or None,
+        **orient,
         "edgesOnFacesNote": ("%d of the 'edges' given are also face edges, so they are not loose" % len(on_faces))
                             if on_faces else None,
         "uvLayers": [u.name for u in mesh.uv_layers],
@@ -5981,8 +6192,8 @@ def _replace_mesh_data(obj, mesh, groups, slots_given, params, placed, want_scal
 # duplicate_object -- a copy under a new name, full or linked
 # ---------------------------------------------------------------------------
 
-_DUPLICATE_KEYS = ("objects", "object", "names", "suffix", "linked", "collection", "offset", "rotation", "scale",
-                   "includeChildren", "hide")
+_DUPLICATE_KEYS = ("objects", "object", "name", "names", "suffix", "linked", "collection", "offset", "rotation",
+                   "scale", "includeChildren", "hide", "visible")
 
 
 def _data_collection(data):
@@ -6027,6 +6238,28 @@ def copy_row(src, new, wanted, linked):
     }
 
 
+def _dup_hidden_row(row, src, new):
+    """The copy's hidden state in its reply row, and a note when it came from the source rather than hide."""
+    def state(o):
+        try:
+            eye = o.hide_get()
+        except RuntimeError:
+            eye = None
+        return {"hideRender": o.hide_render, "hideViewport": o.hide_viewport, "hiddenInViewLayer": eye}
+    row["hidden"] = state(new)
+    if new.hide_render and src.hide_render:
+        row["hiddenNote"] = ("the copy kept its source's hide_render, so a bake on it fails 'not enabled for rendering' - "
+                             "visible true clears it")
+
+
+def _world_from_basis(obj):
+    """obj's world matrix from the basis chain (parent's world @ parent inverse @ basis), never the cached
+    matrix_world, which a viewport-hidden collection leaves stale. Constraints are not applied."""
+    if obj.parent is None:
+        return obj.matrix_basis.copy()
+    return _world_from_basis(obj.parent) @ obj.matrix_parent_inverse @ obj.matrix_basis
+
+
 def op_duplicate_object(params):
     """Duplicate objects under new names: a full copy (its own mesh) or a linked one (the same mesh, as Alt+D).
 
@@ -6039,15 +6272,19 @@ def op_duplicate_object(params):
     each copy asks for its source's name and Blender appends .001 - the reply echoes the name every copy actually got,
     with nameWasSuffixed. linked (default false) shares the data: an edit to one mesh then shows on both, which is what
     a linked duplicate is for. Materials are shared either way (Blender's own default), and so is any action.
-    collection puts every copy there; by default each copy goes into its source's collections. offset [x,y,z] (world
-    units) moves each top-level copy, rotation [x,y,z] (radians, as transform_object) turns it about its own origin and
-    scale multiplies its scale. includeChildren copies each object's children too, parented to the copies. hide
-    'original' or 'copy' hides that one in the view layer and the render (a kept backup). Every name and target is
+    collection puts every copy there; by default each copy goes into its source's collections. offset (meters, world
+    space, [x,y,z]) moves each top-level copy, rotation (radians, not degrees, [x,y,z], as transform_object) turns it
+    about its own origin and scale multiplies its scale. includeChildren copies each object's children too, parented to the copies. hide
+    'original' or 'copy' hides that one in the view layer and the render (a kept backup). A copy keeps its source's
+    hidden state; each row's hidden says it, and visible true shows every copy in the viewport and the render. Every name and target is
     checked before anything is made.
     """
     reject_unknown(params, _DUPLICATE_KEYS, "duplicate_object")
     tail = "NOTHING was created."
-    raw = take(params, "objects", "object")
+    if params.get("name") is not None and (params.get("object") is not None or params.get("objects") is not None):
+        raise MifOpError("duplicate_object takes the new names as `names` (one per object) or a `suffix`; `name` is the "
+                         "object to copy, as in every op, and was sent beside object/objects. NOTHING was changed.")
+    raw = take(params, "objects", "object", "name")
     if raw is None:
         raise MifOpError("pass objects (a list of names) or object (one name). %s" % tail)
     names_in = [raw] if isinstance(raw, str) else raw
@@ -6074,6 +6311,9 @@ def op_duplicate_object(params):
     hide = take(params, "hide", kind=str)
     if hide is not None and hide.lower() not in ("original", "copy"):
         raise MifOpError("hide must be 'original' or 'copy' (got %r). %s" % (hide, tail))
+    visible = take_bool(params, "visible", default=False)
+    if visible and hide is not None and hide.lower() == "copy":
+        raise MifOpError("visible shows the copies and hide 'copy' hides them - pass one. %s" % tail)
     target = None
     coll_name = take(params, "collection", kind=str)
     if coll_name is not None:
@@ -6139,10 +6379,26 @@ def op_duplicate_object(params):
             write_rotation(new, rotation, True)
         bpy.context.view_layer.update()
         if offset is not None:
+            # A HIDDEN COLLECTION'S OBJECTS KEEP A STALE matrix_world: view_layer.update()
+            # does not refresh an object in a viewport-hidden collection, so reading matrix_world here and writing it back
+            # put the SOURCE's rotation and scale over the ones just set - ok:true and a wrong copy. The offset is applied
+            # to location instead, turned into the parent's space through a matrix computed from the basis chain, and
+            # rotation and scale are never written back.
             from mathutils import Vector   # local, as op_transform_objects imports it
-            mw = new.matrix_world.copy()
-            mw.translation = mw.translation + Vector(offset)
-            new.matrix_world = mw
+            delta = Vector(offset)
+            if new.parent is not None:
+                delta = (_world_from_basis(new.parent) @ new.matrix_parent_inverse).to_3x3().inverted_safe() @ delta
+            new.location = new.location + delta
+        if visible:
+            # A COPY KEEPS ITS SOURCE'S HIDDEN STATE (FOUND 2026-11-18): a low copied from a part hidden from render failed
+            # every later bake 'not enabled for rendering'. visible clears it on every copy made
+            for o in family:
+                o[1].hide_render = False
+                o[1].hide_viewport = False
+                try:
+                    o[1].hide_set(False)
+                except RuntimeError:
+                    pass
         if hide is not None:
             hidden = new if hide.lower() == "copy" else src
             hidden.hide_render = True
@@ -6157,6 +6413,7 @@ def op_duplicate_object(params):
     for family, asked in rows:
         src, new = family[0]
         row = copy_row(src, new, asked, linked)
+        _dup_hidden_row(row, src, new)
         if len(family) > 1:
             row["children"] = [copy_row(s, n, s.name, linked) for s, n in family[1:]]
         copies.append(row)
@@ -6182,6 +6439,287 @@ def op_duplicate_object(params):
     return out
 
 
+# ------------------------------------------------------------------------------------------------------- sdf_union
+_SDF_KEYS = ("chains", "spheres", "boxes", "smooth", "voxelSize", "name", "maxVoxels", "location", "collection")
+
+
+def _sdf_catmull(pts, rad, per):
+    """A chain sampled as a Catmull-Rom spline through its points (radius interpolated alike), `per` steps a span."""
+    if len(pts) < 3:
+        return pts, rad
+    out_p, out_r = [], []
+    ext_p = [pts[0] * 2.0 - pts[1]] + pts + [pts[-1] * 2.0 - pts[-2]]
+    ext_r = [rad[0]] + rad + [rad[-1]]
+    for i in range(1, len(ext_p) - 2):
+        p0, p1, p2, p3 = ext_p[i - 1:i + 3]
+        r1, r2 = ext_r[i], ext_r[i + 1]
+        for k in range(per):
+            t = k / per
+            t2, t3 = t * t, t * t * t
+            out_p.append(0.5 * ((2.0 * p1) + (-p0 + p2) * t + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2 +
+                                (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3))
+            out_r.append(r1 + (r2 - r1) * t)
+    out_p.append(pts[-1])
+    out_r.append(rad[-1])
+    return out_p, out_r
+
+
+def _sdf_elements(params, tail):
+    """[(kind, data, (lo, hi) world box)] - capsule chains (each a list of round-cone segments), spheres and boxes."""
+    import numpy as np   # noqa: PLC0415
+    elems = []
+    chains = params.get("chains") or []
+    spheres = params.get("spheres") or []
+    boxes = params.get("boxes") or []
+    if not isinstance(chains, list) or not isinstance(spheres, list) or not isinstance(boxes, list):
+        raise MifOpError("chains, spheres and boxes are lists. %s" % tail)
+    for k, ch in enumerate(chains):
+        if not isinstance(ch, dict) or set(ch) - {"points", "radii", "radius", "smoothPath"} \
+                or not isinstance(ch.get("points"), list) or len(ch["points"]) < 2:
+            raise MifOpError("chains[%d] is {points [[x,y,z], ...] (2 or more), radii [r, ...] | radius, smoothPath}. %s"
+                             % (k, tail))
+        pts = [np.array(finite_floats(list(p), "chains[%d].points" % k), dtype=float) for p in ch["points"]]
+        if any(p.shape != (3,) for p in pts):
+            raise MifOpError("chains[%d].points are [x, y, z]. %s" % (k, tail))
+        if (ch.get("radii") is None) == (ch.get("radius") is None):
+            raise MifOpError("chains[%d] takes radii (one per point) OR radius. %s" % (k, tail))
+        rad = finite_floats(list(ch["radii"]), "chains[%d].radii" % k) if ch.get("radii") is not None \
+            else [finite_float(ch["radius"], "chains[%d].radius" % k)] * len(pts)
+        if len(rad) != len(pts) or any(r <= 0 for r in rad):
+            raise MifOpError("chains[%d]: one radius above 0 per point (%d points, %d radii). %s"
+                             % (k, len(pts), len(rad), tail))
+        if ch.get("smoothPath", True):
+            pts, rad = _sdf_catmull(pts, rad, 8)
+        segs = [(pts[i], pts[i + 1], rad[i], rad[i + 1]) for i in range(len(pts) - 1)]
+        lo = np.min([np.minimum(a - ra, b - rb) for a, b, ra, rb in segs], axis=0)
+        hi = np.max([np.maximum(a + ra, b + rb) for a, b, ra, rb in segs], axis=0)
+        elems.append(("chain", segs, (lo, hi)))
+    for k, sp in enumerate(spheres):
+        if not isinstance(sp, dict) or set(sp) - {"center", "radius"} or sp.get("center") is None \
+                or sp.get("radius") is None:
+            raise MifOpError("spheres[%d] is {center [x,y,z], radius}. %s" % (k, tail))
+        c = np.array(finite_floats(list(sp["center"]), "spheres[%d].center" % k), dtype=float)
+        r = finite_float(sp["radius"], "spheres[%d].radius" % k)
+        if c.shape != (3,) or r <= 0:
+            raise MifOpError("spheres[%d]: center [x,y,z] and a radius above 0. %s" % (k, tail))
+        elems.append(("sphere", (c, r), (c - r, c + r)))
+    for k, bx in enumerate(boxes):
+        if not isinstance(bx, dict) or set(bx) - {"center", "size", "round"} or bx.get("center") is None \
+                or bx.get("size") is None:
+            raise MifOpError("boxes[%d] is {center [x,y,z], size [x,y,z], round}. %s" % (k, tail))
+        c = np.array(finite_floats(list(bx["center"]), "boxes[%d].center" % k), dtype=float)
+        sz = np.array(finite_floats(list(bx["size"]), "boxes[%d].size" % k), dtype=float)
+        rd = finite_float(bx.get("round", 0.0), "boxes[%d].round" % k)
+        if c.shape != (3,) or sz.shape != (3,) or (sz <= 0).any() or rd < 0 or rd * 2 >= sz.min():
+            raise MifOpError("boxes[%d]: center and size [x,y,z] (sizes above 0), round 0 to under half the smallest "
+                             "side. %s" % (k, tail))
+        elems.append(("box", (c, sz / 2.0, rd), (c - sz / 2.0, c + sz / 2.0)))
+    if not elems:
+        raise MifOpError("nothing to fuse: pass chains, spheres or boxes. %s" % tail)
+    return elems
+
+
+def _sdf_field(elems, k_smooth, voxel, max_vox, tail):
+    """(field array, origin, voxel): the signed distance of every element, fused by a polynomial smooth minimum k wide
+    between elements (a chain's own segments by a plain one), sampled on the grid; each element only touches the
+    block it can change - outside it its distance is over k from its surface, where the smooth minimum is the plain
+    one and the zero level cannot move."""
+    import numpy as np   # noqa: PLC0415
+    lo = np.min([e[2][0] for e in elems], axis=0) - (k_smooth + 3.0 * voxel)
+    hi = np.max([e[2][1] for e in elems], axis=0) + (k_smooth + 3.0 * voxel)
+    dims = np.ceil((hi - lo) / voxel).astype(int) + 1
+    total = int(dims.prod())
+    if total > max_vox:
+        raise MifOpError("the field would be %d x %d x %d = %d voxels, over maxVoxels %d - raise voxelSize (or build "
+                         "at a larger scale and scale it down). %s" % (dims[0], dims[1], dims[2], total, max_vox, tail))
+    field = np.full(tuple(dims), 1e9, dtype=np.float64)
+    pad = k_smooth + 2.0 * voxel
+    for kind, data, (elo, ehi) in elems:
+        i0 = np.maximum(np.floor((elo - pad - lo) / voxel).astype(int), 0)
+        i1 = np.minimum(np.ceil((ehi + pad - lo) / voxel).astype(int) + 1, dims)
+        gx = lo[0] + voxel * np.arange(i0[0], i1[0])
+        gy = lo[1] + voxel * np.arange(i0[1], i1[1])
+        gz = lo[2] + voxel * np.arange(i0[2], i1[2])
+        X, Y, Z = np.meshgrid(gx, gy, gz, indexing="ij")
+        P = np.stack([X, Y, Z], axis=-1)
+        if kind == "sphere":
+            c, r = data
+            d = np.linalg.norm(P - c, axis=-1) - r
+        elif kind == "box":
+            c, h, rd = data
+            q = np.abs(P - c) - (h - rd)
+            d = np.linalg.norm(np.maximum(q, 0.0), axis=-1) + np.minimum(q.max(axis=-1), 0.0) - rd
+        else:
+            d = np.full(X.shape, 1e9)
+            for a, b, ra, rb in data:
+                ab = b - a
+                ll = float(ab.dot(ab))
+                t = np.zeros(X.shape) if ll < 1e-18 else np.clip(((P - a) @ ab) / ll, 0.0, 1.0)
+                closest = a + t[..., None] * ab
+                d = np.minimum(d, np.linalg.norm(P - closest, axis=-1) - (ra + (rb - ra) * t))
+        sub = field[i0[0]:i1[0], i0[1]:i1[1], i0[2]:i1[2]]
+        if k_smooth > 0:
+            h_ = np.clip(0.5 + 0.5 * (d - sub) / k_smooth, 0.0, 1.0)
+            fused = d + (sub - d) * h_ - k_smooth * h_ * (1.0 - h_)
+            fused = np.where(np.abs(sub) > 1e8, d, fused)
+        else:
+            fused = np.minimum(sub, d)
+        field[i0[0]:i1[0], i0[1]:i1[1], i0[2]:i1[2]] = fused
+    return field, lo, dims
+
+
+def _surface_nets(field, lo, voxel):
+    """(vertices, quads) of the field's zero level: one vertex per cell the surface crosses, at the mean of its edge
+    crossings; one quad per grid edge the surface crosses, wound so it faces out (the field rises outward)."""
+    import numpy as np   # noqa: PLC0415
+    inside = field < 0.0
+    nx, ny, nz = field.shape
+    cell_has = np.zeros((nx - 1, ny - 1, nz - 1), dtype=bool)
+    acc = np.zeros((nx - 1, ny - 1, nz - 1, 3))
+    cnt = np.zeros((nx - 1, ny - 1, nz - 1))
+    corners = [(0, 0, 0), (1, 0, 0), (0, 1, 0), (1, 1, 0), (0, 0, 1), (1, 0, 1), (0, 1, 1), (1, 1, 1)]
+    edges = [(a, b) for a in range(8) for b in range(a + 1, 8)
+             if sum(abs(corners[a][i] - corners[b][i]) for i in range(3)) == 1]
+    for a, b in edges:
+        ca, cb = corners[a], corners[b]
+        fa = field[ca[0]:nx - 1 + ca[0], ca[1]:ny - 1 + ca[1], ca[2]:nz - 1 + ca[2]]
+        fb = field[cb[0]:nx - 1 + cb[0], cb[1]:ny - 1 + cb[1], cb[2]:nz - 1 + cb[2]]
+        cross = (fa < 0) != (fb < 0)
+        if not cross.any():
+            continue
+        t = np.where(cross, fa / np.where(cross, fa - fb, 1.0), 0.0)
+        for ax in range(3):
+            pa = ca[ax] + (cb[ax] - ca[ax]) * t
+            acc[..., ax] += np.where(cross, pa, 0.0)
+        cnt += cross
+        cell_has |= cross
+    idx = -np.ones(cell_has.shape, dtype=np.int64)
+    cells = np.argwhere(cell_has)
+    idx[tuple(cells.T)] = np.arange(len(cells))
+    local = acc[cell_has] / cnt[cell_has][:, None]
+    verts = (cells + local) * voxel + lo
+    quads = []
+    # an edge along axis ax from grid point g to g + e_ax: the four cells round it
+    for ax in range(3):
+        u, v = (ax + 1) % 3, (ax + 2) % 3
+        sl_a = [slice(None)] * 3
+        sl_b = [slice(None)] * 3
+        sl_a[ax] = slice(0, field.shape[ax] - 1)
+        sl_b[ax] = slice(1, field.shape[ax])
+        ia, ib = inside[tuple(sl_a)], inside[tuple(sl_b)]
+        flip = ia & ~ib
+        cross = ia != ib
+        pts = np.argwhere(cross)
+        for g in pts:
+            if g[u] == 0 or g[v] == 0 or g[u] >= field.shape[u] - 1 or g[v] >= field.shape[v] - 1:
+                continue
+            c00 = list(g)
+            ring = []
+            for du, dv in ((-1, -1), (0, -1), (0, 0), (-1, 0)):
+                cc = list(c00)
+                cc[u] += du
+                cc[v] += dv
+                ring.append(int(idx[tuple(cc)]))
+            if min(ring) < 0:
+                continue
+            quads.append(ring if flip[tuple(g)] else ring[::-1])
+    return verts, quads
+
+
+def op_sdf_union(params):
+    """Fuse capsule chains, spheres and boxes with a smooth minimum into ONE mesh - roots filleted into a trunk, a
+    creature's limbs into its body - meshed from the field, not from joined shells.
+
+    THE GAP (FOUND 2026-11-18 by two builds): a stump's roots were joined to its trunk as overlapping closed shells,
+    voxel-remeshed (a hard crease at every union) and smoothed whole, softening everything else; a creature's metaball
+    chains rendered as beads unless spaced at 0.3 radius or less, so the build wrote its own Catmull-Rom sampler.
+
+    chains [{points [[x,y,z], ...], radii [r, ...] | radius, smoothPath (default true: a Catmull-Rom through the
+    points, radius alike, 8 steps a span)}] - each a chain of round cones, its own segments joined by a plain union;
+    spheres [{center, radius}]; boxes [{center, size, round}]. smooth (metres, default 0): the smooth minimum's width
+    between elements - the fillet; 0 is a hard union. voxelSize (default a quarter of the smallest radius): the grid the
+    field is sampled on, refused past maxVoxels (default 12,000,000). The zero level is meshed by surface nets (a vertex
+    per crossed cell at the mean of its edge crossings, a quad per crossed grid edge) into one mesh, every face out;
+    name (default "SDFUnion"), location, collection as create_mesh's. Reply: elements, voxels, the field's grid,
+    closedCheck {boundaryEdges, nonManifoldEdges} and islands. Refused before anything exists: nothing to fuse, a
+    chain under two points or with a radius not above 0, radii and radius both or neither, a box rounder than half its
+    side, smooth below 0, a voxelSize not above 0, a grid past maxVoxels.
+    """
+    import numpy as np   # noqa: PLC0415
+    tail = "NOTHING was created."
+    reject_unknown(params, _SDF_KEYS, "sdf_union")
+    elems = _sdf_elements(params, tail)
+    k_smooth = take_float(params, "smooth", default=0.0)
+    if not math.isfinite(k_smooth) or k_smooth < 0:
+        raise MifOpError("smooth is the fillet width in metres, 0 or more, got %r. %s" % (k_smooth, tail))
+    radii = []
+    for kind, data, _b in elems:
+        if kind == "chain":
+            radii.extend(min(ra, rb) for _a, _b2, ra, rb in data)
+        elif kind == "sphere":
+            radii.append(data[1])
+        else:
+            radii.append(float(data[1].min()))
+    voxel = take_float(params, "voxelSize", default=min(radii) / 4.0)
+    if not math.isfinite(voxel) or voxel <= 0:
+        raise MifOpError("voxelSize must be above 0, got %r. %s" % (voxel, tail))
+    max_vox = take_int(params, "maxVoxels", default=12000000)
+    if not 1000 <= max_vox <= 100000000:
+        raise MifOpError("maxVoxels is 1,000-100,000,000, got %d. %s" % (max_vox, tail))
+    field, lo, dims = _sdf_field(elems, k_smooth, voxel, max_vox, tail)
+    verts, quads = _surface_nets(field, lo, voxel)
+    if not quads:
+        raise MifOpError("the field has no surface at this voxelSize - every element is thinner than the grid. %s"
+                         % tail)
+    name = take(params, "name", default="SDFUnion", kind=str)
+    coll = _resolve_collection(params)
+    placed = _place_values(params)
+    me = bpy.data.meshes.new(name)
+    me.from_pydata(verts.tolist(), [], quads)
+    me.validate(clean_customdata=False)
+    me.update()
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(me)
+        boundary = sum(1 for e in bm.edges if e.is_boundary)
+        nonman = sum(1 for e in bm.edges if not e.is_manifold and not e.is_boundary)
+        nonman_v = sum(1 for v in bm.verts if not v.is_manifold)
+        seen, islands = set(), 0
+        for v0 in bm.verts:
+            if v0.index in seen:
+                continue
+            islands += 1
+            stack = [v0]
+            seen.add(v0.index)
+            while stack:
+                v = stack.pop()
+                for e in v.link_edges:
+                    o = e.other_vert(v)
+                    if o.index not in seen:
+                        seen.add(o.index)
+                        stack.append(o)
+    finally:
+        bm.free()
+    for poly in me.polygons:
+        poly.use_smooth = True
+    obj = bpy.data.objects.new(name, me)
+    _link_new(obj, coll)
+    _place(obj, placed)
+    out = _created(obj, coll, "MESH", "sdf_union", name)
+    out.update({
+        "elements": {"chains": sum(1 for e in elems if e[0] == "chain"),
+                     "spheres": sum(1 for e in elems if e[0] == "sphere"),
+                     "boxes": sum(1 for e in elems if e[0] == "box")},
+        "smooth": k_smooth, "voxelSize": round(voxel, 9), "grid": [int(x) for x in dims],
+        "voxels": int(np.prod(dims)), "vertices": len(me.vertices), "faces": len(me.polygons),
+        "closedCheck": {"boundaryEdges": boundary, "nonManifoldEdges": nonman, "nonManifoldVertices": nonman_v},
+        "islands": islands,
+        "note": ("surface nets can pinch a vertex where two parts nearly touch (%d here); remesh_mesh VOXEL at this "
+                 "voxelSize makes it manifold" % nonman_v) if nonman_v else None,
+    })
+    return out
+
+
 OPS = {
     "create_primitive": op_create_primitive,
     "create_lattice": op_create_lattice,
@@ -6190,6 +6728,7 @@ OPS = {
     "create_volume": op_create_volume,
     "create_nurbs_surface": op_create_nurbs_surface,
     "create_metaball": op_create_metaball,
+    "sdf_union": op_sdf_union,
     "create_texture": op_create_texture,
     "transform_object": op_transform_object,
     "transform_objects": op_transform_objects,

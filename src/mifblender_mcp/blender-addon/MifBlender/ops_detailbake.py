@@ -1060,7 +1060,10 @@ def _status(jid):
     if job.get("result") is not None:
         return job["result"]
     from .ops_gamebake import op_bake_texture_set               # noqa: PLC0415
-    st = op_bake_texture_set({"jobId": job["bakeJob"]})
+    try:
+        st = op_bake_texture_set({"jobId": job["bakeJob"]})
+    except MifOpError as exc:                                   # a job with a failed map refuses its status
+        st = getattr(exc, "payload", None) or {"error": str(exc)}
     if st.get("running"):
         return {"jobId": jid, "running": True, "bake": st}
     if not st.get("complete"):

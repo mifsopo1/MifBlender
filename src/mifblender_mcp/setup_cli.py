@@ -86,6 +86,10 @@ def _write_atomic(path, text):
     tmp = path + ".tmp-mifblender"
     with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(text)
+    # THE OLD FILE'S MODE IS KEPT (FOUND 2026-11-22): a client config can hold other servers' keys at 0600, and the new
+    # file used to come back with the umask's mode (often 0644, readable by every account on the machine).
+    if os.path.exists(path):
+        shutil.copymode(path, tmp)
     os.replace(tmp, path)
 
 
@@ -131,6 +135,55 @@ def toml_block(command, args, token):
     return "\n".join(lines) + "\n"
 
 
+# THE TOKEN FILE (MifBlender's token_store.py and the MCP server's _bl_token_file: the three must agree). setup keeps
+# the token it gives the add-on in this file too, so a client that is handed no token - Claude Code, whose `claude mcp
+# add` takes an environment value only on its command line, where every process listing shows it (FOUND 2026-11-22) -
+# reaches Blender through the file, which the MCP server reads by itself.
+def token_file_path():
+    raw = (os.environ.get("MIF_BLENDER_TOKEN_FILE") or "").strip()
+    if raw:
+        return os.path.abspath(os.path.expanduser(raw))
+    return os.path.join(os.path.expanduser("~"), ".mifbridge", "blender_token")
+
+
+def _usable(tok):
+    return isinstance(tok, str) and len(tok) >= 16 and all(" " < c <= "~" for c in tok)
+
+
+def read_file_token():
+    try:
+        with open(token_file_path(), encoding="utf-8") as fh:
+            tok = fh.read().strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return tok if _usable(tok) else None
+
+
+def store_file_token(tok):
+    """Write tok to the token file when it holds no usable token (owner-only, created exclusively). True when the file
+    holds tok afterwards. A file that already holds another usable token is left alone: choose_token reads it first."""
+    if read_file_token() == tok:
+        return True
+    path = token_file_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if os.path.exists(path) and read_file_token() is None:
+            os.remove(path)                       # present but unusable (empty, damaged): replaced, as the add-on does
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(tok + "\n")
+    except OSError:
+        pass
+    return read_file_token() == tok
+
+
+def choose_token(clients):
+    """The one token setup gives the add-on: the token file's (a Blender in Per-install mode made it, or an earlier
+    setup kept it), else one an earlier setup wrote into a client's config, else a new one."""
+    return read_file_token() or next(filter(None, (read_existing_token(c) for c in clients)), None) \
+        or secrets.token_urlsafe(24)
+
+
 def read_existing_token(client):
     """A token an earlier setup wrote, so a re-run keeps a working pair."""
     if client == "claude-code":
@@ -153,14 +206,16 @@ def connect_client(client, token):
         claude = shutil.which("claude")
         if not claude:
             return False, "the claude command is not on PATH"
-        subprocess.run([claude, "mcp", "remove", "--scope", "user", SERVER_NAME], capture_output=True, text=True, **HIDE)
+        # NO TOKEN ON THIS COMMAND LINE: the server reads it from the token file (store_file_token, called by main first)
+        if token and read_file_token() != token:
+            return False, ("the token is not in %s, and claude mcp add would take it only on its command line, where "
+                           "any program can read it; nothing was changed" % token_file_path())
+        subprocess.run([claude, "mcp", "remove", "--scope", "user", SERVER_NAME], capture_output=True, text=True, encoding="utf-8", errors="replace", **HIDE)
         cmd = [claude, "mcp", "add", "--scope", "user", SERVER_NAME]
-        if token:
-            cmd += ["-e", "MIF_BLENDER_TOKEN=%s" % token]
-        r = subprocess.run(cmd + ["--", command] + args, capture_output=True, text=True, **HIDE)
+        r = subprocess.run(cmd + ["--", command] + args, capture_output=True, text=True, encoding="utf-8", errors="replace", **HIDE)
         if r.returncode:
             return False, "claude mcp add failed with exit code %d" % r.returncode
-        got = subprocess.run([claude, "mcp", "get", SERVER_NAME], capture_output=True, text=True, **HIDE)
+        got = subprocess.run([claude, "mcp", "get", SERVER_NAME], capture_output=True, text=True, encoding="utf-8", errors="replace", **HIDE)
         return (got.returncode == 0), ("registered, read back" if got.returncode == 0 else "registered, but not read back")
     path = client_config_path(client)
     if client == "codex":
@@ -192,7 +247,7 @@ def disconnect_client(client):
         claude = shutil.which("claude")
         if not claude:
             return False, "the claude command is not on PATH"
-        r = subprocess.run([claude, "mcp", "remove", "--scope", "user", SERVER_NAME], capture_output=True, text=True, **HIDE)
+        r = subprocess.run([claude, "mcp", "remove", "--scope", "user", SERVER_NAME], capture_output=True, text=True, encoding="utf-8", errors="replace", **HIDE)
         return r.returncode == 0, "removed" if r.returncode == 0 else "no entry removed"
     path = client_config_path(client)
     if not os.path.exists(path):
@@ -246,7 +301,7 @@ def find_blenders():
 
 def blender_version(exe):
     try:
-        r = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=60, **HIDE)
+        r = subprocess.run([exe, "--version"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, **HIDE)
     except (OSError, subprocess.SubprocessError):
         return None
     m = re.search(r"Blender (\d+\.\d+(?:\.\d+)?)", r.stdout or "")
@@ -258,9 +313,9 @@ def running_blenders():
     try:
         if os.name == "nt":
             r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq blender.exe", "/NH", "/FO", "CSV"],
-                               capture_output=True, text=True, timeout=30, **HIDE)
+                               capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, **HIDE)
             return [int(m) for m in re.findall(r'^"blender\.exe","(\d+)"', r.stdout, re.M | re.I)]
-        r = subprocess.run(["pgrep", "-ix", "blender"], capture_output=True, text=True, timeout=30)
+        r = subprocess.run(["pgrep", "-ix", "blender"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
         return [int(x) for x in r.stdout.split()]
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
@@ -292,7 +347,28 @@ import json, os, sys
 import addon_utils, bpy
 action, mod = os.environ["MIFBLENDER_ACTION"], os.environ["MIFBLENDER_MODULE"]
 out = {"blender": bpy.app.version_string, "action": action}
+
+
+def _redirect_refusal():
+    """A BLENDER_USER_CONFIG or BLENDER_USER_SCRIPTS that Blender did not take (a folder that does not exist is ignored
+    without a word) leaves it on the user's own preferences, where a save writes over them. Refuse before anything."""
+    for kind in ("CONFIG", "SCRIPTS"):
+        want = os.environ.get("BLENDER_USER_" + kind)
+        if not want:
+            continue
+        have = bpy.utils.user_resource(kind)
+        out["user" + kind.title()] = have
+        if os.path.normcase(os.path.abspath(want)) != os.path.normcase(os.path.abspath(have or "")):
+            return ("BLENDER_USER_%s is %s, but this Blender uses %s, so nothing was changed. Create that folder, or unset "
+                    "the variable to use Blender's own." % (kind, want, have))
+    return None
+
+
 try:
+    refusal = _redirect_refusal()
+    if refusal:
+        out["refused"] = True
+        raise RuntimeError(refusal)
     if action == "install":
         addon_utils.disable(mod, default_set=True)
         bpy.ops.preferences.addon_install(overwrite=True, filepath=os.environ["MIFBLENDER_ZIP"])
@@ -300,7 +376,10 @@ try:
         addon_utils.enable(mod, default_set=True, persistent=True)
         token = os.environ.get("MIFBLENDER_TOKEN")
         if token:
-            bpy.context.preferences.addons[mod].preferences.token = token
+            settings = bpy.context.preferences.addons[mod].preferences
+            settings.token = token
+            if hasattr(settings, "token_mode"):     # 1.4: a stored Per-install mode would ignore the token
+                settings.token_mode = "CUSTOM"
         bpy.ops.wm.save_userpref()
     elif action == "remove":
         # Not preferences.addon_remove: it ends in context.area.tag_redraw(), and a background Blender has no area, so it
@@ -343,7 +422,7 @@ def run_in_blender(exe, action, addon_zip=None, token=None):
             env["MIFBLENDER_TOKEN"] = token
         try:
             r = subprocess.run([exe, "--background", "--python-exit-code", "1", "--python", script],
-                               capture_output=True, text=True, timeout=300, env=env, cwd=tmp, **HIDE)
+                               capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300, env=env, cwd=tmp, **HIDE)
         except (OSError, subprocess.SubprocessError) as e:
             return {"error": "could not run Blender: %s" % e}
     for line in (r.stdout or "").splitlines():
@@ -483,9 +562,13 @@ def main(argv=None):
             rc = rc or (0 if ok else 1)
         return rc
 
-    token = next(filter(None, (read_existing_token(c) for c in clients)), None)
-    if not token and blenders:
-        token = secrets.token_urlsafe(24)
+    token = None
+    if blenders or "claude-code" in clients:
+        token = choose_token(clients)
+        if not store_file_token(token):
+            print("mifblender setup: could not keep the token in %s; Claude Code is not set up without it" % token_file_path())
+    elif clients:
+        token = next(filter(None, (read_existing_token(c) for c in clients)), None)
     if blenders:
         with tempfile.TemporaryDirectory(prefix="mifblender_addon_") as tmp:
             zp = build_addon_zip(os.path.join(tmp, "MifBlender-%s.zip" % __version__))
@@ -503,5 +586,6 @@ def main(argv=None):
     if not rc:
         print("Done. Restart your AI app, open Blender, and ask it to call bl_status.")
         if token:
-            print("A private token links them; it is stored in the add-on's preferences and each app's config, and not shown.")
+            print("A private token links them; it is stored in the add-on's preferences, in %s and in each app's config "
+                  "file (never on a command line), and not shown." % token_file_path())
     return rc

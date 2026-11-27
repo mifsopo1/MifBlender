@@ -12,7 +12,7 @@ SHARED CONTRACT, every op in this module:
     the mesh now holds them - so the next call needs no fresh selection;
   * lengths and offsets are in the mesh's own units (`space` LOCAL, the default) or in world units (`space` WORLD, the
     object's scale and rotation applied to the vector only: a big translation never touches a coordinate - float32 at
-    240 m from the origin moves a vertex by micrometres, docs/02_GOTCHAS.md);
+    240 m from the origin moves a vertex by micrometres, the internal notes);
   * a mesh with shape keys is refused: these ops write the base mesh, and the keys would pull it back.
 """
 from __future__ import annotations
@@ -633,7 +633,15 @@ def op_slide_edges(params):
 # --------------------------------------------------------------------------------------------- inset
 
 _INSET_KEYS = ("object", "name", "faces", "thickness", "depth", "individual", "boundary", "even", "outset",
-               "relativeOffset", "space")
+               "relativeOffset", "space", "allowFolds")
+
+
+def _bm_span(bm):
+    """The diagonal of a bmesh's axis-aligned bounds (0 for no vertices)."""
+    if not len(bm.verts):
+        return 0.0
+    xs, ys, zs = zip(*(tuple(v.co) for v in bm.verts))
+    return ((max(xs) - min(xs)) ** 2 + (max(ys) - min(ys)) ** 2 + (max(zs) - min(zs)) ** 2) ** 0.5
 
 
 def op_inset_faces(params):
@@ -645,6 +653,13 @@ def op_inset_faces(params):
     instead; relativeOffset scales the width by the size of the neighbouring faces. Lengths in the mesh's units, or
     world units with space WORLD (uniform scale only). Reply: innerFaces (the faces given, now smaller) and ringFaces
     (new), counts before and after.
+
+    A FOLD IS REFUSED (found 2026-11-18): a thickness past a narrow face's inner radius turns the inner face over
+    itself, and the op answered ok - the folds showed only in a NORMAL bake, as slivers; a 6-ring nested inset threw a
+    vertex 250 m out. After the inset, every inner face whose normal turned against its own before (or whose area went
+    to zero) is a fold, and a mesh whose bounds grew by more than the inset can explain is a jump: either refuses the
+    call, writing nothing, naming facesFolded and the bounds before and after, unless allowFolds is true (then the reply
+    carries them).
     """
     reject_unknown(params, _INSET_KEYS, "inset_faces")
     obj = _target(params, "inset_faces")
@@ -656,6 +671,9 @@ def op_inset_faces(params):
     even = take_bool(params, "even", default=True)
     outset = take_bool(params, "outset", default=False)
     relative = take_bool(params, "relativeOffset", default=False)
+    # READ HERE, NOT IN THE FOLD TEST: behind `(folded or jumped) and`, a malformed allowFolds was refused only when the
+    # inset happened to fold, and accepted on every call that did not.
+    allow_folds = take_bool(params, "allowFolds", default=False)
     if not thickness > 0.0:
         raise MifOpError("thickness must be above 0, got %r. NOTHING was changed." % thickness)
     if individual and (outset or params.get("boundary") is not None):
@@ -667,6 +685,8 @@ def op_inset_faces(params):
     bm = _open(obj)
     try:
         faces = _elements(params, "faces", bm.faces, "face", obj)
+        normals_before = {f: f.normal.copy() for f in faces}
+        span_before = _bm_span(bm)
         if individual:
             r = bmesh.ops.inset_individual(bm, faces=faces, thickness=th, depth=dp, use_even_offset=even,
                                            use_interpolate=True, use_relative_offset=relative)
@@ -678,12 +698,26 @@ def op_inset_faces(params):
         if not ring:
             raise MifOpError("the inset made no faces. NOTHING was changed.")
         bm.normal_update()
+        folded = sorted(f.index for f, n in normals_before.items() if f.is_valid and (
+            f.calc_area() < 1e-12 or (n.length > 0 and f.normal.dot(n) <= 0.0)))
+        span_after = _bm_span(bm)
+        allowed = 2.0 * (abs(th) + abs(dp)) + 1e-6
+        jumped = span_after - span_before > allowed
+        if (folded or jumped) and not allow_folds:
+            raise MifOpError("the inset folded %d inner face(s) over themselves (%s)%s - a thickness past a face's inner "
+                             "radius turns it inside out. Use a smaller thickness (or individual false), or pass "
+                             "allowFolds true to keep it. NOTHING was changed."
+                             % (len(folded), folded[:20], "" if not jumped else
+                                " and the mesh's extent grew %.4g -> %.4g, more than the inset's %.4g explains"
+                                % (span_before, span_after, allowed)))
         _commit(bm, obj)
         inner, ring_i = _idx(faces), _idx(ring)
     finally:
         bm.free()
     out = {"object": obj.name, "thickness": thickness, "depth": depth, "space": space, "individual": individual,
-           "innerFaces": inner, "ringFaces": ring_i, "before": before, "after": mesh_counts(obj)}
+           "innerFaces": inner, "ringFaces": ring_i, "before": before, "after": mesh_counts(obj),
+           # MEASURED after the inset: inner faces turned over (allowFolds kept them), and the extent before and after.
+           "facesFolded": folded, "spanBefore": round(span_before, 6), "spanAfter": round(span_after, 6)}
     out.update(shared_data_note(obj))
     return out
 
@@ -4788,9 +4822,10 @@ def op_subdivide_multires(params):
 # --------------------------------------------------------------------------------------------- remesh_mesh
 _REMESH_KEYS = ("object", "name", "mode", "targetFaces", "targetRatio", "targetEdgeLength", "symmetry", "preserveSharp",
                 "preserveBoundary", "preserveAttributes", "smoothNormals", "seed", "voxelSize", "adaptivity",
-                "fixPoles", "preserveVolume", "preserveVertexColors", "preserveFaceSets", "preserveMask")
+                "fixPoles", "preserveVolume", "preserveVertexColors", "preserveFaceSets", "preserveMask", "capHoles",
+                "allowNewHoles")
 _QUADRIFLOW_ONLY = ("targetFaces", "targetRatio", "targetEdgeLength", "symmetry", "preserveSharp", "preserveBoundary",
-                    "smoothNormals", "seed")
+                    "smoothNormals", "seed", "capHoles", "allowNewHoles")
 _VOXEL_ONLY = ("voxelSize", "adaptivity", "fixPoles", "preserveVolume", "preserveVertexColors", "preserveFaceSets",
                "preserveMask")
 _VOXEL_MAX_CELLS = 200_000_000
@@ -4819,6 +4854,68 @@ def _mesh_shape_counts(me):
             "quads": sides.count(4), "ngons": len(sides) - sides.count(3) - sides.count(4),
             "poles": sum(1 for i, n in enumerate(valence) if not on_rim[i] and n != 4 and n > 0),
             "nonManifoldEdges": sum(1 for n in edge_faces if n != 2)}
+
+
+# compare_v3v3(a, b, 1e-4f) in Blender 5.0.0's check (object_remesh.cc, read 2026-11-25): an edge whose ends are within
+# 1e-4 on every axis, in mesh space, is "zero length" there.
+_QF_ZERO_EDGE = 1e-4
+
+
+def quadriflow_blockers(me):
+    """What Blender's own QuadriFlow check (object_remesh.cc, mesh_is_manifold_consistent) refuses, counted the way it
+    counts: an edge on 3+ faces, an edge two faces walk the same way (a flip), a wire edge, and a ZERO-LENGTH edge -
+    both ends within 1e-4 on every axis, in mesh space. Boundary edges count as manifold there. {count per kind,
+    edges[:20]}.
+
+    FOUND 2026-11-18: a 79k-quad voxel remesh of a sculpted creature with 0 boundary, non-manifold or flipped edges by
+    mesh_quality answered only CANCELLED, whatever the target and seed, and the same mesh decimated remeshed at once.
+    Measured 2026-11-25 on 5.0.1: one edge 1e-9 long on a closed UV sphere is enough - "The mesh needs to be manifold
+    and have face normals that point in a consistent direction" on stdout, CANCELLED - and so is a monkey closed and
+    voxel-remeshed at 0.04, whose surface nets leave edges under 0.1 mm: CANCELLED on seeds 1-8. mesh_quality could
+    not see either, since none of its checks is that one."""
+    import numpy as np                                        # noqa: PLC0415
+    ne = len(me.edges)
+    ev = np.empty(ne * 2, dtype=np.int64)
+    me.edges.foreach_get("vertices", ev)
+    ev = ev.reshape(-1, 2)
+    co = np.empty(len(me.vertices) * 3, dtype=np.float64)
+    me.vertices.foreach_get("co", co)
+    co = co.reshape(-1, 3).astype(np.float32).astype(np.float64)
+    zero = np.nonzero((np.abs(co[ev[:, 0]] - co[ev[:, 1]]) <= _QF_ZERO_EDGE).all(axis=1))[0] if ne else np.array([])
+    faces_on = np.zeros(ne, dtype=np.int64)
+    first_vert = np.full(ne, -1, dtype=np.int64)
+    flips, over = [], []
+    lv = np.empty(len(me.loops), dtype=np.int64)
+    le = np.empty(len(me.loops), dtype=np.int64)
+    me.loops.foreach_get("vertex_index", lv)
+    me.loops.foreach_get("edge_index", le)
+    for v, e in zip(lv.tolist(), le.tolist()):
+        faces_on[e] += 1
+        if faces_on[e] == 3:
+            over.append(e)
+        if first_vert[e] == -1:
+            first_vert[e] = v
+        elif first_vert[e] == v:
+            flips.append(e)
+    wire = np.nonzero(faces_on == 0)[0]
+    rows = {"zeroLengthEdges": int(len(zero)), "edgesOnThreeOrMoreFaces": len(over), "flippedEdges": len(flips),
+            "wireEdges": int(len(wire))}
+    rows["count"] = sum(rows.values())
+    rows["edges"] = sorted(set(zero.tolist()[:20] + over[:20] + flips[:20] + wire.tolist()[:20]))[:20]
+    rows["zeroEdgeIndices"] = zero.tolist()
+    return rows
+
+
+def _boundary_loop_rows(me):
+    """The open boundary loops of a mesh: [{vertices, edges, firstVertex}] - what a remesh left open."""
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(me)
+        from .ops_mesh import _boundary_loops                     # noqa: PLC0415 - one loop walker for the add-on
+        return [{"vertices": len(verts), "edges": len(edges), "firstVertex": min(v.index for v in verts)}
+                for edges, verts in _boundary_loops(bm)]
+    finally:
+        bm.free()
 
 
 def _weld_symmetry_seam(obj, sym):
@@ -4993,30 +5090,101 @@ def op_remesh_mesh(params):
         raise MifOpError("'%s' has a Multires modifier, whose levels are bound to the base topology. NOTHING was "
                          "changed." % obj.name)
     cfg = _remesh_parse(params, obj)
+    # READ BEFORE THE REMESH, NOT BEHIND `opened > 0 and`: there a malformed value was refused only when QuadriFlow opened
+    # a hole - after the remesh had run - and accepted on every call where it did not.
+    allow_new_holes = take_bool(params, "allowNewHoles", default=False)
     before = _mesh_shape_counts(me)
     if not before["faces"]:
         raise MifOpError("'%s' has no faces to remesh. NOTHING was changed." % obj.name)
-    if before["nonManifoldEdges"]:
+    open_edges = _boundary_edge_count(me)
+    if cfg["mode"] == "VOXEL" and before["nonManifoldEdges"]:
         raise MifOpError("'%s' has %d non-manifold edges (open or shared by 3+ faces) - %s needs a closed surface; close "
                          "the holes first (fill_mesh_loop). NOTHING was changed."
                          % (obj.name, before["nonManifoldEdges"], cfg["mode"]))
     ctx = dict(object=obj, active_object=obj, selected_objects=[obj], selected_editable_objects=[obj])
+    pre = None
+    if cfg["mode"] == "QUADRIFLOW":
+        # QUADRIFLOW TAKES AN OPEN MESH (its own check counts a boundary edge as manifold; preserveBoundary keeps the
+        # rim): a cap nobody sees can be deleted first instead of spending a quarter of the budget (2026-11-18: 2,687 of
+        # 9,621 faces on a flat underground cap). What its check refuses is measured here, first.
+        blockers = quadriflow_blockers(me)
+        hard = blockers["count"] - blockers["zeroLengthEdges"]
+        if hard:
+            raise MifOpError("'%s' fails QuadriFlow's own check: %d edge(s) on 3+ faces, %d flipped, %d wire (edges %s) "
+                             "- it would answer only CANCELLED. Fix them first (clean_mesh, recalcNormals). NOTHING "
+                             "was changed." % (obj.name, blockers["edgesOnThreeOrMoreFaces"], blockers["flippedEdges"],
+                                               blockers["wireEdges"], blockers["edges"][:10]))
+        backup = me.copy()
+        pre = {"zeroLengthEdgesCollapsed": 0}
+        if blockers["zeroLengthEdges"]:
+            # ZERO-LENGTH EDGES ARE COLLAPSED, not refused: they are what a fine voxel remesh leaves, nothing can be
+            # seen of them, and QuadriFlow rebuilds the surface anyway. The mesh is put back if QuadriFlow then fails.
+            bm = bmesh.new()
+            try:
+                bm.from_mesh(me)
+                bm.edges.ensure_lookup_table()
+                zero = [bm.edges[i] for i in blockers["zeroEdgeIndices"]]
+                bmesh.ops.collapse(bm, edges=zero, uvs=False)
+                bm.to_mesh(me)
+            finally:
+                bm.free()
+            me.update()
+            pre["zeroLengthEdgesCollapsed"] = blockers["zeroLengthEdges"]
+            left = quadriflow_blockers(me)
+            if left["count"]:
+                bm = bmesh.new()
+                try:
+                    bm.from_mesh(backup)
+                    bm.to_mesh(me)
+                finally:
+                    bm.free()
+                me.update()
+                bpy.data.meshes.remove(backup)
+                raise MifOpError("'%s' had %d edge(s) under 1e-4 (QuadriFlow refuses a mesh for one), and collapsing them "
+                                 "left %d zero-length, %d on 3+ faces, %d flipped and %d wire. Weld at a larger distance "
+                                 "first (clean_mesh mergeDistance) or decimate. The mesh was put back: NOTHING was changed."
+                                 % (obj.name, blockers["zeroLengthEdges"], left["zeroLengthEdges"],
+                                    left["edgesOnThreeOrMoreFaces"], left["flippedEdges"], left["wireEdges"]))
     if cfg["mode"] == "QUADRIFLOW":
         mirror_before = (me.use_mirror_x, me.use_mirror_y, me.use_mirror_z)
         if cfg["symmetry"] is not None:
             me.use_mirror_x, me.use_mirror_y, me.use_mirror_z = cfg["symmetry"]
+        import io                                                 # noqa: PLC0415
+        from contextlib import redirect_stdout                   # noqa: PLC0415
+        said = io.StringIO()
+
+        def put_back():
+            bm = bmesh.new()
+            try:
+                bm.from_mesh(backup)
+                bm.to_mesh(me)
+            finally:
+                bm.free()
+            me.update()
         try:
-            with bpy.context.temp_override(**ctx):
+            # THE OPERATOR'S OWN WORDS ARE KEPT: its reason for a CANCELLED reached only the worker's stdout.
+            with redirect_stdout(said), bpy.context.temp_override(**ctx):
                 r = bpy.ops.object.quadriflow_remesh(**cfg["qf"])
         except RuntimeError as exc:
             me.use_mirror_x, me.use_mirror_y, me.use_mirror_z = mirror_before
+            put_back()
+            bpy.data.meshes.remove(backup)
             raise MifOpError("QuadriFlow: %s. NOTHING was changed." % str(exc).strip()) from None
         finally:
             if cfg["symmetry"] is not None:
                 me.use_mirror_x, me.use_mirror_y, me.use_mirror_z = mirror_before
+        report = [ln.strip() for ln in said.getvalue().splitlines() if "QuadriFlow" in ln]
         if "FINISHED" not in r:
-            raise MifOpError("QuadriFlow answered %s. NOTHING was changed." % sorted(r))
+            put_back()
+            bpy.data.meshes.remove(backup)
+            raise MifOpError("QuadriFlow answered %s, saying: %s. Its own check found nothing here (no edge on 3+ faces, "
+                             "flipped, wire or zero-length), so it is likely the solver itself: decimate first "
+                             "(decimate_mesh COLLAPSE to a few times the target - a decimated copy of a mesh that "
+                             "CANCELLED remeshed at once), or try another seed. NOTHING was changed."
+                             % (sorted(r), " / ".join(report) or "nothing"))
+        settings_report = report
         settings = dict(cfg["qf"], symmetry=cfg["symmetry"])
+        settings["operatorReport"] = settings_report or None
         if cfg.get("derived"):
             settings["derivedFrom"] = cfg["derived"]
         if cfg["symmetry"] is not None and any(cfg["symmetry"]):
@@ -5042,8 +5210,56 @@ def op_remesh_mesh(params):
     bpy.context.view_layer.update()
     after = _mesh_shape_counts(obj.data)
     out = {"object": obj.name, "mode": cfg["mode"], "settings": settings, "before": before, "after": after}
+    if pre is not None:
+        out.update(pre)
+        # A RESULT MORE OPEN THAN ITS INPUT (found 2026-11-18): one run from the same high came back with two triangle
+        # holes and the reply said ok. The new boundary loops are listed; capHoles fills them; without allowNewHoles
+        # an unfilled one refuses the call, putting the mesh back.
+        opened = _boundary_edge_count(obj.data) - open_edges
+        if opened > 0:
+            loops = _boundary_loop_rows(obj.data)
+            capped = None
+            if take_bool(params, "capHoles", default=False):
+                from .ops_mesh import _fill_holes                 # noqa: PLC0415 - clean_mesh's per-hole fill
+                bm = bmesh.new()
+                try:
+                    bm.from_mesh(obj.data)
+                    small = max((lp["vertices"] for lp in loops), default=3)
+                    capped = _fill_holes(bm, small)
+                    bm.to_mesh(obj.data)
+                finally:
+                    bm.free()
+                obj.data.update()
+                opened = _boundary_edge_count(obj.data) - open_edges
+                after = _mesh_shape_counts(obj.data)
+                out["after"] = after
+            if opened > 0 and not allow_new_holes:
+                bm = bmesh.new()
+                try:
+                    bm.from_mesh(backup)
+                    bm.to_mesh(obj.data)
+                finally:
+                    bm.free()
+                obj.data.update()
+                bpy.data.meshes.remove(backup)
+                raise MifOpError("QuadriFlow came back with %d boundary edge(s) the input did not have (loops %s). Pass "
+                                 "capHoles true to fill them, or allowNewHoles true to keep them. The mesh was put back: "
+                                 "NOTHING was changed." % (opened, loops[:10]))
+            out["newBoundaryLoops"] = loops[:50]
+            out["holesCapped"] = capped
+            out["newBoundaryEdges"] = max(opened, 0)
+        bpy.data.meshes.remove(backup)
     out.update(shared_data_note(obj))
     return out
+
+
+def _boundary_edge_count(me):
+    """Edges on exactly one face."""
+    count = {}
+    for p in me.polygons:
+        for k in p.edge_keys:
+            count[k] = count.get(k, 0) + 1
+    return sum(1 for n in count.values() if n == 1)
 
 
 # --------------------------------------------------------------------------------------------- set_face_sets
@@ -5272,7 +5488,7 @@ def op_set_face_sets(params):
 
 
 def _preview_specs():
-    # THE BULK PREVIEW of cloth_filter (ops_preview.py; docs/15 section 5, 2026-10-09): planned on a scratch copy, as the
+    # THE BULK PREVIEW of cloth_filter: planned on a scratch copy, as the
     # other mesh writes are - the filter's settle passes are the result, and they run in the pass that writes it.
     from . import ops_preview as preview   # noqa: PLC0415
     return {"cloth_filter": preview.mesh_spec(op_cloth_filter, keys=("object",))}

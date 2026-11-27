@@ -10,6 +10,7 @@ import socket
 import time
 
 from . import epic as _epic
+from . import steps as _steps
 from .listener import mifbridge_uefn_catalog as CAT
 from .listener import mifbridge_uefn_win32 as W32
 
@@ -91,6 +92,29 @@ def file_sha(path):
         return hashlib.sha1(fh.read()).hexdigest()
 
 
+# What the listener hashes when it loads (mifbridge_uefn_listener.IN_UEFN_FILES), by the name ping reports.
+IN_UEFN_FILES = {"mifbridge_uefn_listener.py": LISTENER_FILE, "mifbridge_uefn_panel.py": PANEL_FILE,
+                 "mifbridge_uefn_catalog.py": os.path.join(LISTENER_DIR, "mifbridge_uefn_catalog.py"),
+                 "mifbridge_uefn_win32.py": os.path.join(LISTENER_DIR, "mifbridge_uefn_win32.py"),
+                 "uefn_catalog.json": os.path.join(HERE, "uefn_catalog.json")}
+
+
+def stale_files(ping_result):
+    """The in-UEFN files whose loaded copy is not this server's (M3). A listener from before sourceShas reports only its
+    own hash; every other file then counts as unknown, which is stale."""
+    shas = (ping_result or {}).get("sourceShas") or {}
+    out = []
+    for name, path in IN_UEFN_FILES.items():
+        have = shas.get(name, (ping_result or {}).get("sourceSha") if name == "mifbridge_uefn_listener.py" else None)
+        try:
+            want = file_sha(path)
+        except OSError:
+            want = None
+        if have != want:
+            out.append(name)
+    return out
+
+
 class UefnError(Exception):
     def __init__(self, kind, message, **extra):
         super().__init__(message)
@@ -150,12 +174,23 @@ class Backend:
                             "MIF_UEFN_PORT to a free port and call uefn_install." % (
                                 self.port, own["listenerPid"], own["listenerImage"] or "image unreadable"),
                             ownership=own)
+        # L4: "is UEFN" is a name prefix, so any executable called UnrealEditorFortnite* would pass it. When Epic's port
+        # is held too, it must be the SAME pid - the token goes only to the editor that runs Epic's MCP (install already
+        # required this). With Epic's MCP stopped the name check stands alone, and the reply's pid is still checked.
+        if own["epicPid"] and own["epicPid"] != own["listenerPid"]:
+            raise UefnError("port_taken", "127.0.0.1:%d is held by pid %s (%s) but Epic's UEFN MCP port %d by pid %s; "
+                            "they must be one UEFN. Nothing was sent." % (
+                                self.port, own["listenerPid"], own["listenerImage"], self.epic_port, own["epicPid"]),
+                            ownership=own)
         return own
 
     # ------------------------------------------------------------ the listener
     def _send(self, op, args, timeout):
         token = read_or_make_token()
         line = (json.dumps({"token": token, "op": op, "args": args}) + "\n").encode("utf-8")
+        if len(line) > CAT.REQUEST_LINE_LIMIT:
+            raise UefnError("too_large", "the request for %s is %d bytes, over the listener's %d-byte line limit; "
+                            "nothing was sent" % (op, len(line), CAT.REQUEST_LINE_LIMIT))
         t0 = time.perf_counter()
         try:
             s = self.connect(self.port, timeout)
@@ -175,6 +210,11 @@ class Backend:
             raise UefnError("busy", "UEFN accepted %s and did not answer in %.0f s. UEFN may be hitching or hung (a "
                             "known UEFN issue with tool calls). Nothing was retried and the op may still complete: "
                             "read back before repeating it." % (op, timeout))
+        except OSError as e:
+            # ConnectionResetError, BrokenPipeError and the rest (FOUND 2026-11-22: they escaped this call as a raw
+            # exception). Whether the op ran is unknown once the line went out, so the answer says so.
+            raise UefnError("protocol", "the connection to the listener broke during %s (%s). The op may or may not "
+                            "have run: read back before repeating it." % (op, e))
         finally:
             try:
                 s.close()
@@ -184,6 +224,10 @@ class Backend:
             res = json.loads(buf)
         except ValueError:
             raise UefnError("protocol", "the listener's reply to %s is not JSON (%d bytes)" % (op, len(buf)))
+        if not isinstance(res, dict):
+            # valid JSON that is not an object (FOUND 2026-11-22: it raised TypeError on the line below)
+            raise UefnError("protocol", "the listener's reply to %s is JSON but not an object (%s)"
+                            % (op, type(res).__name__))
         res["clientMs"] = round((time.perf_counter() - t0) * 1000, 1)
         return res
 
@@ -204,8 +248,12 @@ class Backend:
 
     def run(self, op, args=None):
         """op() with None-valued arguments left out and the reply flattened: {ok, <result fields>, refused?, error?,
-        mismatch?, ms}. A refusal or error carries no result fields."""
-        return flatten(self.op(op, {k: v for k, v in (args or {}).items() if v is not None}))
+        mismatch?, ms}. A refusal or error carries no result fields. With the Epic-MCP transport in use the same op runs
+        as Epic tool calls (steps.run_direct)."""
+        args = {k: v for k, v in (args or {}).items() if v is not None}
+        if self.transport_choice() != "listener" and self.transport_name() == "epic":
+            return self.run_steps(_steps.run_direct, op, args)
+        return flatten(self.op(op, args))
 
     # ------------------------------------------------------------ Epic's whole tool surface, through the catalog
     def find_catalog(self, query="", toolset="", mode="", limit=25):
@@ -224,7 +272,9 @@ class Backend:
         rows.sort(key=lambda x: (x[0], x[1]))
         lim = max(1, min(int(limit or 25), 200))
         return {"ok": True, "uefn": cat.get("uefn"), "count": len(rows),
-                "tools": [{"tool": full, "mode": r["mode"], "verify": r.get("verify"), "summary": r["summary"][:160]} for _s, full, r in rows[:lim]],
+                "tools": [{"tool": full, "mode": r["mode"], "verify": r.get("verify"),
+                           "destructive": bool(r.get("destructive")) or None, "summary": r["summary"][:160]}
+                          for _s, full, r in rows[:lim]],
                 "call": "uefn_call(tool, args); uefn_describe_tool(tool) gives its parameters"}
 
     def describe_catalog(self, name):
@@ -235,24 +285,107 @@ class Backend:
             return {"ok": False, "error": "no UEFN tool %r in the catalog (UEFN %s)" % (name, cat.get("uefn")),
                     "didYouMean": [t["tool"] for t in near]}
         return {"ok": True, "tool": name, "toolset": r["toolset"], "mode": r["mode"], "epicAnnotated": r["annotated"],
-                "readBackThrough": r.get("getter"), "verify": r.get("verify"), "deny": r.get("deny"), "description": r["description"],
+                "readBackThrough": r.get("getter"), "verify": r.get("verify"), "deny": r.get("deny"),
+                "destructive": r.get("destructive"), "needsConfirm": r["name"] if r.get("destructive") else None,
+                "sensitive": r.get("sensitive"), "description": r["description"],
                 "parameters": r["inputSchema"], "uefn": cat.get("uefn"),
                 "guarantees": "unknown keys refused at every depth, JSON types checked (no string for a number), "
                               "enums and bounds checked, vectors whole or filled from the getter's current value"
                               + VERIFY_TEXT.get(r.get("verify"), "")}
 
-    def call_catalog(self, name, args):
+    def call_catalog(self, name, args, confirm=None):
         cat = CAT.load()
         r = cat["tools"].get(name)
         if r is not None and r.get("deny"):           # refused before anything is sent, UEFN or not
             return {"ok": False, "refused": "%s is not reachable through MifBridge: %s" % (name, r["deny"])}
+        short = name.rsplit(".", 1)[-1]
+        if r is not None and r.get("destructive") and confirm != short:
+            return {"ok": False, "tool": name, "refused": "%s needs confirm=%r: %s. Nothing was sent. Pass it only "
+                    "when the person asked for exactly this" % (name, short, r["destructive"])}
         if r is not None:
             try:
                 CAT.validate(json.loads(json.dumps(args if args is not None else {})), r["inputSchema"], "args",
                              partial_vectors=[] if r.get("getter") else None)
             except CAT.Invalid as e:
                 return {"ok": False, "refused": str(e), "tool": name}
-        return self.run("call", {"tool": name, "args": args if args is not None else {}})
+        return self.run("call", {"tool": name, "args": args if args is not None else {}, "confirm": confirm})
+
+    # ------------------------------------------------------------ the catalog follows the running build (2026-11-25)
+    def _follow_catalog(self, info):
+        """Use on the host the per-build catalog the listener loaded, so uefn_tools, uefn_describe_tool and uefn_call's
+        host-side checks read the same schemas UEFN is checked against. Only a file under this server's own
+        <state dir>/catalogs is followed."""
+        f = (info or {}).get("file") if (info or {}).get("catalog") == "per-build" else None
+        root = os.path.normcase(os.path.abspath(os.path.join(state_dir(), CAT.CATALOG_DIR_NAME)))
+        if f and os.path.isfile(f) and os.path.normcase(os.path.abspath(f)).startswith(root + os.sep):
+            if CAT.ACTIVE["path"] != f:
+                CAT._CACHE.pop(f, None)
+            CAT.ACTIVE["path"] = f
+        else:
+            CAT.ACTIVE["path"] = None
+        return CAT.ACTIVE["path"]
+
+    def refresh_catalog(self, force=False):
+        """uefn_refresh_catalog: read every toolset of the running UEFN (in process through the listener, else over
+        Epic's MCP), write a catalog for its build under <state dir>/catalogs, report tools added, removed and changed
+        against the shipped one, and have the listener load it. The shipped catalog stays the default: when it already
+        matches the running build nothing is written unless force."""
+        from . import gen_catalog as G
+        ping = self.op("ping")
+        if not ping.get("ok"):
+            return flatten(ping) if ping.get("result") is None else {"ok": False, "error": "ping failed"}
+        engine = (ping.get("result") or {}).get("engine")
+        stamp = CAT.stamp_of(engine)
+        target = CAT.per_build_file(state_dir(), engine)
+        if not stamp or not target:
+            return {"ok": False, "error": "the running UEFN build cannot be read from %r, so no catalog can be stamped "
+                    "for it; nothing was written" % engine}
+        shipped = CAT.load(CAT.CATALOG_FILE)
+        if CAT.build_of(shipped.get("uefn")) == CAT.build_of(engine) and not force:
+            self._follow_catalog(None)
+            return {"ok": True, "written": None, "catalog": "shipped", "uefn": shipped.get("uefn"),
+                    "note": "the shipped catalog is for the running build; nothing to refresh (force writes one)"}
+        got = self.op("describe_toolsets", timeout=600.0)
+        route, failed, why_not = None, None, None
+        docs = None
+        if got.get("ok") and (got.get("result") or {}).get("docs"):
+            docs, route = got["result"]["docs"], got["result"].get("route")
+            failed = got["result"].get("failed")
+        else:
+            why_not = got.get("refused") or got.get("error") or "the listener answered no toolsets"
+            own = self.ownership()
+            if not (own["epicPid"] and own["epicIsUefn"] and own["epicPid"] == own["listenerPid"]):
+                return {"ok": False, "error": "the toolsets could not be read in process (%s), and Epic's UEFN MCP "
+                        "port %d is not held by the same UEFN (pid %s, %s), so it was not asked either; nothing "
+                        "was written" % (why_not, self.epic_port, own["epicPid"], own["epicImage"])}
+            try:
+                docs = G.from_live(self.epic_port, mcp=self.epic_factory(self.epic_port))
+            except _epic.EpicError as e:
+                return {"ok": False, "kind": e.kind, "error": "in process: %s; over Epic's MCP: %s. Nothing was "
+                        "written" % (why_not, e)}
+            route = "Epic's UEFN MCP over HTTP (list_toolsets, describe_toolset)"
+        cat = G.build(docs or [], stamp)
+        if not cat["tools"]:
+            return {"ok": False, "route": route, "error": "no tools were read (%s); an empty catalog is not written"
+                    % (why_not or "every toolset answered empty")}
+        try:
+            G.write_catalog(cat, target)
+        except (OSError, ValueError) as e:
+            return {"ok": False, "route": route, "error": "the catalog was not written: %s" % e}
+        diff = G.diff_catalogs(shipped, cat)
+        loaded = self.op("catalog_reload")
+        lres = loaded.get("result") or {}
+        bad = []
+        if not loaded.get("ok"):
+            bad.append("the listener did not reload: %s" % (loaded.get("refused") or loaded.get("error")))
+        elif (lres.get("catalog") or {}).get("file") != target or (lres.get("epicTools") or {}).get("state") != "ok":
+            bad.append("the listener did not take the new catalog: %s" % (lres.get("catalog") or {}).get("why"))
+        self._follow_catalog(lres.get("catalog"))
+        return {"ok": not bad, "mismatch": bad, "written": target, "uefn": stamp, "route": route,
+                "inProcessRefused": why_not, "toolsetsFailed": failed, "counts": cat["counts"],
+                "against": shipped.get("uefn"), "added": diff["added"], "removed": diff["removed"],
+                "changed": diff["changed"], "loaded": lres.get("catalog"), "epicTools": lres.get("epicTools"),
+                "catalogGate": lres.get("catalogGate")}
 
     # ------------------------------------------------------------ status
     def status(self, log=0):
@@ -282,18 +415,27 @@ class Backend:
             ping = self.op("ping")
             if ping.get("ok"):
                 r = ping["result"]
-                stale = r.get("sourceSha") != file_sha(LISTENER_FILE)
+                self._follow_catalog(r.get("catalog"))
+                stale_list = stale_files(r)
+                stale = bool(stale_list)
                 out["listener"] = {"running": True, "pid": r.get("pid"), "version": r.get("version"),
-                                   "stale": stale, "writeMode": r.get("writeMode"), "level": r.get("level"),
+                                   "stale": stale, "staleFiles": stale_list or None,
+                                   "catalogGate": r.get("catalogGate"), "writeMode": r.get("writeMode"),
+                                   "writeModeFrom": r.get("writeModeFrom"), "level": r.get("level"),
                                    "contentRoot": r.get("contentRoot"), "engine": r.get("engine"),
                                    "panelOpen": r.get("panel"), "served": r.get("served"),
                                    "refused": r.get("refused"), "failed": r.get("failed"),
                                    "endpoints": len(r["ops"]) if isinstance(r.get("ops"), dict) else None,
-                                   "epicTools": r.get("epicTools"), "pingMs": ping.get("ms"),
+                                   "epicTools": r.get("epicTools"), "catalog": r.get("catalog"),
+                                   "pingMs": ping.get("ms"),
                                    "clientMs": ping.get("clientMs")}
                 if stale:
-                    out["setup"].append("The listener running in UEFN is not this server's copy (an older or newer "
-                                        "MifBridge). Call uefn_install to refresh it.")
+                    out["setup"].append("The listener running in UEFN is not this server's copy (%s differ: an older "
+                                        "or newer MifBridge). Call uefn_install to refresh it." % ", ".join(stale_list))
+                if r.get("catalogGate"):
+                    out["setup"].append("Writes are refused: the catalog is not for the UEFN that is running (%s). "
+                                        "Call uefn_refresh_catalog: it reads this UEFN's toolsets, writes a "
+                                        "catalog for its build and loads it." % r["catalogGate"])
                 if log:
                     lg = self.op("log", {"n": int(log)})
                     out["log"] = lg.get("result") if lg.get("ok") else lg
@@ -310,6 +452,7 @@ class Backend:
             out["setup"].append("MifBridge's listener is not running in UEFN (it is installed once per UEFN start): "
                                 "call uefn_install.")
         out["ready"] = bool(out["listener"] and out["listener"].get("running") and not out["listener"].get("stale"))
+        out["transport"] = self.transport_status(out)
         return out
 
     # ------------------------------------------------------------ install
@@ -362,22 +505,114 @@ class Backend:
                                                                                    own["epicPid"]))
         if not ping.get("ok"):
             bad.append("the listener does not answer: %s" % (ping.get("error") or ping.get("refused")))
-        elif ping["result"].get("sourceSha") != file_sha(LISTENER_FILE):
-            bad.append("UEFN loaded a different listener source than this server's copy")
+        elif stale_files(ping["result"]):
+            bad.append("UEFN loaded a different copy of %s than this server's" % ", ".join(stale_files(ping["result"])))
+        mode = (ping.get("result") or {}).get("writeMode", got.get("writeMode"))
+        if got.get("modeBefore") in ("read", "edit", "full") and mode != got.get("modeBefore"):
+            bad.append("the write mode was %s before the install and is %s after" % (got.get("modeBefore"), mode))
         return {"ok": not bad, "pid": own["epicPid"], "port": self.port, "version": got.get("version"),
                 "panel": got.get("panel"), "logCarried": got.get("carried"), "mismatch": bad,
+                "writeMode": mode, "writeModeBefore": got.get("modeBefore"),
+                "writeModeFrom": (ping.get("result") or {}).get("writeModeFrom", got.get("writeModeFrom")),
                 "level": (ping.get("result") or {}).get("level"),
                 "contentRoot": (ping.get("result") or {}).get("contentRoot")}
 
     # ------------------------------------------------------------ the Blender hand-off
-    def import_from_blender(self, check, folder, name="", skeleton="", animations=None, collision=""):
+    def import_from_blender(self, check, folder, name="", skeleton="", animations=None, collision="", replace=False):
         plan = plan_blender_import(check, folder, name, skeleton, animations, collision)
         if not plan.get("ok"):
             return plan
+        if replace:
+            if plan["op"] != "import_skeletal":
+                return {"ok": False, "error": "replace is for animation clips, and this file is a static mesh"}
+            plan["args"]["replace"] = True
         res = self.op(plan["op"], plan["args"])
         if not res.get("ok") and res.get("result") is None:
             return flatten(res)
         return flatten(compare_blender_import(plan, res))
+
+
+    # ------------------------------------------------------------ the transport, and the ops written as Epic tool calls
+    TRANSPORTS = ("listener", "epic", "auto")
+
+    def transport_choice(self):
+        """MIF_UEFN_TRANSPORT: listener (the default), epic (Epic's UEFN MCP over HTTP, no listener), or auto (the
+        listener when UEFN holds its port, else Epic's MCP)."""
+        raw = (os.environ.get("MIF_UEFN_TRANSPORT") or "").strip().lower()
+        return raw if raw in self.TRANSPORTS else "listener"
+
+    def transport_name(self):
+        choice = self.transport_choice()
+        if choice != "auto":
+            return choice
+        own = self.ownership()
+        return "listener" if own["listenerPid"] and own["listenerIsUefn"] else "epic"
+
+    def transport(self):
+        """The step transport for one call: ListenerCalls, or EpicCalls after the same ownership check install makes
+        (Epic's port held by UEFN). The Epic client is kept, so its describe_toolset reads are made once."""
+        if self.transport_name() == "listener":
+            self._require_listener()
+            return _steps.ListenerCalls(self)
+        own = self.ownership()
+        if not own["epicPid"]:
+            raise UefnError("epic_mcp_off", "nothing listens on Epic's UEFN MCP port %d; nothing was sent"
+                            % self.epic_port, setup=[ENABLE_MCP if self.uefn_processes() else START_UEFN])
+        if not own["epicIsUefn"]:
+            raise UefnError("port_taken", "port %d is held by pid %s (%s), not UEFN; nothing was sent"
+                            % (self.epic_port, own["epicPid"], own["epicImage"]), ownership=own)
+        held = getattr(self, "_epic_steps", None)
+        if held is None or held[0] != (self.epic_port, own["epicPid"]):
+            held = ((self.epic_port, own["epicPid"]), _steps.EpicCalls(self.epic_factory(self.epic_port)))
+            self._epic_steps = held
+        T = held[1]
+        T.calls, T.writes, T.ms = 0, [], []
+        return T
+
+    def run_steps(self, fn, *args, **kw):
+        """One step op on the transport in use: {ok, <its fields>, transport, epicCalls, ...}. Refusals and errors carry
+        the step that stopped it; nothing after it ran."""
+        t0 = time.perf_counter()
+        try:
+            T = self.transport()
+        except UefnError as e:
+            return e.reply()
+        try:
+            res = fn(T, *args, **kw)
+        except _steps.StepError as e:
+            res = e.reply()
+            res["writesBefore"] = list(T.writes) or None
+        out = dict(res)
+        out["ok"] = bool(res.get("ok", True)) and not res.get("mismatch")
+        out.update(transport=T.name, epicCalls=T.calls, ms=round((time.perf_counter() - t0) * 1000, 1))
+        if T.name == "listener" and getattr(T, "verify", None):
+            out["stepVerification"] = [v for v in T.verify if v.get("mismatch")] or None
+        if T.name == "epic":
+            out["callMs"] = T.ms[:200]
+        return out
+
+    def transport_status(self, st):
+        """What uefn_status says about the transport: the choice, the one in use, and why."""
+        choice = self.transport_choice()
+        lst = st.get("listener") or {}
+        epic_ok = (st.get("epicMcp") or {}).get("answering") is True
+        name = "listener" if choice == "listener" else "epic" if choice == "epic" else (
+            "listener" if lst.get("running") else "epic")
+        mode, came = _steps.host_write_mode()
+        out = {"choice": choice, "inUse": name, "from": "MIF_UEFN_TRANSPORT" if os.environ.get("MIF_UEFN_TRANSPORT")
+               else "the default (listener)"}
+        if name == "epic":
+            out.update(ready=epic_ok, writeMode=mode, writeModeFrom=came, listenerOnly=sorted(_steps.LISTENER_ONLY),
+                       note="each typed op runs as Epic tool calls over HTTP (slower, ~333 ms a call unfocused); no "
+                            "panel, so the write gate is MIF_BRIDGE_WRITE_MODE in the MCP server's environment")
+        else:
+            out["ready"] = bool(st.get("ready"))
+            if not lst.get("running") and epic_ok:
+                st.setdefault("setup", []).append(
+                    "If the listener cannot be installed (Python off for the project, or a UEFN release that blocks "
+                    "it), set MIF_UEFN_TRANSPORT=epic in the MCP server's environment: the typed tools then run over "
+                    "Epic's UEFN MCP, slower, and the imports, capture and sessions stay listener-only.")
+        return out
 
 
 def flatten(res):
@@ -429,6 +664,12 @@ def plan_blender_import(check, folder, name="", skeleton="", animations=None, co
         args = {"file": path, "folder": folder, "name": asset}
         if collision:
             args["collision"] = collision
+        # A LOD CHAIN MUST NOT BE COMBINED (found 2026-11-18 on a 3-LOD barrel). Epic's ImportFile defaults
+        # bCombineMeshes to true, and with it the FBX importer merges LOD1 and LOD2 into LOD0: UEFN held 4,830 LOD0
+        # triangles for Blender's 2,760 (2,760 + 1,380 + 690), three copies of the mesh in one. With it false the
+        # LOD group is read as a chain: 3 LODs at 2,760 / 1,380 / 690. One mesh with a chain imports uncombined;
+        # several meshes still combine into the one StaticMesh this op reads back.
+        args["combine"] = not (len(meshes) == 1 and expect["lods"] > 1)
         return {"ok": True, "op": "import_static", "args": args, "kind": kind, "expect": expect}
     if collision:
         return {"ok": False, "error": "collision is a static mesh setting; this file is skinned"}
@@ -488,18 +729,25 @@ out = {}
 try:
     old = sys.modules.get("mifbridge_uefn_listener")
     carried = []
+    old_mode = None
     if old is not None:
         await old.stop()
         carried = list(old.CALL_LOG)
+        # THE GATE THE PERSON SET IS CARRIED, like the call log (H1, 2026-11-22): a fresh module starts in its own
+        # mode, so without this a reinstall was a way round a panel set to read.
+        old_mode = getattr(old, "STATE", {}).get("write_mode")
     for _name in [n for n in sys.modules if n in ("mifbridge_uefn_win32", "mifbridge_uefn_catalog")]:
         sys.modules.pop(_name)
     spec = importlib.util.spec_from_file_location("mifbridge_uefn_listener", MIF["listener"])
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     mod.CALL_LOG.extend(carried)
+    if old_mode is not None:
+        mod.carry_write_mode(old_mode, "from the listener it replaced")
     sys.modules["mifbridge_uefn_listener"] = mod
     out = await mod.start(MIF["port"], MIF["token_file"], MIF["state_dir"])
     out["carried"] = len(carried)
+    out["modeBefore"] = old_mode
     oldp = sys.modules.get("mifbridge_uefn_panel")
     was_open = bool(oldp and oldp.is_open())
     geom = oldp.STATE.get("geometry") if oldp else None

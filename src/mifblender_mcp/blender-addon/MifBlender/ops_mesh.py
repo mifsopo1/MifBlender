@@ -97,7 +97,7 @@ from .ops_common import (remove_objects, MifOpError, UU_PER_BU, simulation_guard
                          shared_data_note, take, take_bool, take_float, take_int,
                          material_slot_names, instances_note, evaluated_mesh_bounds, drawn_instances,
                          _FLT_MIN, _UV_OPEN_RADIUS, _f32, _open_collapsed_uvs, drop_doubled_and_fin_faces, open_collapsed_uvs_of,
-                         triangulate_ngons)
+                         triangulate_ngons, _TRUE_WORDS, _FALSE_WORDS)
 
 # Pinned, not defaulted. Anything that changes the geometry, the axes or the
 # units of the written file lives in this dict so there is exactly one place to
@@ -144,21 +144,34 @@ FBX_UNITY_ARGS = {
     "apply_scale_options": "FBX_SCALE_ALL",
     "bake_space_transform": True,
 }
-# The names export_mesh takes for `profile`, unreal being today's behavior.
+# THE ROBLOX PROFILE, measured in Studio 0.748 with a file uploaded (FBX_UNITY_ARGS with FBX_SCALE_UNITS): 1 Blender metre
+# is 1 stud, the file's origin becomes the MeshPart's pivot (PivotOffset), and R = (-bx, bz, by) - Blender +Y lands on
+# Roblox +Z (its back), +X on -X - so a model built facing Blender's front (-Y) faces Roblox's front (-Z). Written
+# deliberately so: Blender's front stays the front. At global scale 1 FBX_SCALE_UNITS writes the same numbers as
+# FBX_SCALE_ALL (node scale 1, UnitScaleFactor 100); it is pinned because it is what was measured.
+FBX_ROBLOX_ARGS = {
+    "axis_up": "Y",
+    "axis_forward": "-Z",
+    "apply_scale_options": "FBX_SCALE_UNITS",
+    "bake_space_transform": True,
+}
+# The names export_material_textures and mesh_quality take for `profile`, unreal being today's behavior.
 EXPORT_PROFILES = ("unreal", "unity")
+# export_mesh also writes for Roblox; nothing else has a Roblox rule measured.
+EXPORT_MESH_PROFILES = EXPORT_PROFILES + ("roblox",)
 # What Unity's importer does with a hull named for Unreal: a plain visible MeshRenderer, no collider (measured).
 _UNITY_HULL = re.compile(r"^(UCX|UBX|USP|UCP)_")
 _UNITY_LOD = re.compile(r"^(.+)_LOD(\d+)(\.\d+)?$")
 
 
-def export_profile(params, tail):
-    """The engine a file or a check is for: None when not asked (nothing in the reply changes), else unreal or unity."""
+def export_profile(params, tail, allowed=EXPORT_PROFILES):
+    """The engine a file or a check is for: None when not asked (nothing in the reply changes), else one of allowed."""
     raw = params.get("profile")
     if raw is None:
         return None
     value = str(raw).lower() if isinstance(raw, str) else None
-    if value not in EXPORT_PROFILES:
-        raise MifOpError("profile is %s, got %r. %s" % (" or ".join(EXPORT_PROFILES), raw, tail))
+    if value not in allowed:
+        raise MifOpError("profile is %s, got %r. %s" % (", ".join(allowed[:-1]) + " or " + allowed[-1], raw, tail))
     return value
 
 
@@ -383,14 +396,14 @@ def op_import_mesh(params):
         # meshes; what changed is that the response now SAYS an animation was left behind.
         args["use_anim"] = take_bool(params, "importAnimation", default=False)
 
-    # THE CLEAR, NOW THAT NOTHING ABOVE CAN REFUSE. FILE-WIDE, as it always was - bpy.data.objects is every
-    # scene's objects, not the active scene's - and the response now says what went, and which of it was not
-    # in the scene being imported into, because until now a caller could not tell.
+    # THE CLEAR, NOW THAT NOTHING ABOVE CAN REFUSE. clear_targets picks what goes by clearScope: "scene" (the default
+    # since 2026-10-04) the objects of the scene being imported into and of no other, "file" every scene's objects
+    # (bpy.data.objects) - and the response says what went, and which of it was not in the scene being imported into.
     #
     # THROUGH ops_scene._delete, THE RIGID-BODY-SAFE PATH clear_scene and delete_object use (2026-09-28, the 2026-09-21
     # pack-rule review). This removed each object with a bare bpy.data.objects.remove, which frees a rigid body or joint
     # without taking it out of Bullet's world - the use after free that crashed 5.2.1 and 4.2.17 through delete_object
-    # (docs/22 B51) - and kept a baked world's cache after every body in it was gone: measured on 5.2.1 through this
+    # - and kept a baked world's cache after every body in it was gone: measured on 5.2.1 through this
     # op, five baked hinge rigs cleared and the world's point cache still read isBaked true. purge=False: the clear has
     # never purged, and does not start now.
     cleared, cleared_elsewhere, shared_kept = [], [], []
@@ -434,7 +447,7 @@ def op_import_mesh(params):
                              % (len(created), ", ".join(o.name for o in created),
                                 (", and clearScene deleted %d object(s) first" % len(cleared)) if cleared else ""))
         # Naming an imported object over one already in the scene renames THAT object on 3.6
-        # when the import's own name sorts higher - ledger B12. An import is exactly where it
+        # when the import's own name sorts higher - the internal notes. An import is exactly where it
         # would bite: the incoming name comes from a file, so the sort is not the caller's to
         # predict.
         assign_id_name(created[0], str(rename), bpy.data.objects)
@@ -483,9 +496,9 @@ def op_import_mesh(params):
         "animationImported": bool(new_actions),
         "actionsCreated": new_actions,
         "objectsWithAction": animated,
-        # WHAT clearScene DELETED, which the response never said. It is FILE-WIDE, so an object in another scene
-        # goes too; clearedFromOtherScenes names those, measured 2026-09-21 on 5.0.1 (a second scene's object was
-        # deleted by an import into the first).
+        # WHAT clearScene DELETED, which the response never said. With clearScope "file" an object in another scene
+        # goes too, and clearedFromOtherScenes names those (measured 2026-09-21 on 5.0.1, when file was the only scope:
+        # a second scene's object was deleted by an import into the first). The default, "scene", leaves them.
         "clearScene": clear,
         "clearScope": scope if clear else None,
         # An object linked into this scene AND another is not deleted by a scene clear - deleting it would take it
@@ -896,8 +909,15 @@ def op_export_mesh(params):
         "applyScaleOptions", "pathMode", "embedTextures", "facingBody", "splitShapeCorners", "sockets", "lodGroups",
         "profile"},
         "export_mesh")
-    profile = export_profile(params, "NOTHING was written.")
+    profile = export_profile(params, "NOTHING was written.", EXPORT_MESH_PROFILES)
     unity = profile == "unity"
+    roblox = profile == "roblox"
+    if roblox and params.get("sockets") is not None:
+        raise MifOpError("sockets writes Unreal's SOCKET_ Empties; profile roblox has no reading of them measured (a "
+                         "MeshPart upload keeps one mesh). Place Attachments in Studio instead. NOTHING was written.")
+    if roblox and params.get("lodGroups") is not None:
+        raise MifOpError("lodGroups writes the LodGroup Empties Unreal's importer reads; profile roblox has no reading of "
+                         "them measured (Roblox makes its own levels of detail). NOTHING was written.")
     if unity and params.get("sockets") is not None:
         raise MifOpError("sockets writes Unreal's SOCKET_ Empties; profile unity has no reading of them measured. "
                          "NOTHING was written.")
@@ -1047,6 +1067,8 @@ def op_export_mesh(params):
     args = dict(FBX_EXPORT_ARGS)
     if unity:
         args.update(FBX_UNITY_ARGS)
+    if roblox:
+        args.update(FBX_ROBLOX_ARGS)
     for key, (arg, kind) in _EXPORT_OVERRIDES.items():
         if key in params:
             value = params[key]
@@ -1303,6 +1325,26 @@ def op_export_mesh(params):
                               "unchanged.")
         if lod_notes:
             out["lodWarning"] = lod_notes
+    if roblox:
+        out["axis"] = {"up": "Y", "forward": "-Z", "unit": "1 Blender metre = 1 stud", "robloxFromBlender": "(-x, z, y)",
+                       "pivot": "the file's origin becomes the MeshPart's pivot (PivotOffset): the scene origin, or the "
+                                "first object's own origin with localSpace",
+                       "note": "Blender's front (-Y) faces Roblox's front (-Z); Blender +X lands on Roblox -X. Measured "
+                               "in Studio 0.748 on an uploaded file"}
+        # READ OFF THE FILE, not predicted: the axes and unit the importer will see.
+        from .ops_handoff import _read_fbx                    # noqa: PLC0415 - the one binary FBX reader
+        try:
+            st = _read_fbx(path).get("settings") or {}
+        except (MifOpError, OSError, ValueError, KeyError, IndexError) as exc:
+            st, out["fileAxesError"] = {}, str(exc)
+        out["fileAxes"] = {k: st.get(k) for k in ("UpAxis", "UpAxisSign", "FrontAxis", "FrontAxisSign", "CoordAxis",
+                                                  "CoordAxisSign", "UnitScaleFactor")}
+        usl = float(bpy.context.scene.unit_settings.scale_length)
+        if abs(usl - 1.0) > 1e-9 or (gscale is not None and abs(gscale - 1.0) > 1e-9) or                 args.get("apply_scale_options") != "FBX_SCALE_UNITS":
+            out["unitWarning"] = ("1 metre = 1 stud was measured at unit scale 1, global scale 1 and FBX_SCALE_UNITS; "
+                                  "this file has scale_length %g, globalScale %s, %s, so its size in studs is not "
+                                  "measured" % (usl, gscale if gscale is not None else 1.0,
+                                                args.get("apply_scale_options")))
     if socket_names is not None:
         out["socketsWritten"] = sorted(e.name for e in socket_objs)
     if lod_groups:
@@ -2281,7 +2323,7 @@ def op_transform_selection(params, _plan=None):
     offset - never by carrying a vertex out to its world position and back in 32 bits, which put a vertex at y 240 moved
     by -0.1 at -0.600006 instead of -0.6 - so the same edit at y 240 and at the origin writes the same raw coordinates.
 
-    dryRun:true IS ALSO THE BULK PREVIEW (docs/15 section 5): every affected vertex, its coordinate before and after (the
+    dryRun:true IS ALSO THE BULK PREVIEW: every affected vertex, its coordinate before and after (the
     shape key's when shapeKey is given), and a previewId that {previewId} alone commits - planned again, refused on any
     difference, read back, and on a mismatch every vertex of the mesh and of each shape key put back as it was.
     """
@@ -2475,7 +2517,7 @@ def op_transform_selection(params, _plan=None):
         before_selected_local = [v.co.copy() for v in verts]
         # EVERY MOVE IN DOUBLES, AND NEVER THROUGH A WORLD COORDINATE (2026-10-04). Mesh coordinates and
         # mathutils are 32-bit: carrying a vertex 240 m out into world space and back cost about 1.5e-5 m, so a WORLD
-        # move of a vertex at y 240 by -0.1 landed at -0.600006 local instead of -0.6 (docs/02_GOTCHAS.md). Now the
+        # move of a vertex at y 240 by -0.1 landed at -0.600006 local instead of -0.6. Now the
         # move is worked out as an OFFSET - the vector, or (scale or turn - 1) x the vertex's offset from the pivot, that
         # offset formed as W3 x (local - local centre) or W3 x local + (translation - pivot), so the big translation
         # cancels before it touches a coordinate - taken back through a double-precision inverse of the 3x3, and added
@@ -2762,7 +2804,7 @@ def _bevel_applied_offset(src, geom_ref, offset, kwargs, result_key):
 
 
 # A BEVEL CAN PASS THROUGH ITSELF WHILE EVERY GUARD IN op_bevel_edges HOLDS. MEASURED 2026-09-17 through server._execute
-# (docs/22 B81): a 2 BU cube with a radius-0.5 tube booleaned onto it, bevel_edges on the tube's rim or on a blind hole's
+#: a 2 BU cube with a radius-0.5 tube booleaned onto it, bevel_edges on the tube's rim or on a blind hole's
 # floor ring at offsets from 0.5 BU - the tube's radius - up, answered ok with 8 to 590 pairs of faces crossing on 3.6.23
 # and 5.2.1. clampOverlap stops it on 3.6.23 and 4.2.17 (0.7 asked on the rim, 0.498 applied, nothing crossing) and does
 # NOT from 4.4.0 (0.689 applied, 386 pairs on 4.4.0, 5.0.1 and 5.2.1). Offsets up to 0.35 crossed nothing on either ring
@@ -3520,13 +3562,14 @@ def op_set_material_slots(params):
       object       (str, required)  a mesh - or a curve, text, surface, metaball, hair curves,
                                     point cloud or volume, which hold slots the same way
       slots        (list[str|null], required)  the slot names, in order
-      allowResize  (bool, default False)  permit changing the slot COUNT
+      allowResize  (bool, default False)  permit changing the slot COUNT; an object with NO slots takes its first
+                                    materials without it (no polygon index to re-map)
       links        (list[str|null])  per slot, OBJECT or DATA (MaterialSlot.link): where the slot's material is
                                     stored - on the object, or on the mesh every user shares. Set before the
                                     material, so the material lands there. OBJECT is how an override of a linked
                                     mesh object keeps its own material across a reload; a DATA slot on linked data
                                     that is not overridden is refused (the write would not survive a reload)
-      dryRun       (bool)  the BULK PREVIEW (docs/15 section 5): every slot, link and material that would change, with
+      dryRun       (bool)  the BULK PREVIEW: every slot, link and material that would change, with
                                     its value before, and a previewId that {previewId} alone commits - planned again,
                                     refused on any difference, read back, and put back (slots, links, polygon material
                                     indices, the materials it made) on a mismatch
@@ -3574,11 +3617,14 @@ def op_set_material_slots(params):
                     "would not survive a reload. Pass links with OBJECT for that slot (the object keeps its own "
                     "material), or override the data (library_override data). NOTHING was changed."
                     % (i, obj.name, obj.data.name, obj.data.library.filepath))
-        if allow_resize and len(slots) != len(before):
+        if (allow_resize or not before) and len(slots) != len(before):
             raise MifOpError("'%s' uses linked data '%s', whose slot count this file cannot change. NOTHING was "
                              "changed." % (obj.name, obj.data.name))
 
-    if len(slots) != len(before) and not allow_resize:
+    # A 0-SLOT OBJECT HAS NO INDEX TO RE-MAP (FOUND 2026-11-18): every fresh primitive, lathe and plane refused its first
+    # material without allowResize. With no slots every polygon reads slot 0 already, so 0 -> n moves no face; the guard
+    # stays for every other count change.
+    if len(slots) != len(before) and not allow_resize and before:
         # REFUSED rather than resized. Changing the count re-indexes polygons, and a
         # face whose material_index now points past the end renders as the LAST slot
         # with no error anywhere - exactly the silent-wrong-result this project keeps
@@ -3604,8 +3650,9 @@ def op_set_material_slots(params):
                                                                       or bool(would_create)),
                 "note": "DRY RUN - nothing was written."}
 
-    # Resize first, so the assignment loop below always has a slot to write into.
-    if allow_resize:
+    # Resize first, so the assignment loop below always has a slot to write into. An object with no slots grows
+    # without the flag (the guard above says why).
+    if allow_resize or not before:
         while len(obj.material_slots) < len(slots):
             obj.data.materials.append(None)
         while len(obj.material_slots) > len(slots):
@@ -3680,7 +3727,9 @@ _UV_KEYS = {
     # FOLLOW_ACTIVE_QUADS
     "fillHoles", "activeFace", "previewId", "previewTtlSeconds",
     # SEAMS BY RULE AND A PACK TO A FILL TARGET (2026-11-07)
-    "seamRules", "packFill"}
+    "seamRules", "packFill",
+    # A TOKEN OF UV SPACE FOR FACES NOBODY SEES (2026-11-22): shrunk after the unwrap, before the pack
+    "hiddenFaces"}
 
 # bpy.ops.uv.unwrap's method for each of this op's names. MINIMUM_STRETCH is in the operator's enum on 4.4, 5.0 and
 # 5.2 and not on 4.2 (read off its rna_type, 2026-10-06); 3.6 and 4.2 have only uv.minimize_stretch, which relaxes a
@@ -3985,7 +4034,9 @@ def _refit_islands(mesh, layer_name, old_uv):
 # 38% of the texture. These rules mark the seams a character artist would: the head off the neck and up the back of the
 # skull, and every piece of a garment cut open along its inside until it lies flat - then an ANGLE unwrap and a pack to a
 # fill target. World space throughout; the object's origin is the working origin.
-_SEAM_RULES = ("head", "garment")
+_SEAM_RULES = ("head", "garment", "tube", "lathe", "creature")
+# THE ORGANIC RULES (2026-11-25): seams that run where the part is least seen, joining its ends or its tips into one tree
+_ORGANIC_RULE_KEYS = {"rule", "axis", "views", "rays", "tips", "hide"}
 _HEAD_RULE_KEYS = {"rule", "bone", "armature", "back"}
 _GARMENT_RULE_KEYS = {"rule", "midPlane", "prefer", "preferWeight", "splitAtMidPlane"}
 _MAX_SEAM_RULES = 8
@@ -4013,6 +4064,9 @@ def _parse_seam_rules(raw, obj):
             raise MifOpError("seamRules[%d] must be {rule: %s, ...}; got %r. NOTHING was changed."
                              % (i, " | ".join(_SEAM_RULES), r))
         kind = r["rule"]
+        if kind in ("tube", "lathe", "creature"):
+            out.append((kind, _parse_organic_rule(r, i)))
+            continue
         allowed = _HEAD_RULE_KEYS if kind == "head" else _GARMENT_RULE_KEYS
         extra = sorted(set(r) - allowed)
         if extra:
@@ -4306,6 +4360,174 @@ def _rule_garment(bm, pos, wn, spec):
                                 "cutPaths": rows, "splitEdges": len(split_edges) if spec["split"] else None}
 
 
+def _parse_organic_rule(r, i):
+    """{rule: tube | lathe | creature, axis, views, rays, tips, hide}, checked."""
+    extra = sorted(set(r) - _ORGANIC_RULE_KEYS)
+    if extra:
+        raise MifOpError("seamRules[%d] (%s) does not take %s - it takes %s. NOTHING was changed."
+                         % (i, r["rule"], ", ".join(extra), ", ".join(sorted(_ORGANIC_RULE_KEYS - {"rule"}))))
+    spec = {"axis": None, "hide": None}
+    if r.get("axis") is not None:
+        ax = r["axis"]
+        if isinstance(ax, str) and ax.upper() in ("X", "Y", "Z"):
+            spec["axis"] = Vector({"X": (1, 0, 0), "Y": (0, 1, 0), "Z": (0, 0, 1)}[ax.upper()])
+        else:
+            spec["axis"] = _rule_vec(ax, "axis", i).normalized()
+    if r.get("hide") is not None:
+        spec["hide"] = _rule_vec(r["hide"], "hide", i).normalized()
+    views = r.get("views", 32)
+    rays = r.get("rays", True)
+    tips = r.get("tips", 6)
+    if isinstance(views, bool) or not isinstance(views, int) or not 6 <= views <= 256:
+        raise MifOpError("seamRules[%d].views is 6-256 view directions, got %r. NOTHING was changed." % (i, views))
+    if not isinstance(rays, bool):
+        raise MifOpError("seamRules[%d].rays is true (occlusion by ray) or false (facing only). NOTHING was changed."
+                         % i)
+    if isinstance(tips, bool) or not isinstance(tips, int) or not 2 <= tips <= 32:
+        raise MifOpError("seamRules[%d].tips is 2-32 (the creature's limb tips joined), got %r. NOTHING was changed."
+                         % (i, tips))
+    spec.update(views=views, rays=rays, tips=tips)
+    return spec
+
+
+def _organic_exposure(bm, pos, spec):
+    """Per vertex 0-1: how much it is seen - the share of `views` directions (the upper half weighted double, as a game
+    camera sees a part) it faces and, with rays, is not hidden from by the part itself. hide [x,y,z] adds the facing
+    toward that direction as least seen (a creature's belly: [0, 0, -1])."""
+    from mathutils.bvhtree import BVHTree   # noqa: PLC0415
+    n = spec["views"]
+    golden = math.pi * (3.0 - math.sqrt(5.0))
+    dirs = []
+    for k in range(n):
+        z = 1.0 - 2.0 * (k + 0.5) / n
+        r = math.sqrt(max(0.0, 1.0 - z * z))
+        dirs.append(Vector((r * math.cos(golden * k), r * math.sin(golden * k), z)))
+    weights = [2.0 if d.z > 0 else 1.0 for d in dirs]
+    tree = BVHTree.FromPolygons([pos[v] for v in bm.verts], [[v.index for v in f.verts] for f in bm.faces]) \
+        if spec["rays"] else None
+    span = max((pos[v] - pos[bm.verts[0]]).length for v in bm.verts) or 1.0
+    eps = span * 1e-4
+    out = {}
+    tot_w = sum(weights)
+    for v in bm.verts:
+        nrm = v.normal
+        seen = 0.0
+        for d, w in zip(dirs, weights):
+            if nrm.dot(d) <= 0.05:
+                continue
+            if tree is not None:
+                hit = tree.ray_cast(pos[v] + nrm * eps, d, span * 2.0)[0]
+                if hit is not None:
+                    continue
+            seen += w
+        e = seen / tot_w
+        if spec["hide"] is not None:
+            e = e * (1.0 - 0.5 * max(0.0, nrm.dot(spec["hide"])))
+        out[v] = e
+    return out
+
+
+def _rule_organic(bm, kind, pos, spec):
+    """tube / lathe / creature: a tree of seams through the least-seen surface that opens the part into one disc. Its
+    terminals: every open loop, and on a closed part the two ends along the axis (tube, lathe - default the part's
+    longest direction) or the creature's limb tips (the vertices geodesically farthest from each other, up to `tips`,
+    while each is at least a third as far as the first). Each terminal joins the tree by the cheapest edge path, an edge
+    costing its length x (0.05 + how much it is seen)^2. Returns (edges, detail)."""
+    import heapq as _hq
+    bm.verts.ensure_lookup_table()
+    bm.normal_update()
+    expo = _organic_exposure(bm, pos, spec)
+    loops = [set(vs) for _es, vs in _boundary_loops(bm)]
+
+    def cost(e):
+        a, b = e.verts
+        return (pos[a] - pos[b]).length * (0.05 + 0.5 * (expo[a] + expo[b])) ** 2
+
+    def geodesic(src):
+        dist = {v: 0.0 for v in src}
+        heap = [(0.0, i, v) for i, v in enumerate(src)]
+        _hq.heapify(heap)
+        tie = len(heap)
+        while heap:
+            d, _t, v = _hq.heappop(heap)
+            if d > dist.get(v, 1e30):
+                continue
+            for e in v.link_edges:
+                w = e.other_vert(v)
+                nd = d + (pos[v] - pos[w]).length
+                if nd < dist.get(w, 1e30):
+                    dist[w] = nd
+                    tie += 1
+                    _hq.heappush(heap, (nd, tie, w))
+        return dist
+    terms = [lp for lp in loops]
+    if kind in ("tube", "lathe") and len(terms) < 2:
+        ax = spec["axis"]
+        if ax is None:
+            import numpy as np   # noqa: PLC0415
+            a = np.array([tuple(pos[v]) for v in bm.verts])
+            w, vec = np.linalg.eigh(np.cov((a - a.mean(axis=0)).T))
+            ax = Vector(vec[:, -1].tolist()).normalized()
+        ts = sorted(bm.verts, key=lambda v: pos[v].dot(ax))
+        ends = [{ts[0]}, {ts[-1]}]
+        for end in ends:
+            if not any(end & lp for lp in terms):
+                terms.append(end)
+    elif kind == "creature":
+        centre = sum((pos[v] for v in bm.verts), Vector()) / len(bm.verts)
+        start = min(bm.verts, key=lambda v: (pos[v] - centre).length)
+        d0 = geodesic([start])
+        first = max(d0, key=d0.get)
+        tips = [first]
+        dmin = geodesic([first])
+        reach0 = None
+        while len(tips) < spec["tips"]:
+            cand = max(dmin, key=dmin.get)
+            if reach0 is None:
+                reach0 = dmin[cand]
+            elif dmin[cand] < reach0 / 3.0:
+                break
+            tips.append(cand)
+            dn = geodesic([cand])
+            for v in dmin:
+                dmin[v] = min(dmin[v], dn.get(v, 1e30))
+        for t in tips:
+            if not any(t in lp for lp in terms):
+                terms.append({t})
+    if len(terms) < 2:
+        return [], {"rule": kind, "terminals": len(terms), "cutEdges": 0,
+                    "note": "one open loop or one end - the part already opens into a disc, nothing was cut"}
+    joined = set(terms[0])
+    rest = [set(t) for t in terms[1:]]
+    cuts, paths = [], []
+    owner = {}
+    for k, t in enumerate(rest):
+        for v in t:
+            owner[v] = k
+    while any(rest):
+        got = _cut_dijkstra(joined, lambda v: owner.get(v) if owner.get(v) is not None and rest[owner[v]] else None,
+                            lambda e: True, pos, cost)
+        if got is None:
+            break
+        edges, verts, k = got
+        cuts.extend(edges)
+        paths.append(verts)
+        joined.update(verts)
+        joined.update(rest[k])
+        rest[k] = set()
+    seam_v = {v for e in cuts for v in e.verts}
+    mean_all = sum(expo.values()) / len(expo)
+    mean_seam = sum(expo[v] for v in seam_v) / len(seam_v) if seam_v else None
+    rows = [{"edges": len(pv) - 1, "points": [rnd(list(pos[v])) for v in pv[:64]], "truncated": len(pv) > 64}
+            for pv in paths[:32]]
+    return cuts, {"rule": kind, "terminals": len(terms), "openLoops": len(loops), "cutEdges": len(cuts),
+                  "seamLength": round(sum(e.calc_length() for e in cuts), 6),
+                  "exposure": {"mesh": round(mean_all, 4), "seams": round(mean_seam, 4) if mean_seam is not None
+                               else None, "note": "0 is never seen, 1 seen from every view; a seam well under the "
+                                                  "mesh's mean runs where it is least seen"},
+                  "cutPaths": rows}
+
+
 def _apply_seam_rules(bm, obj, rules):
     """Mark every rule's seams on the bmesh, in order - a later rule sees the seams an earlier one marked. Returns
     (edges marked new, per-rule detail). A rule that marks nothing is reported, not refused: a garment already cut to
@@ -4321,7 +4543,10 @@ def _apply_seam_rules(bm, obj, rules):
     marked, rows = 0, []
     for kind, spec in rules:
         before = sum(1 for e in bm.edges if e.seam)
-        edges, detail = (_rule_head(bm, obj, pos, wn, spec) if kind == "head" else _rule_garment(bm, pos, wn, spec))
+        if kind in ("tube", "lathe", "creature"):
+            edges, detail = _rule_organic(bm, kind, pos, spec)
+        else:
+            edges, detail = (_rule_head(bm, obj, pos, wn, spec) if kind == "head" else _rule_garment(bm, pos, wn, spec))
         for e in set(edges):
             e.seam = True
         new = sum(1 for e in bm.edges if e.seam) - before
@@ -4352,6 +4577,283 @@ def _layout_report(mesh, layer_name, m3, texture=1024):
                 "worldArea": round(a3, 6)}
     finally:
         bm.free()
+
+
+_HIDDEN_KEYS = {"visibility", "rays", "occluders", "volumes", "volumeTolerance", "downFacing", "baseBand", "uvScale"}
+
+
+def _hidden_faces_spec(raw, method, uv_pack_given, keep_bounds):
+    """hiddenFaces, checked before anything is written: which tests to run and how small to make what they find.
+
+    A WATERTIGHT SHELL SPENDS TEXTURE ON ITS INSIDE (found 2026-11-21 building a 20 x 16 cottage of closed wall slabs):
+    the slabs' inner faces and the base nobody sees took their full share of the map. Shrinking them to a token before
+    the pack let what shows take the space, 13 to 22 texels per stud at the same map size."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise MifOpError("hiddenFaces must be an object like {visibility: true, downFacing: true} or {volumes: "
+                         "['Interior']}; got %r. NOTHING was changed." % (raw,))
+    unknown = set(raw) - _HIDDEN_KEYS
+    if unknown:
+        raise MifOpError("hiddenFaces does not take %s - it takes %s. NOTHING was changed."
+                         % (", ".join(sorted(unknown)), ", ".join(sorted(_HIDDEN_KEYS))))
+    if method in ("BOX",):
+        raise MifOpError("hiddenFaces shrinks hidden faces' UVs so a pack gives the rest their space, and method BOX "
+                         "does not pack (its tile is in meters). NOTHING was changed.")
+    if keep_bounds:
+        raise MifOpError("hiddenFaces packs after shrinking, and keepBounds puts each island back where it was - pass "
+                         "one. NOTHING was changed.")
+    if uv_pack_given is False:
+        raise MifOpError("hiddenFaces packs - the shrink is only worth anything when a pack scales up the rest - so it "
+                         "cannot go with uvPack false. NOTHING was changed.")
+
+    def _flag(key):
+        v = raw.get(key, False)
+        if not isinstance(v, bool):
+            raise MifOpError("hiddenFaces.%s must be true or false; got %r. NOTHING was changed." % (key, v))
+        return v
+
+    def _num(key, default, lo, hi, what):
+        v = raw.get(key, default)
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not lo < v <= hi:
+            raise MifOpError("hiddenFaces.%s must be %s; got %r. NOTHING was changed." % (key, what, v))
+        return float(v)
+
+    def _names(key):
+        v = raw.get(key)
+        if v is None:
+            return []
+        if not isinstance(v, (list, tuple)) or not v or any(not isinstance(n, str) for n in v):
+            raise MifOpError("hiddenFaces.%s must be a non-empty list of object names; got %r. NOTHING was changed."
+                             % (key, v))
+        out = []
+        for n in v:
+            o = bpy.data.objects.get(n)
+            if o is None:
+                raise MifOpError("hiddenFaces.%s names %r, which is not an object here. NOTHING was changed." % (key, n))
+            out.append(o)
+        return out
+
+    rays_f = _num("rays", 64, 3, 4096, "a whole number of rays from 4 to 4096")
+    spec = {"visibility": _flag("visibility"), "downFacing": _flag("downFacing"),
+            "volumes": _names("volumes"), "occluders": _names("occluders"),
+            "uvScale": _num("uvScale", 0.03, 0.0, 1.0, "above 0 and below 1 (0.03 shrinks a hidden face to 3% of its "
+                            "size across)"),
+            "rays": int(rays_f),
+            "baseBand": _num("baseBand", 0.05, -1e-12, 1e6, "a distance in meters, 0 or more"),
+            "volumeTolerance": _num("volumeTolerance", 0.01, -1e-12, 1e6, "a distance in meters, 0 or more")}
+    if spec["uvScale"] >= 1.0:
+        raise MifOpError("hiddenFaces.uvScale must be below 1 - 1 shrinks nothing. NOTHING was changed.")
+    if not rays_f.is_integer():          # _num refused a bool and a non-finite value; a fraction is refused here, not floored
+        raise MifOpError("hiddenFaces.rays must be a whole number; got %r. NOTHING was changed." % (raw["rays"],))
+    if not (spec["visibility"] or spec["downFacing"] or spec["volumes"]):
+        raise MifOpError("hiddenFaces names no test: pass visibility true (a face every ray from which hits geometry), "
+                         "volumes (objects whose bounding boxes hold faces that face inward), or downFacing true (faces "
+                         "facing down at the base). NOTHING was changed.")
+    if spec["occluders"] and not spec["visibility"]:
+        raise MifOpError("hiddenFaces.occluders are what visibility's rays may hit; pass visibility true with them. "
+                         "NOTHING was changed.")
+    if raw.get("rays") is not None and not spec["visibility"]:
+        raise MifOpError("hiddenFaces.rays is visibility's ray count; pass visibility true with it. NOTHING was changed.")
+    if raw.get("baseBand") is not None and not spec["downFacing"]:
+        raise MifOpError("hiddenFaces.baseBand is downFacing's height band; pass downFacing true with it. NOTHING was "
+                         "changed.")
+    if raw.get("volumeTolerance") is not None and not spec["volumes"]:
+        raise MifOpError("hiddenFaces.volumeTolerance pads volumes; pass volumes with it. NOTHING was changed.")
+    return spec
+
+
+def _world_mesh_arrays(o):
+    """World-space vertices and polygon index lists of an object's evaluated mesh, for a BVH."""
+    dg = bpy.context.evaluated_depsgraph_get()
+    ev = o.evaluated_get(dg)
+    me = ev.to_mesh()
+    try:
+        mw = o.matrix_world
+        verts = [mw @ v.co for v in me.vertices]
+        polys = [list(p.vertices) for p in me.polygons]
+    finally:
+        ev.to_mesh_clear()
+    return verts, polys
+
+
+def _hemisphere_dirs(n, count):
+    """`count` fixed directions over the hemisphere about unit normal n (a Fibonacci spiral, cos of the angle from n
+    from 1 down to 0.05 so no ray runs along the face's own plane). Fixed, so the same mesh always gives the same
+    answer."""
+    from mathutils import Vector
+    t = Vector((1.0, 0.0, 0.0)) if abs(n.x) < 0.9 else Vector((0.0, 1.0, 0.0))
+    u = n.cross(t).normalized()
+    w = n.cross(u)
+    golden = math.pi * (3.0 - math.sqrt(5.0))
+    out = []
+    for k in range(count):
+        c = 1.0 - (k + 0.5) / count * 0.95
+        s = math.sqrt(max(0.0, 1.0 - c * c))
+        a = golden * k
+        out.append((n * c + u * (s * math.cos(a)) + w * (s * math.sin(a))).normalized())
+    return out
+
+
+def _classify_hidden_faces(obj, mesh, spec):
+    """Which of the mesh's faces are hidden, by each test asked for. Reads geometry only; writes nothing.
+
+    visibility  every one of `rays` rays from the face (a fixed spread over its outward hemisphere) hits the object
+                itself or an occluder - the face looks only at geometry, as a closed slab's inner face does.
+    volumes     the face's centre lies inside a volume object's bounding box (padded by volumeTolerance) and it faces
+                the box's centre - the inner faces of the walls round a named interior.
+    downFacing  the face points down (within 25 degrees) and sits within baseBand of the object's lowest point."""
+    from mathutils import Vector
+    mw = obj.matrix_world
+    nm = mw.to_3x3().inverted_safe().transposed()
+    centres = [mw @ p.center for p in mesh.polygons]
+    normals = []
+    for p in mesh.polygons:
+        v = nm @ p.normal
+        normals.append(v.normalized() if v.length > 1e-12 else v)
+    reasons = {}
+
+    def _mark(i, why):
+        reasons.setdefault(i, []).append(why)
+
+    by = {"visibility": None, "volumes": None, "downFacing": None}
+    if spec["visibility"]:
+        from mathutils.bvhtree import BVHTree
+        # THE TARGET AS UNWRAPPED (its own mesh, the faces being classified), the occluders as they render (evaluated)
+        verts = [mw @ v.co for v in mesh.vertices]
+        polys = [list(p.vertices) for p in mesh.polygons]
+        for o in [o for o in spec["occluders"] if o != obj]:
+            if o.type not in ("MESH", "CURVE", "SURFACE", "META", "FONT"):
+                raise MifOpError("hiddenFaces.occluders: %r is a %s, not geometry rays can hit. NOTHING was changed."
+                                 % (o.name, o.type))
+            vv, pp = _world_mesh_arrays(o)
+            base = len(verts)
+            verts.extend(vv)
+            polys.extend([[base + i for i in poly] for poly in pp])
+        tree = BVHTree.FromPolygons(verts, polys, epsilon=0.0)
+        # THE RAY OFFSET IS THE TARGET'S SIZE, NOT THE OCCLUDERS'. It was taken off every vertex in the tree, and a
+        # 200 m ground plane made it 2.8 mm - past a ground 1 mm under the base, so the base's rays started below the
+        # ground and escaped (measured 2026-11-22, Blender 5.0.1). No ray runs within 3 degrees of the face's plane, so
+        # a tiny offset cannot hit the face itself or a coplanar neighbour.
+        own = verts[:len(mesh.vertices)]
+        lo =Vector((min(v.x for v in own), min(v.y for v in own), min(v.z for v in own)))
+        hi = Vector((max(v.x for v in own), max(v.y for v in own), max(v.z for v in own)))
+        eps = max(1e-6, (hi - lo).length * 1e-6)
+        count = 0
+        for i, (c, n) in enumerate(zip(centres, normals)):
+            if n.length < 0.5:
+                continue
+            origin = c + n * eps
+            if all(tree.ray_cast(origin, d)[0] is not None for d in _hemisphere_dirs(n, spec["rays"])):
+                _mark(i, "visibility")
+                count += 1
+        by["visibility"] = count
+    if spec["volumes"]:
+        count = 0
+        for vol in spec["volumes"]:
+            if vol == obj:
+                raise MifOpError("hiddenFaces.volumes names %r, the object being unwrapped - a volume is the space its "
+                                 "faces enclose, given as another object (a box over the interior). NOTHING was changed."
+                                 % obj.name)
+            inv = vol.matrix_world.inverted_safe()
+            bb = [Vector(c) for c in vol.bound_box]
+            blo = Vector((min(c.x for c in bb), min(c.y for c in bb), min(c.z for c in bb)))
+            bhi = Vector((max(c.x for c in bb), max(c.y for c in bb), max(c.z for c in bb)))
+            centre_w = vol.matrix_world @ ((blo + bhi) * 0.5)
+            sc = max(abs(s) for s in vol.matrix_world.to_scale()) or 1.0
+            tol = spec["volumeTolerance"] / sc
+            for i, (c, n) in enumerate(zip(centres, normals)):
+                lc = inv @ c
+                inside = all(blo[k] - tol <= lc[k] <= bhi[k] + tol for k in range(3))
+                if inside and n.dot(centre_w - c) > 1e-9:
+                    if "volumes" not in reasons.get(i, []):
+                        _mark(i, "volumes")
+                        count += 1
+        by["volumes"] = count
+    if spec["downFacing"]:
+        zmin = min((mw @ v.co).z for v in mesh.vertices)
+        count = 0
+        for i, (c, n) in enumerate(zip(centres, normals)):
+            if n.z < -0.9063 and c.z <= zmin + spec["baseBand"] + 1e-9:   # cos 25 degrees
+                _mark(i, "downFacing")
+                count += 1
+        by["downFacing"] = count
+    return reasons, by
+
+
+def _hidden_faces_found(obj, mesh, spec):
+    """(face index set, the answer's hiddenFaces block) for uv_unwrap and uv_pack. Reads geometry only.
+
+    AN EMPTY MATCH IS REFUSED, as markSeams' is: shrinking nothing and packing would answer as though the hidden faces
+    had been dealt with."""
+    reasons, by = _classify_hidden_faces(obj, mesh, spec)
+    if not reasons:
+        raise MifOpError("hiddenFaces found NO hidden face on '%s' (%s), so nothing would be shrunk. On an open "
+                         "mesh every face sees out; check the volumes' boxes and the base band. NOTHING was changed."
+                         % (obj.name, ", ".join("%s %d" % (k, v) for k, v in by.items() if v is not None)))
+    found = set(reasons)
+    return found, {
+        "uvScale": spec["uvScale"],
+        "uvAreaScale": round(spec["uvScale"] ** 2, 6),
+        "faces": len(found),
+        "facesTotal": len(mesh.polygons),
+        "byTest": {k: v for k, v in by.items() if v is not None},
+        "rays": spec["rays"] if spec["visibility"] else None,
+        "occluders": [o.name for o in spec["occluders"]],
+        "volumes": [o.name for o in spec["volumes"]],
+        "faceIndices": sorted(found)[:500],
+        "faceIndicesTruncated": len(found) > 500,
+    }
+
+
+def _visible_density(mesh, layer_name, m4, hidden, texture=1024):
+    """Texel density (pixels per metre at `texture`) over the faces NOT in `hidden`, and the share of the layout's UV
+    area the hidden faces hold - read off the layer, with world areas from the object's matrix."""
+    layer = mesh.uv_layers.get(layer_name)
+    if layer is None or not len(layer.data):
+        return None, None
+    flat = [0.0] * (2 * len(layer.data))
+    layer.data.foreach_get("uv", flat)
+    wv = [m4 @ v.co for v in mesh.vertices]
+    uv_vis = uv_hid = a_vis = 0.0
+    for p in mesh.polygons:
+        s, k = p.loop_start, p.loop_total
+        acc = 0.0
+        for j in range(k):
+            a, b = s + j, s + (j + 1) % k
+            acc += flat[2 * a] * flat[2 * b + 1] - flat[2 * b] * flat[2 * a + 1]
+        uva = abs(acc) * 0.5
+        if p.index in hidden:
+            uv_hid += uva
+            continue
+        vs = [wv[i] for i in p.vertices]
+        nrm = vs[0] * 0.0
+        for j in range(len(vs)):
+            nrm = nrm + vs[j].cross(vs[(j + 1) % len(vs)])
+        uv_vis += uva
+        a_vis += nrm.length * 0.5
+    dens = math.sqrt(uv_vis / a_vis) * texture if a_vis > 1e-12 else None
+    tot = uv_vis + uv_hid
+    return (round(dens, 2) if dens is not None else None), (round(uv_hid / tot, 5) if tot > 1e-12 else None)
+
+
+def _shrink_face_uvs(mesh, layer_name, faces, scale):
+    """Each listed face's UVs scaled about its own UV centroid. Per-face loops, so the face leaves its island as a
+    token island of its own and its visible neighbours keep their corners."""
+    layer = mesh.uv_layers[layer_name]
+    flat = array.array("f", [0.0]) * (2 * len(layer.data))
+    layer.data.foreach_get("uv", flat)
+    for i in faces:
+        p = mesh.polygons[i]
+        s, k = p.loop_start, p.loop_total
+        cu = sum(flat[2 * (s + j)] for j in range(k)) / k
+        cv = sum(flat[2 * (s + j) + 1] for j in range(k)) / k
+        for j in range(k):
+            a = s + j
+            flat[2 * a] = cu + (flat[2 * a] - cu) * scale
+            flat[2 * a + 1] = cv + (flat[2 * a + 1] - cv) * scale
+    layer.data.foreach_set("uv", flat)
+    mesh.update()
 
 
 def op_uv_unwrap(params):
@@ -4405,6 +4907,23 @@ def op_uv_unwrap(params):
 
     The response reports uvLayersBefore and uvLayersAfter by NAME, so "did it land on
     the channel I meant" is answerable without a second call.
+
+    hiddenFaces (2026-11-22) GIVES FACES NOBODY SEES A TOKEN OF UV SPACE: after the unwrap and before
+    the pack (it packs; refused with uvPack false, keepBounds and BOX), each face found is shrunk about
+    its own UV centre by uvScale (default 0.03 across), so the pack scales up what shows. The tests:
+    visibility (every one of `rays`, default 64, from the face hits the object or an `occluders`
+    mesh), volumes (inside a named object's bounding box and facing its centre), downFacing (facing
+    down within baseBand, default 0.05 m, of the lowest point). A test finding nothing is refused.
+    The answer's hiddenFaces block names the faces and counts them by test, and measures the visible
+    faces' texel density with the same pack run without the shrink and with it. On a closed 20 x 16 m
+    cottage of six slabs, 19 of 36 faces were hidden and held 62% of a plain pack's UV area; with
+    them shrunk the visible faces went from 15.57 to 25.04 px/m at 1024 (Blender 5.0.1).
+
+    packFill IN THE ANSWER IS NEVER NULL AFTER A PACK (2026-11-26): uvPack, packFill, hiddenFaces and method LIGHTMAP
+    all answer packFill {target (null without one), achieved (the share of the 0-1 tile the packed layout covers),
+    met, margin, attempts, packedBy, islands, texelDensity (pixels per metre at texelDensityTexture 1024),
+    densitySpread}, measured off the layer after the pack and before uvTransform. It was the fill target's answer
+    only, so a SMART + uvPack call answered packFill null and a sparse pack looked unmeasured.
     """
     reject_unknown(params, _UV_KEYS, "uv_unwrap")
     obj = get_object(take(params, "object", "name", required=True, kind=str), want_mesh=True)
@@ -4492,6 +5011,12 @@ def op_uv_unwrap(params):
         if params.get("uvPack") is False:
             raise MifOpError("packFill packs - it cannot go with uvPack false. NOTHING was changed.")
         uv_pack = True
+    # HIDDEN FACES GET A TOKEN OF UV SPACE (2026-11-22): checked here, the faces found before the seams below write
+    hidden_spec = _hidden_faces_spec(take(params, "hiddenFaces", default=None), method,
+                                     False if params.get("uvPack") is not None and not uv_pack else None,
+                                     take_bool(params, "keepBounds", default=False))
+    if hidden_spec is not None:
+        uv_pack = True
     seam_rules = _parse_seam_rules(params.get("seamRules"), obj)
     if seam_rules and method in ("SMART", "LIGHTMAP", "BOX", "FOLLOW_ACTIVE_QUADS"):
         raise MifOpError("seamRules mark seams for an unwrap that follows them, and %s %s - pass method ANGLE (or "
@@ -4513,6 +5038,10 @@ def op_uv_unwrap(params):
     mesh = obj.data
     before = [uv.name for uv in mesh.uv_layers]
     faq_quads = None
+    hidden_report = None
+    hidden_set = None
+    if hidden_spec is not None and mesh.polygons:
+        hidden_set, hidden_report = _hidden_faces_found(obj, mesh, hidden_spec)
     if method == "FOLLOW_ACTIVE_QUADS":
         faq_quads = sum(1 for p in mesh.polygons if len(p.vertices) == 4)
         if not faq_quads:
@@ -4628,6 +5157,7 @@ def op_uv_unwrap(params):
             "islandMargin": margin,
             "box": box_tile,
             "seams": seams,
+            "hiddenFaces": hidden_report,
             "warnings": warnings,
             "note": "nothing was modified. Drop dryRun to apply.",
         }
@@ -4805,10 +5335,40 @@ def op_uv_unwrap(params):
             # EVERY PROPERTY PINNED (see _pinned_op_kwargs): margin alone left rotate, scale and the island shape to
             # whatever the session last used, and a pack that neither scales nor rotates barely moves anything.
             first_margin = margin if pack_margin is None else pack_margin
+            if hidden_set:
+                # THE SAME PACK WITHOUT THE SHRINK FIRST, measured and thrown away, so the answer's before and after
+                # are one layout packed two ways and the gain is not a comparison with some other call.
+                bpy.ops.object.mode_set(mode="OBJECT")
+                _lay = mesh.uv_layers[active_name]
+                _unpacked = array.array("f", [0.0]) * (2 * len(_lay.data))
+                _lay.data.foreach_get("uv", _unpacked)
+                bpy.ops.object.mode_set(mode="EDIT")
+                bpy.ops.mesh.select_all(action="SELECT")
+                bpy.ops.uv.select_all(action="SELECT")
+                if pack_fill is not None:
+                    bpy.ops.uv.average_islands_scale()
+                bpy.ops.uv.pack_islands(margin=first_margin,
+                                        **_pinned_op_kwargs(bpy.ops.uv.pack_islands, _PACK_PINNED))
+                bpy.ops.object.mode_set(mode="OBJECT")
+                _d0, _s0 = _visible_density(mesh, active_name, obj.matrix_world, hidden_set)
+                hidden_report["visibleTexelDensityBefore"] = _d0
+                hidden_report["hiddenUvShareBefore"] = _s0
+                mesh.uv_layers[active_name].data.foreach_set("uv", _unpacked)
+                mesh.update()
+                bpy.ops.object.mode_set(mode="EDIT")
+                bpy.ops.mesh.select_all(action="SELECT")
+                bpy.ops.uv.select_all(action="SELECT")
             if pack_fill is not None:
                 # ONE TEXEL DENSITY FIRST: every island scaled to its share of the surface, so the tight pack below
                 # cannot buy fill by blowing one island up
                 bpy.ops.uv.average_islands_scale()
+            if hidden_set:
+                # AFTER the averaging (which would grow them back) and BEFORE the pack, which then scales what shows
+                bpy.ops.object.mode_set(mode="OBJECT")
+                _shrink_face_uvs(mesh, active_name, hidden_set, hidden_spec["uvScale"])
+                bpy.ops.object.mode_set(mode="EDIT")
+                bpy.ops.mesh.select_all(action="SELECT")
+                bpy.ops.uv.select_all(action="SELECT")
             bpy.ops.uv.pack_islands(margin=first_margin, **_pinned_op_kwargs(bpy.ops.uv.pack_islands, _PACK_PINNED))
             packed = True
             if pack_fill is not None:
@@ -4870,6 +5430,27 @@ def op_uv_unwrap(params):
     # (see the table at the pack call). That is legal, Blender clamps rather than breaking, and it
     # is invisible unless somebody reports the bounds. So report them.
     kept = _refit_islands(mesh, active_name, old_uv) if old_uv is not None else None
+    # EVERY PACK ANSWERS ITS FILL AND DENSITY (FOUND 2026-11-19): packFill was the fill TARGET's answer, so SMART +
+    # uvPack with no target answered packFill null and a sparse pack read as unmeasured. Measured here off the layer
+    # after the pack - Blender's pack_islands, or lightmap_pack, which packs as it unwraps - and before uvTransform.
+    if packed or method == "LIGHTMAP":
+        _lay = _layout_report(mesh, active_name, obj.matrix_world.to_3x3())
+        if _lay is not None:
+            if fill_report is None:
+                fill_report = {"target": None, "achieved": _lay["fill"], "met": None,
+                               "margin": round(margin if pack_margin is None else pack_margin, 6) if packed
+                               else lightmap_div, "attempts": None}
+            fill_report.update({"packedBy": "pack_islands" if packed else "lightmap_pack",
+                                "islands": _lay["islands"], "texelDensity": _lay["texelDensity"],
+                                "texelDensityTexture": _lay["texelDensityTexture"],
+                                "densitySpread": _lay["densitySpread"]})
+    if hidden_report is not None and packed:
+        _d1, _s1 = _visible_density(mesh, active_name, obj.matrix_world, hidden_set)
+        hidden_report["visibleTexelDensityAfter"] = _d1
+        hidden_report["hiddenUvShareAfter"] = _s1
+        hidden_report["texelDensityTexture"] = 1024
+        _d0 = hidden_report.get("visibleTexelDensityBefore")
+        hidden_report["densityGain"] = round(_d1 / _d0, 4) if _d0 and _d1 else None
     packed_bounds = None
     if packed:
         _layer = mesh.uv_layers.get(active_name) or mesh.uv_layers.active
@@ -4988,8 +5569,12 @@ def op_uv_unwrap(params):
         # MEASURED AT THE PACK CALL, not read back off the request. See packedBounds.
         "packed": packed,
         "packMargin": pack_margin if packed else None,
-        # packFill's answer: the target, the fill reached, the margin kept and every pack tried
+        # packFill's answer on EVERY pack (target null without one): the fill reached, the margin kept, every pack tried
+        # with a target, and the packed layout's islands and texel density at 1024
         "packFill": fill_report,
+        # hiddenFaces' answer: the faces shrunk and by which test, the scale, and the visible faces' texel density with
+        # the same pack run without the shrink and with it
+        "hiddenFaces": hidden_report,
         # HOW THE LAYOUT USES THE TILE, read off the layer: fill, islands, and texel density (pixels per metre at
         # 1024, overall, and the spread between islands)
         "layout": _layout_report(mesh, active_name, obj.matrix_world.to_3x3()),
@@ -6308,10 +6893,7 @@ def op_clean_mesh(params):
                                    trianglesLeft=t1)
 
     if do_tri:
-        n_before = len([f for f in bm.faces if len(f.verts) > 3])
-        if n_before:
-            bmesh.ops.triangulate(bm, faces=bm.faces[:])
-        steps["triangulated"] = {"nonTriFacesConverted": n_before}
+        steps["triangulated"] = _triangulate_safely(bm)
 
     if do_normals:
         bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
@@ -6420,11 +7002,14 @@ _DELETE_ELEMENT_KINDS = {"VERTS": "VERTS", "EDGES": "EDGES", "FACES": "FACES", "
 
 
 def _parse_occluded(raw):
-    """occludedBy -> (meshes, reach, margin)."""
-    if not isinstance(raw, dict) or not raw.get("meshes") or set(raw) - {"meshes", "reach", "margin"}:
-        raise MifOpError("occludedBy is {meshes: [names], reach (m, default 0.1), margin (face rings kept, default 1)}, "
-                         "got %r. NOTHING was deleted." % (raw,))
-    names = raw["meshes"]
+    """occludedBy -> (meshes, reach, margin, self). self true tests each loose part against the object's OTHER parts."""
+    if not isinstance(raw, dict) or not (raw.get("meshes") or raw.get("self") is True) or set(raw) - {
+            "meshes", "reach", "margin", "self"}:
+        raise MifOpError("occludedBy is {meshes: [names] and/or self: true, reach (m, default 0.1), margin (face rings "
+                         "kept, default 1)}, got %r. NOTHING was deleted." % (raw,))
+    if raw.get("self") not in (None, True, False):
+        raise MifOpError("occludedBy.self is true or false, got %r. NOTHING was deleted." % (raw.get("self"),))
+    names = raw.get("meshes") or []
     if isinstance(names, str):
         names = [names]
     if not isinstance(names, (list, tuple)) or any(not isinstance(n, str) for n in names):
@@ -6436,14 +7021,130 @@ def _parse_occluded(raw):
         raise MifOpError("occludedBy.reach must be above 0, got %r. NOTHING was deleted." % reach)
     if isinstance(margin, bool) or not isinstance(margin, int) or not 0 <= margin <= 50:
         raise MifOpError("occludedBy.margin is 0-50 face rings, got %r. NOTHING was deleted." % (margin,))
-    return meshes, reach, margin
+    return meshes, reach, margin, raw.get("self") is True
 
 
-def _occluded_faces(obj, bm, meshes, reach, margin):
+def _bm_loose_parts(bm):
+    """A part number per face (faces joined through shared vertices), and the count."""
+    part = [-1] * len(bm.faces)
+    n = 0
+    for f0 in bm.faces:
+        if part[f0.index] >= 0:
+            continue
+        part[f0.index] = n
+        stack = [f0]
+        while stack:
+            f = stack.pop()
+            for v in f.verts:
+                for g in v.link_faces:
+                    if part[g.index] < 0:
+                        part[g.index] = n
+                        stack.append(g)
+        n += 1
+    return part, n
+
+
+def _part_trees(obj, bm, part, n):
+    """One world-space BVH per loose part of obj's bmesh (index = part number)."""
+    from mathutils.bvhtree import BVHTree                     # noqa: PLC0415
+    mw = obj.matrix_world
+    world = [mw @ v.co for v in bm.verts]
+    polys = [[] for _ in range(n)]
+    for f in bm.faces:
+        polys[part[f.index]].append([v.index for v in f.verts])
+    trees = []
+    for p in polys:
+        used = sorted({i for poly in p for i in poly})
+        remap = {old: new for new, old in enumerate(used)}
+        trees.append(BVHTree.FromPolygons([world[i] for i in used], [[remap[i] for i in poly] for poly in p]))
+    return trees
+
+
+def _parse_inside(raw):
+    """insideOf -> (meshes, self)."""
+    if not isinstance(raw, dict) or not (raw.get("meshes") or raw.get("self") is True) or set(raw) - {"meshes", "self"}:
+        raise MifOpError("insideOf is {meshes: [names] and/or self: true}, got %r. NOTHING was deleted." % (raw,))
+    names = raw.get("meshes") or []
+    if isinstance(names, str):
+        names = [names]
+    if not isinstance(names, (list, tuple)) or any(not isinstance(x, str) for x in names):
+        raise MifOpError("insideOf.meshes is a list of object names, got %r. NOTHING was deleted." % (names,))
+    return [get_object(x, want_mesh=True) for x in names], raw.get("self") is True
+
+
+def _inside_faces(obj, bm, meshes, use_self):
+    """(faces to delete, report): a face goes when its centre and every vertex lie inside a CLOSED shell - a loose part of
+    another named mesh, or (self) another closed loose part of this one - by ray parity, the test mesh_stats islands
+    runs for its insideOf."""
+    import numpy as np                                       # noqa: PLC0415
+    mw = obj.matrix_world
+    shells = []                                              # (owner label, (T,3,3) world triangles, lo, hi, part)
+    part, n = _bm_loose_parts(bm)
+
+    def closed_tris(src_bm, xform, label, part_of=None, k=None):
+        rows = {}
+        for f in src_bm.faces:
+            key = part_of[f.index] if part_of is not None else 0
+            vs = [xform @ v.co for v in f.verts]
+            for i in range(1, len(vs) - 1):
+                rows.setdefault(key, []).append([tuple(vs[0]), tuple(vs[i]), tuple(vs[i + 1])])
+        edges_ok = {}
+        for e in src_bm.edges:
+            if not e.link_faces:
+                continue
+            key = part_of[e.link_faces[0].index] if part_of is not None else 0
+            edges_ok[key] = edges_ok.get(key, True) and len(e.link_faces) == 2
+        for key, tris in rows.items():
+            if edges_ok.get(key):
+                t = np.array(tris, dtype=np.float64)
+                shells.append((label if part_of is None else "%s part %d" % (label, key), t,
+                               t.reshape(-1, 3).min(axis=0), t.reshape(-1, 3).max(axis=0), key if part_of is not None
+                               else None))
+    for m in meshes:
+        wb = bmesh.new()
+        ev = m.evaluated_get(bpy.context.evaluated_depsgraph_get())
+        me = ev.to_mesh()
+        try:
+            wb.from_mesh(me)
+        finally:
+            ev.to_mesh_clear()
+        mpart, mn = _bm_loose_parts(wb)
+        closed_tris(wb, m.matrix_world, m.name, mpart, mn)
+        wb.free()
+    own_from = len(shells)
+    if use_self:
+        closed_tris(bm, mw, obj.name, part, n)
+    if not shells:
+        raise MifOpError("insideOf found no CLOSED shell to test against (every edge on two faces) among %s. NOTHING was "
+                         "deleted." % ([m.name for m in meshes] + ([obj.name + " (self)"] if use_self else [])))
+    gone, by_shell = [], {}
+    for f in bm.faces:
+        pts = [mw @ f.calc_center_median()] + [mw @ v.co for v in f.verts]
+        arr = np.array([tuple(p) for p in pts])
+        lo, hi = arr.min(axis=0), arr.max(axis=0)
+        for si, (label, tris, slo, shi, key) in enumerate(shells):
+            if si >= own_from and key == part[f.index]:
+                continue                                     # a part is never inside itself
+            if (lo < slo).any() or (hi > shi).any():
+                continue
+            if all(_ray_parity(p, tris) % 2 == 1 for p in arr):
+                gone.append(f)
+                by_shell[label] = by_shell.get(label, 0) + 1
+                break
+    return gone, {"shells": len(shells), "facesInside": len(gone), "byShell": by_shell,
+                  "meshes": [m.name for m in meshes], "self": use_self, "looseParts": n}
+
+
+def _occluded_faces(obj, bm, meshes, reach, margin, use_self=False):
     """(faces to delete, report) - a face is covered when rays along its normal, from its centre and from each of its
-    vertices, all meet one of `meshes` within reach; `margin` rings of covered faces next to an uncovered one are kept."""
+    vertices, all meet one of `meshes` within reach; `margin` rings of covered faces next to an uncovered one are kept.
+    use_self (2026-11-25): the object's own loose parts are occluders too, each face tested against the parts it is NOT
+    in - plate backs inside cores and joint ends inside limbs of a mesh already joined (found 2026-11-18: 42 % of a
+    joined low's triangles hidden, and the call only took other objects)."""
     from mathutils.bvhtree import BVHTree
     trees = []
+    part, n_parts = _bm_loose_parts(bm) if use_self else (None, 0)
+    own = _part_trees(obj, bm, part, n_parts) if use_self else []
     for m in meshes:
         wb = bmesh.new()
         ev = m.evaluated_get(bpy.context.evaluated_depsgraph_get())
@@ -6463,7 +7164,8 @@ def _occluded_faces(obj, bm, meshes, reach, margin):
         if n.length < 0.5:
             continue
         pts = [mw @ f.calc_center_median()] + [mw @ v.co for v in f.verts]
-        if all(any(t.ray_cast(p + n * 1e-5, n, reach)[0] is not None for t in trees) for p in pts):
+        against = trees + ([t for k, t in enumerate(own) if k != part[f.index]] if use_self else [])
+        if against and all(any(t.ray_cast(p + n * 1e-5, n, reach)[0] is not None for t in against) for p in pts):
             covered.add(f.index)
     kept_ring = set()
     edge = {f.index for f in bm.faces if f.index in covered
@@ -6480,7 +7182,8 @@ def _occluded_faces(obj, bm, meshes, reach, margin):
         frontier = nxt
     gone = sorted(covered - kept_ring)
     return [bm.faces[i] for i in gone], {"facesCovered": len(covered), "facesKeptByMargin": len(covered & kept_ring),
-                                         "occluders": [m.name for m in meshes], "reach": reach, "margin": margin}
+                                         "occluders": [m.name for m in meshes], "reach": reach, "margin": margin,
+                                         "self": use_self, "looseParts": n_parts if use_self else None}
 
 
 def _parse_disagree(raw):
@@ -6545,7 +7248,14 @@ def op_delete_mesh_elements(params):
     under other meshes - a body under its outfit, the robust fix for skin poking through. A face is covered when a ray
     along its normal from its centre and from each of its vertices meets one of the meshes within reach (the object as
     its base mesh under its transform, the meshes as they evaluate: compare them in the same pose); `margin` rings of
-    covered faces beside an uncovered one are kept, so the cut sits under the cloth, not at its edge.
+    covered faces beside an uncovered one are kept, so the cut sits under the cloth, not at its edge. self true
+    (2026-11-25) adds the object's OWN loose parts as occluders, each face against the parts it is not in, for a mesh
+    already joined.
+
+    INSIDE (2026-11-25): insideOf {meshes and/or self} deletes every face whose centre and vertices all lie inside a
+    CLOSED shell - a loose part of a named mesh, or another closed part of this one - by ray parity (mesh_stats islands'
+    test). Found 2026-11-18: the normal-cast occludedBy took visible faces facing a near neighbour and missed faces
+    sunk deeper than its reach; a build tested inside-ness itself and deleted by index.
 
     DISAGREEING (2026-10-05): disagreeWith {reference, maxDistance (default 0.01 m), minDot (default 0.3)} deletes every
     face whose centre is farther than maxDistance from the reference surface, or whose normal's dot with the
@@ -6557,24 +7267,30 @@ def op_delete_mesh_elements(params):
     Delete > Only Faces). Counts before and after are reported, and a selector that matches nothing is refused rather
     than answered with an ok that changed nothing.
     """
-    reject_unknown(params, ("object", "name", "elements", "indices", "vertexGroup", "minWeight", "looseIslandsUnder",
-                            "occludedBy", "disagreeWith"), "delete_mesh_elements")
+    reject_unknown(params, ("object", "name", "elements", "indices", "faces", "vertexGroup", "minWeight",
+                            "looseIslandsUnder", "occludedBy", "disagreeWith", "insideOf"), "delete_mesh_elements")
     obj = get_object(take(params, "object", "name", required=True, kind=str), want_mesh=True)
     require_editable(obj, "delete elements of")   # get_object(want_mesh=True) has refused a mesh in edit mode already
-    indices = params.get("indices")
+    # faces IS indices OF FACES, the spelling set_vertex_color and assign_material_to_faces use (found 2026-11-18).
+    indices = take(params, "indices", "faces")
+    if params.get("faces") is not None and str(params.get("elements") or "FACES").upper() not in ("FACES", "ONLY_FACES"):
+        raise MifOpError("faces lists face indices, so elements must be FACES or ONLY_FACES (got %r); for vertices or "
+                         "edges pass indices. NOTHING was deleted." % params.get("elements"))
     group = take(params, "vertexGroup", default=None, kind=str)
     islands_under = take_int(params, "looseIslandsUnder", default=None)
-    occ_raw, dis_raw = params.get("occludedBy"), params.get("disagreeWith")
+    occ_raw, dis_raw, ins_raw = params.get("occludedBy"), params.get("disagreeWith"), params.get("insideOf")
     chosen = [n for n, v in (("indices", indices), ("vertexGroup", group), ("looseIslandsUnder", islands_under),
-                             ("occludedBy", occ_raw), ("disagreeWith", dis_raw)) if v is not None]
+                             ("occludedBy", occ_raw), ("disagreeWith", dis_raw), ("insideOf", ins_raw)) if v is not None]
     if len(chosen) != 1:
-        raise MifOpError("pass exactly one of indices, vertexGroup, looseIslandsUnder, occludedBy or disagreeWith (got "
-                         "%s). Find indices with select_faces or vertex_info. NOTHING was deleted."
+        raise MifOpError("pass exactly one of indices, vertexGroup, looseIslandsUnder, occludedBy, disagreeWith or "
+                         "insideOf (got %s). Find indices with select_faces or vertex_info. NOTHING was deleted."
                          % (", ".join(chosen) or "none"))
     occ = _parse_occluded(occ_raw) if occ_raw is not None else None
     dis = _parse_disagree(dis_raw) if dis_raw is not None else None
-    if occ is not None and obj in occ[0] or dis is not None and dis[0] is obj:
-        raise MifOpError("the object is among the meshes it is measured against. NOTHING was deleted.")
+    ins = _parse_inside(ins_raw) if ins_raw is not None else None
+    if occ is not None and obj in occ[0] or dis is not None and dis[0] is obj or ins is not None and obj in ins[0]:
+        raise MifOpError("the object is among the meshes it is measured against (for its own parts, pass self: true). "
+                         "NOTHING was deleted.")
     if params.get("minWeight") is not None and group is None:
         raise MifOpError("minWeight goes with vertexGroup. NOTHING was deleted.")
     default_kind = "VERTS" if group is not None else "FACES"
@@ -6582,7 +7298,7 @@ def op_delete_mesh_elements(params):
     if kind not in _DELETE_ELEMENT_KINDS:
         raise MifOpError("elements must be one of %s (got %r). NOTHING was deleted."
                          % (", ".join(sorted(_DELETE_ELEMENT_KINDS)), kind))
-    if (occ is not None or dis is not None) and kind not in ("FACES", "ONLY_FACES"):
+    if (occ is not None or dis is not None or ins is not None) and kind not in ("FACES", "ONLY_FACES"):
         raise MifOpError("%s deletes FACES; elements must be FACES or ONLY_FACES. NOTHING was deleted." % chosen[0])
     if islands_under is not None:
         if islands_under < 2:
@@ -6612,6 +7328,8 @@ def op_delete_mesh_elements(params):
         elif dis is not None:
             bm.normal_update()
             geom, report = _disagreeing_faces(obj, bm, *dis)
+        elif ins is not None:
+            geom, report = _inside_faces(obj, bm, *ins)
         elif indices is not None:
             if not isinstance(indices, (list, tuple)) or not indices:
                 raise MifOpError("indices must be a non-empty list of whole numbers. NOTHING was deleted.")
@@ -8432,16 +9150,23 @@ def op_rename_object(params):
     convention like UCX_<name>_00. Those are reported so the caller can see what may need following.
 
     params:
-      object (str)                which object. Required.
-      to / newName / name (str)   the new name. Required.
+      object / name (str)         which object. Required. `name` is the OBJECT, as in every other op (it was the new
+                                  name here until 2026-11-25, and a caller who learned `name` elsewhere renamed the
+                                  wrong way round); {object, name} with no `to` is refused, naming `to`
+      to / newName (str)          the new name. Required.
       renameData (bool)           rename the object's DATA to match. Default true.
       allowCollision (bool)       let Blender resolve a clash its own way, and say which way:
                                   resolvedTo is the name this object got (4.2 and later),
                                   otherObjectRenamed the one the incumbent got (3.6). Default false.
     """
     reject_unknown(params, _RENAME_KEYS, "rename_object")
-    src = take(params, "object", required=True, kind=str)
-    wanted = take(params, "to", "newName", "name", required=True, kind=str)
+    if params.get("object") is not None and params.get("name") is not None and params.get("name") != params.get(
+            "object") and params.get("to") is None and params.get("newName") is None:
+        raise MifOpError("rename_object takes the new name as `to` (or `newName`); `name` is the object, as in every op, "
+                         "and %r and %r cannot both be it. Send {object: %r, to: %r}. NOTHING was changed."
+                         % (params["object"], params["name"], params["object"], params["name"]))
+    src = take(params, "object", "name", required=True, kind=str)
+    wanted = take(params, "to", "newName", required=True, kind=str)
     wanted = str(wanted)
     if not wanted.strip():
         raise MifOpError("the new name is empty. NOTHING was changed.")
@@ -9278,11 +10003,31 @@ def op_set_uv_layer(params):
       layer (str)           which layer. Required.
       active (bool)         make it the active layer
       rename (str)          a new name; Blender suffixes a clash rather than refusing
-      remove (bool)         delete it - excludes active and rename
+      remove (bool | str)   delete it - excludes active and rename. A layer NAME here is read as
+                            {layer: <name>, remove: true}, the shape a pipeline script sends (2026-11-26)
     """
     reject_unknown(params, _SETUV_KEYS, "set_uv_layer")
     obj = get_object(take(params, "object", "name", required=True, kind=str), want_mesh=True)
     mesh = obj.data
+    # remove: "<layer name>" (FOUND 2026-11-19): an art pipeline's drop-extra-UV step sent remove="Proj" and was
+    # answered only "'layer' is required". A string that is not a true/false word is the layer's NAME, read as layer
+    # <name> + remove true; one that disagrees with `layer` is refused naming both. Bool words keep their old reading.
+    raw_remove = params.get("remove")
+    by_name = False
+    if isinstance(raw_remove, str) and raw_remove.strip().lower() not in _TRUE_WORDS + _FALSE_WORDS:
+        if not raw_remove.strip():
+            raise MifOpError("remove is true (with layer naming the UV layer to remove) or the layer's name - got an "
+                             "empty string. Pass layer: <name>, remove: true. NOTHING was changed.")
+        given = params.get("layer")
+        if given is not None and given != raw_remove:
+            raise MifOpError("layer %r and remove %r name two different UV layers. To remove one pass layer: <name>, "
+                             "remove: true (or remove: <name> alone). NOTHING was changed." % (given, raw_remove))
+        params = dict(params, layer=raw_remove, remove=True)
+        by_name = True
+    if params.get("layer") is None:
+        raise MifOpError("'layer' is required - name the UV layer to change: set_uv_layer {layer: <name>, active: true "
+                         "| rename: <new name> | remove: true}; remove: <name> alone also removes that layer. NOTHING "
+                         "was changed.")
     want = take(params, "layer", required=True, kind=str)
 
     if not mesh.uv_layers:
@@ -9359,6 +10104,8 @@ def op_set_uv_layer(params):
         "removed": removed,
         "renamedTo": renamed_to,
         "nameWasSuffixed": bool(renamed_to and rename is not None and renamed_to != str(rename)),
+        # remove: <name> was read as layer: <name>, remove: true
+        "removeGivenAsName": by_name,
         # THE FIELD THAT MATTERS ON A REMOVE. Named layers whose INDEX moved, because an engine
         # importing this mesh reads a lightmap coordinate INDEX and will now read a different layer.
         "indicesShifted": moved or None,
@@ -10653,6 +11400,12 @@ def _game_ready_verdict(obj, checks, spec, profile=None):
             {"when": "flat detail can go", "call": "dissolve_mesh_elements", "args": {"object": name, "mode": "LIMITED", "angle": 0.1}},
             {"when": "they have a use: ask again with gameReady allowWaste true", "call": "mesh_quality",
              "args": {"object": name, "gameReady": {"allowWaste": True}}}]
+        if waste["hiddenTris"] >= _GR_WASTE_HIDDEN_TRIS:
+            # THE HIDDEN SHARE POINTS AT THE CALL THAT REMOVES IT (2026-11-25): parts joined into one mesh hide faces in
+            # each other, and delete_mesh_elements takes them out part against part.
+            reasons[-1]["choices"].insert(1, {"when": "the hidden faces are buried in the mesh's own parts",
+                                              "call": "delete_mesh_elements",
+                                              "args": {"object": name, "insideOf": {"self": True}}})
     tangents = checks.get("tangents") or {}
     zero_t = tangents.get("nearZeroVertexInstances") or 0
     zero_all = zero_t
@@ -11069,6 +11822,14 @@ def op_mesh_quality(params):
             "count": len(inside_out), "parts": inside_out[:20],
             "note": "closed parts whose faces agree with each other and whose signed volume is negative - the whole "
                     "part faces in"}
+        # WHAT QUADRIFLOW'S OWN CHECK REFUSES and none of the rows above counts (2026-11-25): an edge both of whose ends
+        # sit within 1e-4 - a fine voxel remesh leaves them, and one is enough for a CANCELLED.
+        from .ops_topology import quadriflow_blockers   # noqa: PLC0415
+        qf = quadriflow_blockers(mesh)
+        checks["zeroLengthEdges"] = {
+            "count": qf["zeroLengthEdges"], "indices": qf["zeroEdgeIndices"][:50],
+            "note": "edges whose two ends are within 1e-4 on every axis (mesh space): QuadriFlow refuses the mesh for "
+                    "one (remesh_mesh collapses them first)"}
 
         # ---- UVs ------------------------------------------------------------------------
         want_layer = take(params, "uvLayer", default=None, kind=str)
@@ -11734,6 +12495,91 @@ def _hole_cycles(edges):
     return cycles, None
 
 
+def _chord_edges(face):
+    """The edges that already join two NON-adjacent corners of a face - a triangulation that cuts along one reuses it,
+    and that edge then holds three faces."""
+    vs = list(face.verts)
+    n = len(vs)
+    pos = {v: i for i, v in enumerate(vs)}
+    out = []
+    for v in vs:
+        for e in v.link_edges:
+            w = e.other_vert(v)
+            j = pos.get(w)
+            if j is not None and pos[v] < j and (j - pos[v]) % n not in (1, n - 1) and face not in e.link_faces:
+                out.append(e)
+    return out
+
+
+def _fan_avoiding(bm, face, chords):
+    """Triangulate face as a fan from a corner none of whose chords is an existing edge and whose triangles all face the
+    face's way (so the fan stays inside the outline). True when done; False leaves the face as it was."""
+    vs = list(face.verts)
+    n = len(vs)
+    bad = {frozenset(e.verts) for e in chords}
+    nrm = face.normal.copy()
+    for k in range(n):
+        ring = vs[k:] + vs[:k]
+        tris = [(ring[0], ring[i], ring[i + 1]) for i in range(1, n - 1)]
+        if any(frozenset((ring[0], ring[i])) in bad for i in range(2, n - 1)):
+            continue
+        if any((b.co - a.co).cross(c.co - a.co).dot(nrm) <= 1e-12 for a, b, c in tris):
+            continue
+        corner = {lp.vert: lp for lp in face.loops}
+        made = []
+        try:
+            for tri in tris:
+                f = bm.faces.new(tri, face)
+                for lp in f.loops:
+                    lp.copy_from(corner[lp.vert])
+                made.append(f)
+        except ValueError:
+            for f in made:
+                bm.faces.remove(f)
+            continue
+        bm.faces.remove(face)
+        return True
+    return False
+
+
+def _triangulate_safely(bm):
+    """clean_mesh triangulate: every n-gon and quad to triangles (beauty), except where a cut would reuse an edge.
+
+    FOUND 2026-11-18 (a capped mesh after fillHolesUpTo): triangulate turned 26 edges non-manifold, and splitNonManifold
+    then opened 44 boundary edges. A cap whose corners are already joined by an edge elsewhere (a fold, a fin, a thin
+    wall) is cut along that edge, which then holds three faces. Measured on a hexagonal cap two of whose corners are
+    joined by a closed wedge above it: one non-manifold edge after. Such a face is fanned from a corner whose cuts are
+    all new (and stay inside its outline), or left as it is and named; nonManifoldEdges before and after are counted."""
+    def over_two():
+        return sum(1 for e in bm.edges if len(e.link_faces) > 2)
+    bm.faces.ensure_lookup_table()
+    bm.faces.index_update()
+    bm.normal_update()
+    nm0 = over_two()
+    ngons = [f for f in bm.faces if len(f.verts) > 3]
+    risky = {f: _chord_edges(f) for f in ngons}
+    risky = {f: c for f, c in risky.items() if c}
+    safe = [f for f in ngons if f not in risky]
+    rows, fanned, left = [], 0, []
+    for f, chords in risky.items():
+        row = {"face": f.index, "corners": len(f.verts), "edgesReused": [sorted(v.index for v in e.verts) for e in chords]}
+        if _fan_avoiding(bm, f, chords):
+            fanned += 1
+            row["by"] = "fan"
+        else:
+            left.append(row["face"])
+            row["by"] = "left as it is"
+        rows.append(row)
+    if safe:
+        bmesh.ops.triangulate(bm, faces=safe, quad_method="BEAUTY", ngon_method="BEAUTY")
+    out = {"nonTriFacesConverted": len(safe) + fanned, "nonManifoldEdgesBefore": nm0, "nonManifoldEdgesAfter": over_two(),
+           "facesWhoseCutReusesAnEdge": rows[:50] or None, "facesLeftUntriangulated": left[:50] or None}
+    if left:
+        out["note"] = ("%d face(s) could not be triangulated without reusing an edge that joins two of their corners, "
+                       "and were left as they are: triangulating them would make that edge non-manifold." % len(left))
+    return out
+
+
 def _fill_holes(bm, upto):
     """clean_mesh fillHolesUpTo: every hole of at most `upto` vertices filled ON ITS OWN, or named with the reason.
 
@@ -12264,7 +13110,75 @@ def op_fold_boundary_under(params):
 
 
 _UV_PACK_KEYS = ("object", "name", "uvLayer", "margin", "rotate", "equalizeByArea", "textureSize", "mergeOverlap",
-                 "targetTexelDensity", "unit", "region", "marginMethod")
+                 "targetTexelDensity", "unit", "region", "marginMethod", "marginPx", "stackIdentical",
+                 # a token of UV space for faces nobody sees, on a layout that is only packed (2026-11-26)
+                 "hiddenFaces")
+
+
+def _stack_identical(me, name, m3):
+    """Copy one loose part's UVs onto every loose part that is the same piece - the same faces corner by corner and the
+    same 3-D edge lengths in the same order (a duplicated keycap, a repeated bolt) - so a pack with merge_overlap lays
+    every copy on its original's islands. Compared part by part, never island by island, so the faces of one part are
+    never stacked on each other. ([copies per group], parts stacked, loose parts, the copies' loop indices). Mirrored copies
+    wind the other way and are left."""
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(me)
+        bm.faces.ensure_lookup_table()
+        uv = bm.loops.layers.uv[name]
+        part_of, parts = {}, []
+        for f in bm.faces:
+            if f.index in part_of:
+                continue
+            stack, members = [f], []
+            part_of[f.index] = len(parts)
+            while stack:
+                g = stack.pop()
+                members.append(g)
+                for v in g.verts:
+                    for h in v.link_faces:
+                        if h.index not in part_of:
+                            part_of[h.index] = len(parts)
+                            stack.append(h)
+            parts.append(sorted(members, key=lambda x: x.index))
+        sig = {}
+        for faces in parts:
+            loops = [lp for f in faces for lp in f.loops]
+            lens = tuple(round((m3 @ (lp.vert.co - lp.link_loop_next.vert.co)).length, 5) for lp in loops)
+            sig.setdefault((tuple(len(f.loops) for f in faces), lens), []).append(loops)
+        groups, stacked, copies = [], 0, []
+        for members in sig.values():
+            if len(members) < 2:
+                continue
+            first = members[0]
+            for other in members[1:]:
+                for x, y in zip(first, other):
+                    y[uv].uv = x[uv].uv.copy()
+                copies.append([y.index for y in other])
+                stacked += 1
+            groups.append(len(members))
+        bm.to_mesh(me)
+    finally:
+        bm.free()
+    me.update()
+    return sorted(groups, reverse=True), stacked, len(parts), copies
+
+
+def _zero_area_uv_faces(me, name):
+    """Faces whose UV area is under 1e-12 - a corner a tangent basis cannot be built at."""
+    layer = me.uv_layers.get(name)
+    flat = [0.0] * (2 * len(layer.data))
+    layer.data.foreach_get("uv", flat)
+    bad = 0
+    for poly in me.polygons:
+        acc = 0.0
+        st, ct = poly.loop_start, poly.loop_total
+        for k in range(ct):
+            a, b = st + k, st + (k + 1) % ct
+            acc += flat[2 * a] * flat[2 * b + 1] - flat[2 * b] * flat[2 * a + 1]
+        if abs(acc) * 0.5 < 1e-12:
+            bad += 1
+    return bad
 _MARGIN_METHODS = ("SCALED", "ADD", "FRACTION")
 # A LOW FILL IS SAID PLAINLY (FOUND 2026-11-09: 4,990 small plate islands packed to 20% of the tile). Measured on 5.0.1
 # with 5,000 flat rectangles: margin 0.02 SCALED (the default) filled 0.24% of the tile, 0.001 SCALED 24.5%, and the
@@ -12387,6 +13301,20 @@ def op_uv_pack(params):
     density instead of the largest that fits, and packs with scale off: islandsOutside01 counts what no longer fits.
     mergeOverlap keeps islands that already overlap stacked (repeated details on one tile). region [uMin, vMin, uMax,
     vMax] packs into that part of the tile instead (proportions kept; insideRegion says every UV landed in it).
+
+    HALF-EMPTY ATLASES (2026-11-25; FOUND 2026-11-18 on five builds - 54 identical keycaps each given its own place, a
+    5 px margin worked out by hand as 0.0025): marginPx (needs textureSize) is the margin in pixels of that texture,
+    packed as a FRACTION of the tile. stackIdentical copies one island's UVs onto every island that is the same piece
+    (same faces corner by corner, same 3-D edge lengths in order), loose part by loose part, and packs with merge_overlap,
+    so every copy shares its original's place; fill then counts each stacked place once, and the reply's stackIdentical
+    gives parts, groups, partsStacked and their UV area. zeroAreaUvFaces counts faces left with no UV area.
+    hiddenFaces (2026-11-26) is uv_unwrap's, on a layout that is only packed: the faces nobody sees - visibility (every
+    ray from the face hits the mesh or an occluder), volumes (facing into a named box) or downFacing (facing down within
+    baseBand of the lowest point: a platform's underside) - are shrunk about their own UV centres to uvScale across
+    (default 0.03) before the pack, so its scale gives what shows the tile. A test finding nothing is refused, and so is
+    targetTexelDensity beside it (a fixed-scale pack gives nothing back). The answer's hiddenFaces block names the faces
+    by test and measures the visible faces' texel density (px/m at 1024) with the same pack run without the shrink and
+    with it.
     """
     reject_unknown(params, _UV_PACK_KEYS, "uv_pack")
     from .ops_uv import _target_px_per_m, _texture_size, density_stats, texel_shape   # noqa: PLC0415
@@ -12395,6 +13323,30 @@ def op_uv_pack(params):
     layer_name = take(params, "uvLayer", default=None, kind=str)
     margin = take_float(params, "margin", default=0.02)
     margin_method = str(take(params, "marginMethod", default="SCALED", kind=str)).upper()
+    margin_px = take_float(params, "marginPx", default=None)
+    if margin_px is not None:
+        # A MARGIN IN PIXELS (FOUND 2026-11-18): margin is a 0-1 fraction whose meaning moves with marginMethod, so a
+        # build asked for "5 px at 2048" had to work out 0.0025 FRACTION itself. marginPx with textureSize is that.
+        if params.get("margin") is not None or params.get("marginMethod") is not None:
+            raise MifOpError("marginPx sets the margin in pixels of textureSize (as a FRACTION of the tile); drop margin "
+                             "and marginMethod, or marginPx. NOTHING was changed.")
+        if params.get("textureSize") is None:
+            raise MifOpError("marginPx needs textureSize - a pixel is a share of a texture's size. NOTHING was "
+                             "changed.")
+        if not (math.isfinite(margin_px) and margin_px >= 0):
+            raise MifOpError("marginPx is 0 or more pixels, got %r. NOTHING was changed." % margin_px)
+        if "margin_method" not in bpy.ops.uv.pack_islands.get_rna_type().properties.keys():
+            raise MifOpError("marginPx needs pack_islands' margin_method FRACTION, which this Blender lacks. NOTHING "
+                             "was changed.")
+        margin_method = "FRACTION"
+    stack = take_bool(params, "stackIdentical", default=False)
+    if stack:
+        if "merge_overlap" not in bpy.ops.uv.pack_islands.get_rna_type().properties.keys():
+            raise MifOpError("stackIdentical needs pack_islands' merge_overlap, which this Blender lacks. NOTHING was "
+                             "changed.")
+        if params.get("mergeOverlap") is False:
+            raise MifOpError("stackIdentical lays identical islands on one place, which the pack keeps only with "
+                             "mergeOverlap - drop mergeOverlap false. NOTHING was changed.")
     if margin_method not in _MARGIN_METHODS:
         raise MifOpError("marginMethod must be one of %s, got %r. NOTHING was changed."
                          % (", ".join(_MARGIN_METHODS), margin_method))
@@ -12405,6 +13357,8 @@ def op_uv_pack(params):
     if not 0.0 <= margin < 1.0:
         raise MifOpError("margin must be in [0, 1), got %r. NOTHING was changed." % margin)
     tex = _texture_size(params["textureSize"]) if params.get("textureSize") is not None else None
+    if margin_px is not None:
+        margin = margin_px / float(max(tex))
     # A REGION OF THE TILE (2026-10-06, 5.0's custom region, packed here on every build): region [uMin, vMin, uMax,
     # vMax]. A non-square region is packed the way a non-square texture is - V stretched by its width over its height,
     # packed, then placed - so the islands keep their proportions; rotation is refused there for the same reason.
@@ -12440,6 +13394,14 @@ def op_uv_pack(params):
         target = _target_px_per_m({"target": params["targetTexelDensity"], "unit": params.get("unit")})
     elif params.get("unit") is not None:
         raise MifOpError("unit is targetTexelDensity's; pass that too, or drop unit. NOTHING was changed.")
+    # HIDDEN FACES ON A PACK ALONE (FOUND 2026-11-19: a platform's underside took a quarter of its 1024 map; uv_unwrap had
+    # hiddenFaces, but a layout made by hand or by BOX could only be packed, not re-unwrapped). Checked here, before any
+    # write; the faces are found below once the mesh is known.
+    hidden_spec = _hidden_faces_spec(take(params, "hiddenFaces", default=None), "PACK", None, False)
+    if hidden_spec is not None and target is not None:
+        raise MifOpError("hiddenFaces shrinks the hidden faces so the pack's scale gives what shows their space, and "
+                         "targetTexelDensity packs at a fixed scale - every island keeps its size and nothing gains. "
+                         "Pass one. NOTHING was changed.")
     me = obj.data
     if not me.uv_layers:
         raise MifOpError("'%s' has no UV layer to pack - unwrap it first (uv_unwrap). NOTHING was changed." % obj.name)
@@ -12450,13 +13412,45 @@ def op_uv_pack(params):
     if not len(me.polygons):
         raise MifOpError("'%s' has no faces. NOTHING was changed." % obj.name)
     name = layer_name or (me.uv_layers.active or me.uv_layers[0]).name
+    hidden_set = hidden_report = None
+    if hidden_spec is not None:
+        hidden_set, hidden_report = _hidden_faces_found(obj, me, hidden_spec)
     m3 = obj.matrix_world.to_3x3()
+    original = array.array("f", [0.0]) * (2 * len(me.uv_layers[name].data))
+    me.uv_layers[name].data.foreach_get("uv", original)
+    stack_groups, stacked, n_parts, copies = [], 0, None, []
     rows_before = _measure_islands(me, name, m3)
     med, spread_before = _ratio_stats(rows_before)
     # THE OVERLAPS ARE READ BEFORE AND AFTER (FOUND 2026-11-16: a rotating pack was reported to turn 0 overlapping
     # island pairs into 13). A pack that leaves more pairs sharing UV area than it found is packed again without
     # rotation, and refused - the layer put back - when that rises too.
     ov_before = _layer_overlaps(me, name)
+    if stack:
+        # STACKED AFTER THE FIRST OVERLAP READ, and each read after the pack sets every copy aside, each to a tile of its
+        # own: a stacked copy overlaps its original on purpose, and thousands of such pairs would swamp the read (2.5 min
+        # for 29 cubes) and hide a real one
+        stack_groups, stacked, n_parts, copies = _stack_identical(me, name, m3)
+        if stacked:
+            merge = True
+
+    def overlaps_now():
+        if not copies:
+            return _layer_overlaps(me, name)
+        lay = me.uv_layers[name]
+        cur = array.array("f", [0.0]) * (2 * len(lay.data))
+        lay.data.foreach_get("uv", cur)
+        aside = array.array("f", cur)
+        for j, loops in enumerate(copies):
+            for li in loops:
+                aside[2 * li] += 100.0 * (j + 1)
+        lay.data.foreach_set("uv", aside)
+        me.update()
+        try:
+            ov = _layer_overlaps(me, name)
+        finally:
+            me.uv_layers[name].data.foreach_set("uv", cur)
+            me.update()
+        return ov
     layer = me.uv_layers[name]
     saved = array.array("f", [0.0]) * (2 * len(layer.data))
     layer.data.foreach_get("uv", saved)
@@ -12523,12 +13517,26 @@ def op_uv_pack(params):
         # THE LAYER IS LOOKED UP AGAIN, never the `layer` held from before: a bmesh written back (equalize, the target
         # scale) can reallocate the UV data, and foreach_get through the stale reference crashed 5.0.1
         # (EXCEPTION_ACCESS_VIOLATION in ensure_layer_data_is_mutable, 2026-11-16, test_blender_texel_density)
+        if hidden_set:
+            # THE SAME PACK WITHOUT THE SHRINK FIRST, measured and put back, so the answer's before and after are one
+            # layout packed two ways (uv_unwrap's hiddenFaces does the same)
+            unshrunk = array.array("f", [0.0]) * (2 * len(me.uv_layers[name].data))
+            me.uv_layers[name].data.foreach_get("uv", unshrunk)
+            _run_pack_islands(obj, name, margin, pinned)
+            if region is not None:
+                place_in_region()
+            _d0, _s0 = _visible_density(me, name, obj.matrix_world, hidden_set)
+            hidden_report["visibleTexelDensityBefore"] = _d0
+            hidden_report["hiddenUvShareBefore"] = _s0
+            me.uv_layers[name].data.foreach_set("uv", unshrunk)
+            me.update()
+            _shrink_face_uvs(me, name, hidden_set, hidden_spec["uvScale"])
         prepack = array.array("f", [0.0]) * (2 * len(me.uv_layers[name].data))
         me.uv_layers[name].data.foreach_get("uv", prepack)
         _run_pack_islands(obj, name, margin, pinned)
         if region is not None:
             place_in_region()
-        ov_after = _layer_overlaps(me, name)
+        ov_after = overlaps_now()
         if overlapping(ov_after) > overlapping(ov_before) and rotate:
             first = ov_after
             me.uv_layers[name].data.foreach_set("uv", prepack)
@@ -12538,7 +13546,7 @@ def op_uv_pack(params):
             _run_pack_islands(obj, name, margin, pinned)
             if region is not None:
                 place_in_region()
-            ov_after = _layer_overlaps(me, name)
+            ov_after = overlaps_now()
             rotate_dropped = {"overlappingPairsWithRotate": overlapping(first)}
         if overlapping(ov_after) > overlapping(ov_before):
             raise MifOpError("the pack left %d island pair(s) sharing UV area where the layer had %d%s"
@@ -12551,7 +13559,7 @@ def op_uv_pack(params):
                 bpy.ops.object.mode_set(mode="OBJECT")
         except Exception:  # noqa: BLE001
             pass
-        me.uv_layers[name].data.foreach_set("uv", saved)
+        me.uv_layers[name].data.foreach_set("uv", original)
         me.update()
         raise MifOpError("uv_pack failed on '%s': %s: %s. The layer was put back as it was." % (obj.name,
                          type(exc).__name__, exc))
@@ -12583,8 +13591,36 @@ def op_uv_pack(params):
     if merge is not None:
         out["mergeOverlap"] = merge
     out["marginMethod"] = margin_method
+    if margin_px is not None:
+        out["marginPx"] = margin_px
+    stacked_area = 0.0
+    if stack:
+        bm_s = bmesh.new()
+        try:
+            bm_s.from_mesh(me)
+            uv_s = bm_s.loops.layers.uv[name]
+            seen, stacked_area = set(), 0.0
+            for f in bm_s.faces:
+                key = tuple((round(lp[uv_s].uv.x, 6), round(lp[uv_s].uv.y, 6)) for lp in f.loops)
+                key = tuple(sorted(key))
+                if key in seen:
+                    stacked_area += _face_uv_area(f, uv_s)
+                seen.add(key)
+        finally:
+            bm_s.free()
+        out["stackIdentical"] = {"parts": n_parts, "groups": len(stack_groups), "partsStacked": stacked,
+                                 "largestGroup": stack_groups[0] if stack_groups else 0,
+                                 "stackedUvArea": round(stacked_area, 6),
+                                 "note": None if stacked else "no two loose parts are the same piece - nothing stacked"}
+    out["zeroAreaUvFaces"] = _zero_area_uv_faces(me, name)
+    if hidden_report is not None:
+        _d1, _s1 = _visible_density(me, name, obj.matrix_world, hidden_set)
+        _d0 = hidden_report.get("visibleTexelDensityBefore")
+        hidden_report.update({"visibleTexelDensityAfter": _d1, "hiddenUvShareAfter": _s1, "texelDensityTexture": 1024,
+                              "densityGain": round(_d1 / _d0, 4) if _d0 and _d1 else None})
+        out["hiddenFaces"] = hidden_report
     tile = (region[2] - region[0]) * (region[3] - region[1]) if region is not None else 1.0
-    out["fill"] = round(out["uvAreaAfter"] / tile, 4) if tile > 0 else None
+    out["fill"] = round((out["uvAreaAfter"] - stacked_area) / tile, 4) if tile > 0 else None
     if target is None and out["fill"] is not None and out["fill"] < _LOW_FILL:
         out["fillNote"] = (
             "the islands cover %.0f%% of the %s. With %d islands a %s margin of %g spends most of it on gaps: margin "
@@ -13430,7 +14466,7 @@ def op_export_vertex_positions(params):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# THE BULK PREVIEWS of set_material_slots and transform_selection (ops_preview.py; docs/15 section 5).
+# THE BULK PREVIEWS of set_material_slots and transform_selection.
 # ---------------------------------------------------------------------------------------------------------------------
 def _plan_set_material_slots(request):
     resp = op_set_material_slots(dict(request, dryRun=True))     # every refusal, and writes nothing

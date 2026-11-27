@@ -618,8 +618,50 @@ def op_transfer_shape_keys(params):
 # --------------------------------------------------------------------------------------------- set_mesh_attribute
 
 _MA_KEYS = ("object", "action", "name", "newName", "domain", "dataType", "value", "values", "indices",
-            "fromVertexGroup", "sample")
-_MA_ACTIONS = ("CREATE", "WRITE", "RENAME", "CONVERT", "READ")
+            "fromVertexGroup", "sample", "file")
+# UPSERT and REMOVE (found 2026-11-18): WRITE refused a new attribute and CREATE an existing one, so idempotent code was a
+# two-try loop, and a re-run had no way to drop what the last run made.
+_MA_ACTIONS = ("CREATE", "WRITE", "UPSERT", "REMOVE", "RENAME", "CONVERT", "READ")
+
+
+def _ma_file(path, n, width, dtype, tail):
+    """(values, indices) out of a .npy (the values: n rows, or n x width) or a .npz ('values', optional 'indices') -
+    numpy arrays, checked for shape and finiteness. 350k FLOAT_COLOR values as JSON took minutes; a file is read in one
+    pass and written with foreach_set."""
+    import os                                                 # noqa: PLC0415
+    import numpy as np                                        # noqa: PLC0415 - Blender bundles numpy on every build
+    if not isinstance(path, str) or not path.strip():
+        raise MifOpError("file is a path to a .npy or .npz of values. %s" % tail)
+    path = bpy.path.abspath(path)
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in (".npy", ".npz") or not os.path.isfile(path):
+        raise MifOpError("file must be an existing .npy or .npz, got %r. %s" % (path, tail))
+    try:
+        if ext == ".npy":
+            vals, idx = np.load(path, allow_pickle=False), None
+        else:
+            with np.load(path, allow_pickle=False) as z:
+                if "values" not in z.files:
+                    raise MifOpError("file %s has no 'values' array (it has %s). %s" % (path, ", ".join(z.files), tail))
+                vals = z["values"]
+                idx = z["indices"] if "indices" in z.files else None
+    except (OSError, ValueError) as exc:
+        raise MifOpError("file %s could not be read: %s. %s" % (path, str(exc)[:160], tail))
+    rows = vals.shape[0] if vals.ndim else 0
+    if vals.ndim not in (1, 2) or (width == 1 and vals.ndim == 2 and vals.shape[1] != 1) or (
+            width > 1 and (vals.ndim != 2 or vals.shape[1] != width)):
+        raise MifOpError("file %s holds an array of shape %s; a %s attribute takes %s. %s"
+                         % (path, list(vals.shape), dtype, "(n,)" if width == 1 else "(n, %d)" % width, tail))
+    if vals.dtype.kind == "f" and not np.isfinite(vals).all():
+        raise MifOpError("file %s holds NaN or infinite values. %s" % (path, tail))
+    if idx is not None:
+        idx = np.asarray(idx).reshape(-1)
+        if idx.dtype.kind not in "iu" or len(idx) != rows or (len(idx) and (idx.min() < 0 or idx.max() >= n)):
+            raise MifOpError("file %s: indices must be %d whole numbers in 0-%d. %s" % (path, rows, n - 1, tail))
+    elif rows != n:
+        raise MifOpError("file %s holds %d values and the domain %d elements - give one per element, or an 'indices' "
+                         "array in a .npz. %s" % (path, rows, n, tail))
+    return vals.reshape(rows, -1), idx
 _DOMAINS = ("POINT", "EDGE", "FACE", "CORNER")
 _WIDTH = {"FLOAT": 1, "INT": 1, "BOOLEAN": 1, "INT8": 1, "FLOAT_VECTOR": 3, "FLOAT2": 2, "FLOAT_COLOR": 4,
           "BYTE_COLOR": 4, "QUATERNION": 4, "INT32_2D": 2, "INT16_2D": 2}
@@ -678,7 +720,8 @@ def op_set_mesh_attribute(params):
 
     params:
       object (str)            a mesh in object mode
-      action (str)            CREATE | WRITE | RENAME | CONVERT | READ
+      action (str)            CREATE | WRITE | UPSERT (create it, or write it when it exists) | REMOVE | RENAME |
+                              CONVERT | READ
       name (str)              the attribute
       domain (str)            POINT | EDGE | FACE | CORNER (CREATE; CONVERT's new domain)
       dataType (str)          FLOAT | INT | BOOLEAN | INT8 | FLOAT_VECTOR | FLOAT2 | FLOAT_COLOR | BYTE_COLOR |
@@ -686,6 +729,8 @@ def op_set_mesh_attribute(params):
       value                   CREATE / WRITE: one value for every element
       values (list)           CREATE / WRITE: one value per element, or per index with indices
       indices (list)          WRITE: the elements written
+      file (str)              CREATE / WRITE / UPSERT: a .npy of the values (n, or n x width) or a .npz with 'values'
+                              and optional 'indices' - for hundreds of thousands of values, read in one pass
       fromVertexGroup (str)   CREATE / WRITE on a FLOAT POINT attribute: the group's weights (0 where unweighted)
       newName (str)           RENAME
       sample (int)            elements read back (default 8)
@@ -700,6 +745,29 @@ def op_set_mesh_attribute(params):
     name = take(params, "name", required=True, kind=str)
     sample = take_int(params, "sample", default=8)
     at = mesh.attributes.get(name)
+    upsert = action == "UPSERT"
+    if upsert:
+        action = "CREATE" if at is None else "WRITE"
+        if at is not None:
+            asked = [(k, str(params[k]).upper(), want) for k, want in (("domain", at.domain), ("dataType", at.data_type))
+                     if params.get(k) is not None and str(params[k]).upper() != want]
+            if asked:
+                raise MifOpError("UPSERT found '%s' already there as %s %s, and %s - CONVERT changes an attribute's "
+                                 "domain or type. %s" % (name, at.domain, at.data_type, ", ".join(
+                                     "%s %s was asked" % (k, v) for k, v, _w in asked), tail))
+    if action == "REMOVE":
+        if at is None:
+            raise MifOpError("'%s' has no attribute '%s' to remove. %s" % (obj.name, name, tail))
+        if name == "position" or name.startswith(".") or getattr(at, "is_required", False) or getattr(
+                at, "is_internal", False):
+            raise MifOpError("'%s' is Blender's own attribute and is not removed. %s" % (name, tail))
+        require_editable(obj, "changed")
+        was = {"name": at.name, "domain": at.domain, "dataType": at.data_type, "elements": len(at.data)}
+        mesh.attributes.remove(at)
+        mesh.update()
+        if mesh.attributes.get(name) is not None:
+            raise MifOpError("Blender kept '%s' after attributes.remove - it is one this build will not drop." % name)
+        return {"object": obj.name, "action": "REMOVE", "removed": was}
     if action != "CREATE" and at is None:
         raise MifOpError("'%s' has no attribute '%s'. It has: %s. %s"
                          % (obj.name, name, ", ".join(a.name for a in mesh.attributes if not a.name.startswith("."))
@@ -754,11 +822,19 @@ def op_set_mesh_attribute(params):
     n = _domain_len(mesh, domain)
     plan = None
     vg = take(params, "fromVertexGroup", default=None, kind=str)
-    given = [k for k in ("value", "values", "fromVertexGroup") if params.get(k) is not None]
+    given = [k for k in ("value", "values", "fromVertexGroup", "file") if params.get(k) is not None]
     if len(given) > 1:
-        raise MifOpError("give one of value, values or fromVertexGroup. %s" % tail)
+        raise MifOpError("give one of value, values, fromVertexGroup or file. %s" % tail)
     if action == "WRITE" and not given:
-        raise MifOpError("WRITE needs value, values or fromVertexGroup. %s" % tail)
+        raise MifOpError("WRITE needs value, values, fromVertexGroup or file. %s" % tail)
+    from_file = None
+    if params.get("file") is not None:
+        if params.get("indices") is not None:
+            raise MifOpError("indices go inside the .npz with file (an 'indices' array). %s" % tail)
+        width = _WIDTH.get(dtype)
+        if width is None:
+            raise MifOpError("writing %s values is not supported here (STRING, FLOAT4X4). %s" % (dtype, tail))
+        from_file = _ma_file(params["file"], n, width, dtype, tail)
     idx = params.get("indices")
     if idx is not None and (params.get("values") is None):
         raise MifOpError("indices go with values (one value per index). %s" % tail)
@@ -788,11 +864,33 @@ def op_set_mesh_attribute(params):
     if action == "CREATE":
         at = mesh.attributes.new(name, dtype, domain)
     field = _ATTR_FIELD.get(dtype, "value")
+    written = len(plan or [])
+    if from_file is not None:
+        vals, fidx = from_file
+        if dtype == "BOOLEAN":
+            vals = vals.astype(bool)
+        elif dtype.startswith("INT"):
+            if vals.dtype.kind == "f" and (vals != vals.round()).any():
+                if action == "CREATE":
+                    mesh.attributes.remove(at)
+                raise MifOpError("file holds fractional values for a %s attribute. %s" % (dtype, tail))
+            vals = vals.astype("int64")
+        else:
+            vals = vals.astype("float64")
+        if fidx is None:
+            at.data.foreach_set(field, vals.reshape(-1).tolist())
+        else:
+            for i, row in zip(fidx.tolist(), vals.tolist()):
+                setattr(at.data[i], field, row[0] if len(row) == 1 else row)
+        written = len(vals)
     for i, v in plan or []:
         setattr(at.data[i], field, v)
     mesh.update()
     at = mesh.attributes[name]
-    return {"object": obj.name, "action": action, "written": len(plan or []), "attribute": _attr_read(at, sample)}
+    out = {"object": obj.name, "action": action, "written": written, "attribute": _attr_read(at, sample)}
+    if upsert:
+        out.update(action="UPSERT", did="created" if action == "CREATE" else "wrote")
+    return out
 
 
 # --------------------------------------------------------------------------------------------- add_hook

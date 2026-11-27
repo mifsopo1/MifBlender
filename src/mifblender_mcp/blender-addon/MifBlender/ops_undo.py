@@ -54,7 +54,10 @@ EXTERNAL_EFFECTS = frozenset({"export_mesh", "export_scene", "save_file", "rende
                               "bake_texture", "gen_image", "gen_texture", "gen_mesh", "gen_asset", "mixdown_audio",
                               "extract_audio"})
 
-_STATE = {"based": False, "journal": [], "cursor": 0, "skipped": None, "writes": 0, "dropped": 0}
+_STATE = {"based": False, "journal": [], "cursor": 0, "skipped": None, "writes": 0, "dropped": 0, "unrecorded": 0}
+# "unrecorded" counts the calls that changed the scene with no undo step holding them (recording off, a push skipped
+# outside OBJECT mode, a push that raised) since the add-on loaded. reset() leaves it alone on purpose: a caller compares
+# it before and after one call (mif_workflow), and a count that a file load zeroed would read as fewer, not as none.
 
 
 def bridge_writes():
@@ -100,7 +103,7 @@ def _fluid_domains(limit=3):
 # after each of the three keys, stepped to frame 30, evaluates to the bare 8-vertex cube on 4.2.17, 4.4.0, 5.0.1 and
 # 5.2.1 and steps in 0.45-0.55 s; without the pushes after the keys, 24,994-25,236 vertices of liquid in 1.6-1.8 s. The
 # flow moved three times with a push after each does the same; keys on an unrelated object, keys on the domain, and a
-# single key with a single push do not. On 3.6.23 the setup grows no surface to count (docs/22 B69), and stepping
+# single key with a single push do not. On 3.6.23 the setup grows no surface to count, and stepping
 # halved the same way (0.59 s to 0.29 s). A depsgraph update before each push did not prevent it; rewriting a fluid
 # setting afterwards recovered it on 4.2+ but not 3.6 and would restart any simulation stepped one call at a time. Through
 # the bridge (bisect_undo_mantaflow.py) the steps after set_keyframe were the ones that mattered. So while the file holds
@@ -218,12 +221,15 @@ def after_write(endpoint, label=None, result=None, refused=False):
     _STATE["writes"] += 1
     on, why = recording()
     if not on:
+        _STATE["unrecorded"] += 1
         return False, why
     try:
         if _push("MifBlender: %s" % (label or endpoint)):
             return True, None
+        _STATE["unrecorded"] += 1
         return False, _STATE["skipped"]
     except Exception as exc:                                                  # noqa: BLE001 - never breaks the op
+        _STATE["unrecorded"] += 1
         _STATE["skipped"] = "the undo step for %s could not be pushed: %s" % (endpoint, exc)
         return False, _STATE["skipped"]
 
@@ -348,6 +354,8 @@ def op_undo_history(params):
             # How many of the bridge's older steps Blender has let go of - it keeps undo_steps back.
             "olderStepsDropped": _STATE["dropped"],
             "lastSkipped": _STATE["skipped"],
+            # Calls since the add-on loaded that changed the scene with no undo step holding them: undo cannot reach them.
+            "unrecordedWrites": _STATE["unrecorded"],
             "note": ("the bridge's own steps. In an interactive Blender, edits made in the UI are undo steps too and are "
                      "not listed here - undo walks back through them in the order they happened.")}
 

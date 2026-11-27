@@ -2827,7 +2827,9 @@ def op_channel_pack_image(params):
     return out
 
 
-_IST_KEYS = {"image", "file", "normal", "tiling", "pixels", "uvs", "tile", "role", "baseColor"}
+_IST_KEYS = {"image", "file", "normal", "tiling", "pixels", "uvs", "tile", "role", "baseColor", "object", "uvLayer",
+             "mask"}
+_IST_MASK_MAX_TRIS = 2000000        # loop triangles rasterized for a UV-coverage mask; past it the call is refused
 _IST_CHANNELS = ("R", "G", "B", "A")
 _IST_MAX_PIXELS = 67108864          # 8192 x 8192: a 1 GB float read beyond that is refused rather than attempted
 
@@ -2883,10 +2885,83 @@ def _finding(check, measured, limit, source, bad, what):
             "verdict": "warn" if bad else "ok", "means": what}
 
 
-def _pbr_report(img, a, role, base, tail):
-    """The role's checks on pixels `a` (h, w, channels) as stored. `base`: a base color's pixels for the roughness copy
-    check, or None."""
+def _uv_cover_mask(obj_name, uv_name, w, h, tile, tail):
+    """(h, w) bool: the texels whose centres lie inside a UV triangle of the mesh, and the layer used.
+
+    THE BLACK OUTSIDE THE ISLANDS IS NOT THE ALBEDO (2026-11-25). On a 2048 base color with a UV fill of 0.59,
+    darkShare 0.20 was flagged - that 20 % was the background a bake leaves outside the islands. Rasterized here with
+    numpy, one bounding box per triangle; a triangle too small to hold a texel centre marks the texel under its centroid,
+    so a dense mesh is not under-counted."""
     import numpy as np                                               # noqa: PLC0415
+    obj = bpy.data.objects.get(str(obj_name))
+    if obj is None or obj.type != "MESH":
+        raise MifOpError("object '%s' is not a mesh in this file - the UV-coverage mask is read off a mesh's UVs. %s"
+                         % (obj_name, tail))
+    me = obj.data
+    if not me.uv_layers:
+        raise MifOpError("'%s' has no UV layer, so it covers nothing of the image. %s" % (obj.name, tail))
+    layer = me.uv_layers.get(str(uv_name)) if uv_name else (me.uv_layers.active or me.uv_layers[0])
+    if layer is None:
+        raise MifOpError("'%s' has no UV layer '%s' (it has %s). %s"
+                         % (obj.name, uv_name, ", ".join(u.name for u in me.uv_layers), tail))
+    me.calc_loop_triangles()
+    nt = len(me.loop_triangles)
+    if not nt:
+        raise MifOpError("'%s' has no faces, so it covers nothing of the image. %s" % (obj.name, tail))
+    if nt > _IST_MASK_MAX_TRIS:
+        raise MifOpError("'%s' has %d triangles; the coverage mask rasterizes at most %d - decimate a copy first. %s"
+                         % (obj.name, nt, _IST_MASK_MAX_TRIS, tail))
+    uv = np.empty(len(layer.data) * 2, dtype=np.float64)
+    layer.data.foreach_get("uv", uv)
+    uv = uv.reshape(-1, 2)
+    loops = np.empty(nt * 3, dtype=np.int64)
+    me.loop_triangles.foreach_get("loops", loops)
+    tri = uv[loops.reshape(nt, 3)]                                   # (T, 3, 2)
+    if tile is not None:
+        tri = tri - np.array([(tile - 1001) % 10, (tile - 1001) // 10], dtype=np.float64)
+    else:
+        # one triangle wraps by its own floor, so a UV layout offset by whole tiles still lands on the image
+        tri = tri - np.floor(tri.min(axis=1, keepdims=True))
+    px = tri * np.array([w, h], dtype=np.float64) - 0.5                # texel centres at integer coordinates
+    mask = np.zeros((h, w), dtype=bool)
+    lo = np.floor(px.min(axis=1)).astype(np.int64)
+    hi = np.ceil(px.max(axis=1)).astype(np.int64)
+    cen = px.mean(axis=1)
+    for t in range(nt):
+        x0, y0 = max(lo[t, 0], 0), max(lo[t, 1], 0)
+        x1, y1 = min(hi[t, 0], w - 1), min(hi[t, 1], h - 1)
+        if x1 < x0 or y1 < y0:
+            continue
+        (ax, ay), (bx, by), (cx, cy) = px[t]
+        d = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
+        cxi, cyi = int(round(cen[t, 0])), int(round(cen[t, 1]))
+        if 0 <= cxi < w and 0 <= cyi < h:
+            mask[cyi, cxi] = True
+        if abs(d) < 1e-12:
+            continue
+        ys, xs = np.mgrid[y0:y1 + 1, x0:x1 + 1]
+        l1 = ((by - cy) * (xs - cx) + (cx - bx) * (ys - cy)) / d
+        l2 = ((cy - ay) * (xs - cx) + (ax - cx) * (ys - cy)) / d
+        inside = (l1 >= -1e-9) & (l2 >= -1e-9) & (l1 + l2 <= 1 + 1e-9)
+        mask[y0:y1 + 1, x0:x1 + 1] |= inside
+    return mask, layer.name
+
+
+def _pbr_report(img, a, role, base, tail, cover=None):
+    """The role's checks on pixels `a` (h, w, channels) as stored. `base`: a base color's pixels for the roughness copy
+    check, or None. `cover`: an (h, w) bool of the texels a mesh covers - every share and percentile is taken over
+    those, and the block means (broad brightness, the lighting gradient, the base-color copy) see the uncovered texels
+    filled with the covered mean, so the background a bake leaves outside the islands reads as neither dark nor bright."""
+    import numpy as np                                               # noqa: PLC0415
+    if cover is not None:
+        a = a.copy()
+        a[~cover] = a[cover].mean(axis=0)
+        if base is not None and base.shape[:2] == cover.shape:
+            base = base.copy()
+            base[~cover] = base[cover].mean(axis=0)
+        sel = lambda x: x[cover]                                     # noqa: E731
+    else:
+        sel = lambda x: x.ravel() if x.ndim == 2 else x.reshape(-1, x.shape[-1])  # noqa: E731
     nch = a.shape[2]
     rgb = a[:, :, :3] if nch >= 3 else np.repeat(a[:, :, :1], 3, axis=2)
     rgb = np.where(np.isfinite(rgb), rgb, 0.0)
@@ -2905,9 +2980,9 @@ def _pbr_report(img, a, role, base, tail):
                 img.colorspace_settings.name, ", float" if img.is_float else "")
         lum_lin = 0.2126 * lin[..., 0] + 0.7152 * lin[..., 1] + 0.0722 * lin[..., 2]
         lum_enc = _srgb_encode(lum_lin)
-        dark30 = float((lum_enc < 30 / 255.0).mean())
-        dark50 = float((lum_enc < 50 / 255.0).mean())
-        bright = float((enc.max(axis=2) > 240 / 255.0).mean())
+        dark30 = float((sel(lum_enc) < 30 / 255.0).mean())
+        dark50 = float((sel(lum_enc) < 50 / 255.0).mean())
+        bright = float((sel(enc.max(axis=2)) > 240 / 255.0).mean())
         findings.append(_finding("darkShare", dark30, "share under 30 sRGB above %g" % lim["darkShare"], _PBR_GUIDE,
                                  dark30 > lim["darkShare"], "pixels darker than any real non-metal albedo (coal, "
                                  "fresh asphalt sit near 30-50 sRGB); usually shading or AO baked into the color"))
@@ -2932,7 +3007,7 @@ def _pbr_report(img, a, role, base, tail):
                                  "mean: a light from one side brightens one side of the map"))
         out["notMeasured"] = "the shapes of cast shadows: only their broad brightness is read"
     elif role == "metallic":
-        v = rgb[..., 0]
+        v = sel(rgb[..., 0])
         between = float(((v > 0.1) & (v < 0.9)).mean())
         out["readAs"] = "the red channel as stored"
         findings.append(_finding("inBetweenShare", between, "share between 0.1 and 0.9 above %g" % lim["inBetweenShare"],
@@ -2942,12 +3017,12 @@ def _pbr_report(img, a, role, base, tail):
         out["metalShare"] = round(float((v >= 0.9).mean()), 4)
     elif role == "roughness":
         v = rgb[..., 0]
-        rng = float(np.percentile(v, 95) - np.percentile(v, 5))
+        rng = float(np.percentile(sel(v), 95) - np.percentile(sel(v), 5))
         out["readAs"] = "the red channel as stored"
         findings.append(_finding("range", rng, "under %g" % lim["roughnessRange"], _PBR_SCANNED,
                                  rng < lim["roughnessRange"], "5th to 95th percentile: a near-constant roughness "
                                  "reads as one plastic sheen - fine for a uniform material, rare in a scan"))
-        out["mean"] = round(float(v.mean()), 4)
+        out["mean"] = round(float(sel(v).mean()), 4)
         if base is not None:
             b = base[:, :, :3] if base.shape[2] >= 3 else np.repeat(base[:, :, :1], 3, axis=2)
             bl_lum = _blocks(0.2126 * b[..., 0] + 0.7152 * b[..., 1] + 0.0722 * b[..., 2], 64)
@@ -2961,7 +3036,7 @@ def _pbr_report(img, a, role, base, tail):
             else:
                 out["copiesBaseColorNote"] = "not measured: the base color or the roughness is flat at 64 x 64 blocks"
     elif role == "ao":
-        v = rgb[..., 0]
+        v = sel(rgb[..., 0])
         out["readAs"] = "the red channel as stored"
         out["mean"] = round(float(v.mean()), 4)
         white = float((v > 0.98).mean())
@@ -3009,6 +3084,12 @@ def op_image_stats(params):
       pixels [[x, y], ...]       sample values at pixel coordinates (0,0 bottom left, as Blender stores them)
       uvs [[u, v], ...]          sample values at UVs (nearest pixel; u, v wrap)
       tile (int)                 a UDIM tile number (default the image's first)
+      role (str)                 base_color | metallic | roughness | ao - the PBR plausibility check - or normal, the
+                                 same as normal: true (2026-11-25: the one map most worth checking had no role)
+      object + uvLayer (str)     measure over the texels the mesh's UVs cover (uvLayer default the active one): every
+                                 share, mean and check then ignores the background outside the islands; uvCoverage
+                                 reports the covered share
+      mask (str)                 or an image in the file whose red above 0.5 marks the covered texels (same size)
     Per channel: min, max, mean, stddev over finite values, NaN and Inf counts, the share at 0 and at 1; alpha
     coverage (share with alpha above 0.5); and constant when a channel holds one value.
     """
@@ -3024,8 +3105,22 @@ def op_image_stats(params):
         role = role.strip().lower().replace(" ", "_").replace("-", "_")
         role = {"basecolor": "base_color", "albedo": "base_color", "diffuse": "base_color", "metalness": "metallic",
                 "ambient_occlusion": "ao", "occlusion": "ao"}.get(role, role)
-        if role not in _PBR_ROLES:
-            raise MifOpError("role is one of %s, got %r. %s" % (", ".join(_PBR_ROLES), params.get("role"), tail))
+        role = {"normal_map": "normal", "normals": "normal", "tangent_normal": "normal"}.get(role, role)
+        if role not in _PBR_ROLES + ("normal",):
+            raise MifOpError("role is one of %s or normal, got %r. %s" % (", ".join(_PBR_ROLES), params.get("role"),
+                                                                         tail))
+    normal_check = take_bool(params, "normal", default=False)
+    if role == "normal":
+        if params.get("normal") is False:
+            raise MifOpError("role normal is the normal-map check and normal is false - pass one. %s" % tail)
+        normal_check, role = True, None
+    obj_ref = take(params, "object", kind=str)
+    uv_ref = take(params, "uvLayer", kind=str)
+    mask_ref = take(params, "mask", kind=str)
+    if obj_ref is not None and mask_ref is not None:
+        raise MifOpError("object (its UVs) and mask (an image) each say which texels are covered - pass one. %s" % tail)
+    if uv_ref is not None and obj_ref is None:
+        raise MifOpError("uvLayer names a layer of `object`; pass object too. %s" % tail)
     base_ref = take(params, "baseColor", kind=str)
     if base_ref is not None and role != "roughness":
         raise MifOpError("baseColor is what role roughness compares against; it goes with role roughness. %s" % tail)
@@ -3062,13 +3157,32 @@ def op_image_stats(params):
         img.pixels.foreach_get(a)
         a = a.reshape(h, w, nch)
         chans = _IST_CHANNELS[:nch] if nch != 1 else ("V",)
+        cover = None
+        cover_out = None
+        if obj_ref is not None:
+            cover, used_layer = _uv_cover_mask(obj_ref, uv_ref, w, h, tile, tail)
+            cover_out = {"object": obj_ref, "uvLayer": used_layer}
+        elif mask_ref is not None:
+            mk = _read_pixels_of(mask_ref, tail)
+            if mk.shape[:2] != (h, w):
+                raise MifOpError("mask '%s' is %dx%d and the image is %dx%d - they must match. %s"
+                                 % (mask_ref, mk.shape[1], mk.shape[0], w, h, tail))
+            cover = mk[:, :, 0] > 0.5
+            cover_out = {"mask": mask_ref}
+        if cover is not None:
+            covered = int(cover.sum())
+            if not covered:
+                raise MifOpError("the %s covers no texel of '%s' - a coverage of 0 would measure nothing. %s"
+                                 % ("UVs of '%s'" % obj_ref if obj_ref else "mask '%s'" % mask_ref, img.name, tail))
+            cover_out.update(coveredShare=round(covered / float(w * h), 6), texels=covered,
+                             note="every share, mean and check below is over the covered texels only")
         out = {"image": img.name, "size": [w, h], "channels": nch, "isFloat": bool(img.is_float),
                "colorspace": img.colorspace_settings.name, "source": img.source,
                "valuesNote": "as stored: an 8-bit sRGB texture reads its encoded values, a float image linear ones",
                "stats": {}}
-        n = w * h
+        n = w * h if cover is None else int(cover.sum())
         for i, c in enumerate(chans):
-            ch = a[:, :, i]
+            ch = a[:, :, i] if cover is None else a[:, :, i][cover]
             nan = int(np.isnan(ch).sum())
             inf = int(np.isinf(ch).sum())
             fin = ch[np.isfinite(ch)]
@@ -3082,19 +3196,23 @@ def op_image_stats(params):
         out["nanTotal"] = sum(r["nan"] for r in out["stats"].values())
         out["infTotal"] = sum(r["inf"] for r in out["stats"].values())
         if nch == 4:
-            al = a[:, :, 3]
+            al = a[:, :, 3] if cover is None else a[:, :, 3][cover]
             out["alphaCoverage"] = round(float((al > 0.5).sum()) / n, 6)
+        if cover_out is not None:
+            out["uvCoverage"] = cover_out
         warn = []
         if out["nanTotal"] or out["infTotal"]:
             warn.append("%d NaN and %d Inf values" % (out["nanTotal"], out["infTotal"]))
         rgb = [out["stats"][c] for c in chans[:3] if c in out["stats"]]
         if rgb and all(r.get("max", 1) <= 0.0 for r in rgb):
             warn.append("every color value is 0 - a black image")
-        if take_bool(params, "normal", default=False):
+        if normal_check:
             if nch < 3:
                 raise MifOpError("the normal check needs RGB; '%s' has %d channel(s). %s" % (img.name, nch, tail))
             v = a[:, :, :3] * 2.0 - 1.0
             fin = np.isfinite(v).all(axis=2)
+            if cover is not None:
+                fin &= cover
             v = v[fin]
             ln = np.sqrt((v * v).sum(axis=1)) if v.size else np.zeros(0)
             nb = {"blueUnderHalf": round(float((v[:, 2] < 0.0).sum()) / max(1, len(v)), 6) if v.size else None,
@@ -3151,7 +3269,7 @@ def op_image_stats(params):
             base = None
             if base_ref is not None:
                 base = _read_pixels_of(base_ref, tail)
-            out["pbr"] = _pbr_report(img, a, role, base, tail)
+            out["pbr"] = _pbr_report(img, a, role, base, tail, cover=cover)
             if out["pbr"]["warnings"]:
                 warn.append("PBR %s: %s" % (role, ", ".join(out["pbr"]["warnings"])))
         if warn:
@@ -3186,8 +3304,348 @@ def _read_pixels_of(ref, tail):
             bpy.data.images.remove(loaded)
 
 
+# ------------------------------------------------------------------------------------------------ compose_maps
+# LAYERED TEXTURING INSIDE THE TOOLSET (2026-11-26). A baked base color from a procedural material is flat at mid and
+# fine scale, so four builds of five took their surface richness from outside the toolset: AO^1.3 cavity, curvature
+# edge lightening and UV-space value noise composited onto the baked PNGs in numpy; ~30-node chains per material; masks
+# computed in numpy and written back. compose_maps does the compositing on the baked set itself: each layer is a MASK
+# (cavity from AO, edge from curvature, height from position, value noise in UV space, any image) and what it does
+# where the mask is - a blend into the base color, a roughness and a metallic it pulls toward - written to new files
+# under the bake's own names, and measured: the base color's luminance detail at three scales before and after.
+_CM_KEYS = {"object", "folder", "pattern", "maps", "layers", "outFolder", "overwrite", "seed"}
+_CM_MAPS = {"baseColor": "BC", "roughness": "R", "metallic": "M", "ao": "AO", "curvature": "Curv", "position": "Pos"}
+_CM_TYPES = ("cavity", "edge", "height", "noise", "image")
+_CM_BLENDS = ("multiply", "mix", "overlay", "screen", "add")
+_CM_LAYER_KEYS = {"type", "blend", "amount", "color", "roughness", "metallic", "scale", "octaves", "power", "levels",
+                  "invert", "image", "axis", "gain", "seed"}
+
+
+def _cm_read(path, tail):
+    import numpy as np                                               # noqa: PLC0415
+    full = os.path.abspath(bpy.path.abspath(path))
+    if not os.path.isfile(full):
+        raise MifOpError("no file '%s'. %s" % (full, tail))
+    try:
+        im = bpy.data.images.load(full, check_existing=False)
+    except RuntimeError as exc:
+        raise MifOpError("Blender could not read '%s' as an image (%s). %s" % (full, exc, tail))
+    try:
+        w, h, nch = int(im.size[0]), int(im.size[1]), int(im.channels) or 4
+        if not w or not h or w * h > _IST_MAX_PIXELS:
+            raise MifOpError("'%s' is %dx%d - empty, or over the size this reads. %s" % (full, w, h, tail))
+        a = np.empty(w * h * nch, dtype=np.float32)
+        im.pixels.foreach_get(a)
+        a = a.reshape(h, w, nch)
+        if nch < 3:
+            a = np.repeat(a[:, :, :1], 3, axis=2)
+        return a[:, :, :3].astype(np.float64), {"file": full, "isFloat": bool(im.is_float),
+                                                "colorspace": im.colorspace_settings.name}
+    finally:
+        bpy.data.images.remove(im)
+
+
+def _cm_fit(a, h, w):
+    """Nearest-texel resample of an (h0, w0, c) array to (h, w, c)."""
+    import numpy as np                                               # noqa: PLC0415
+    if a.shape[:2] == (h, w):
+        return a
+    ys = (np.arange(h) * a.shape[0] // h).clip(0, a.shape[0] - 1)
+    xs = (np.arange(w) * a.shape[1] // w).clip(0, a.shape[1] - 1)
+    return a[ys][:, xs]
+
+
+def _cm_noise(h, w, scale, octaves, seed):
+    """Tileable value noise in UV space, 0-1: `scale` cells across at the first octave, each octave twice as fine and
+    half as strong."""
+    import numpy as np                                               # noqa: PLC0415
+    rng = np.random.RandomState(int(seed) % (2 ** 31))
+    out = np.zeros((h, w))
+    amp, tot = 1.0, 0.0
+    for o in range(octaves):
+        n = max(1, int(round(scale * (2 ** o))))
+        grid = rng.rand(n, n)
+        fy = np.arange(h) * n / float(h)
+        fx = np.arange(w) * n / float(w)
+        y0, x0 = np.floor(fy).astype(int), np.floor(fx).astype(int)
+        ty, tx = fy - y0, fx - x0
+        ty, tx = ty * ty * (3 - 2 * ty), tx * tx * (3 - 2 * tx)
+        y1, x1 = (y0 + 1) % n, (x0 + 1) % n
+        y0, x0 = y0 % n, x0 % n
+        a = grid[y0][:, x0] * (1 - tx) + grid[y0][:, x1] * tx
+        b = grid[y1][:, x0] * (1 - tx) + grid[y1][:, x1] * tx
+        out += amp * (a * (1 - ty[:, None]) + b * ty[:, None])
+        tot += amp
+        amp *= 0.5
+    out /= tot
+    lo, hi = np.percentile(out, 2), np.percentile(out, 98)
+    return ((out - lo) / max(hi - lo, 1e-9)).clip(0.0, 1.0)
+
+
+def _cm_detail(lum):
+    """The luminance's detail at three scales: the stddev of the fine (under 4 texels), mid (4-32) and broad (32 and
+    over) bands, each the difference of two block-mean blurs."""
+    import numpy as np                                               # noqa: PLC0415
+
+    def blur(a, k):
+        h, w = a.shape
+        hh, ww = (h // k) * k, (w // k) * k
+        if hh == 0 or ww == 0:
+            return np.full_like(a, a.mean())
+        m = a[:hh, :ww].reshape(hh // k, k, ww // k, k).mean(axis=(1, 3))
+        up = np.repeat(np.repeat(m, k, axis=0), k, axis=1)
+        out = np.empty_like(a)
+        out[:hh, :ww] = up
+        out[hh:, :] = a[hh:, :].mean() if hh < h else 0
+        out[:, ww:] = a[:, ww:].mean() if ww < w else 0
+        return out
+    b4, b32 = blur(lum, 4), blur(lum, 32)
+    return {"fine": round(float((lum - b4).std()), 6), "mid": round(float((b4 - b32).std()), 6),
+            "broad": round(float((b32 - b32.mean()).std()), 6)}
+
+
+def _cm_layer_plan(raw, k, tail):
+    if not isinstance(raw, dict):
+        raise MifOpError("layers[%d] is {type, blend, amount, ...}, got %r. %s" % (k, raw, tail))
+    bad = sorted(set(raw) - _CM_LAYER_KEYS)
+    if bad:
+        raise MifOpError("layers[%d] has no %s - a layer's keys are %s. %s"
+                         % (k, ", ".join(bad), ", ".join(sorted(_CM_LAYER_KEYS)), tail))
+    t = str(raw.get("type", "")).lower()
+    if t not in _CM_TYPES:
+        raise MifOpError("layers[%d].type is one of %s, got %r. %s" % (k, ", ".join(_CM_TYPES), raw.get("type"), tail))
+    dflt_blend = {"cavity": "multiply", "edge": "screen", "height": "multiply", "noise": "overlay", "image": "mix"}[t]
+    blend = str(raw.get("blend", dflt_blend)).lower()
+    if blend not in _CM_BLENDS:
+        raise MifOpError("layers[%d].blend is one of %s, got %r. %s" % (k, ", ".join(_CM_BLENDS), raw.get("blend"), tail))
+
+    def unit(key, d, lo=0.0, hi=1.0):
+        v = raw.get(key, d)
+        if v is None:
+            return None
+        v = finite_floats([v], "layers[%d].%s" % (k, key))[0]
+        if not lo <= v <= hi:
+            raise MifOpError("layers[%d].%s runs %g to %g, got %g. %s" % (k, key, lo, hi, v, tail))
+        return v
+    col = raw.get("color")
+    if col is not None:
+        if not isinstance(col, (list, tuple)) or len(col) not in (3, 4):
+            raise MifOpError("layers[%d].color is [r, g, b] (linear 0-1), got %r. %s" % (k, col, tail))
+        col = finite_floats(list(col)[:3], "layers[%d].color" % k)
+    lv = raw.get("levels")
+    if lv is not None:
+        if not isinstance(lv, (list, tuple)) or len(lv) != 2:
+            raise MifOpError("layers[%d].levels is [low, high] - the mask's range stretched to 0-1, got %r. %s"
+                             % (k, lv, tail))
+        lv = finite_floats(list(lv), "layers[%d].levels" % k)
+        if not lv[0] < lv[1]:
+            raise MifOpError("layers[%d].levels low must be under high, got %r. %s" % (k, lv, tail))
+    axis = str(raw.get("axis", "z")).lower()
+    if axis not in ("x", "y", "z"):
+        raise MifOpError("layers[%d].axis is x, y or z, got %r. %s" % (k, raw.get("axis"), tail))
+    if t == "image" and not raw.get("image"):
+        raise MifOpError("layers[%d] type image needs image (a file whose red is the mask). %s" % (k, tail))
+    octaves = raw.get("octaves", 4)
+    if not isinstance(octaves, int) or isinstance(octaves, bool) or not 1 <= octaves <= 8:
+        raise MifOpError("layers[%d].octaves is 1-8, got %r. %s" % (k, octaves, tail))
+    return {"type": t, "blend": blend, "amount": unit("amount", 0.5), "color": col,
+            "roughness": unit("roughness", None), "metallic": unit("metallic", None),
+            "scale": unit("scale", 8.0, 0.5, 4096.0), "octaves": octaves, "power": unit("power", 1.3, 0.05, 20.0),
+            "gain": unit("gain", 8.0, 0.1, 1000.0), "levels": lv, "invert": bool(raw.get("invert", False)),
+            "image": raw.get("image"), "axis": axis, "seed": unit("seed", float(k), -1e6, 1e6)}
+
+
+def op_compose_maps(params):
+    """Composite masks and noise onto a baked texture set: base color, roughness and metallic, layer by layer.
+
+    params:
+      object + folder [+ pattern]  the bake: bake_texture_set's names (pattern default T_{object}_{suffix}) - BC, R, M,
+                                   AO, Curv, Pos - read where present
+      maps {baseColor, roughness, metallic, ao, curvature, position}  or the files by hand (overrides the names)
+      layers [{type, blend, amount, ...}], applied in order:
+        type   cavity (1 - AO^power, power 1.3) | edge (curvature over 0.5 x gain 8: the convex edges) | height (position's
+               axis z, 1 at the bottom, 0 at the top) | noise (UV-space value noise: scale cells across, octaves 4,
+               seed) | image (a file's red)
+        mask   levels [lo, hi] stretches it, invert flips it, amount (0.5) scales it
+        blend  how the base color takes it: multiply (by color, default a dark warm gray) | mix (toward color) |
+               overlay (the mask as light and dark, for noise) | screen (lighter toward color) | add
+        roughness, metallic   pulled toward that value where the mask is
+      outFolder (default <folder>/composed) - the files go there under the SAME names, so material_from_maps or
+      import_pbr_texture_set read them as they read the bake; overwrite (default false) to write over existing files
+    Answers each file written, the layers as resolved, and detail - the base color's luminance stddev in the fine
+    (under 4 texels), mid (4-32) and broad bands - before and after.
+    """
+    import numpy as np                                               # noqa: PLC0415
+    reject_unknown(params, _CM_KEYS, "compose_maps")
+    tail = "NOTHING was written."
+    obj_name = take(params, "object", kind=str)
+    folder = take(params, "folder", kind=str)
+    pattern = take(params, "pattern", default="T_{object}_{suffix}", kind=str)
+    maps_raw = params.get("maps") or {}
+    if not isinstance(maps_raw, dict) or set(maps_raw) - set(_CM_MAPS):
+        raise MifOpError("maps is {%s} - file paths; got %r. %s" % (", ".join(_CM_MAPS), maps_raw, tail))
+    paths = {}
+    if folder is not None:
+        if obj_name is None:
+            raise MifOpError("folder finds the bake's files by object name - pass object too. %s" % tail)
+        base = os.path.abspath(bpy.path.abspath(folder))
+        for key, suf in _CM_MAPS.items():
+            stem = pattern.replace("{object}", obj_name).replace("{suffix}", suf)
+            for ext in (".png", ".exr", ".tga", ".jpg", ".tif"):
+                f = os.path.join(base, stem + ext)
+                if os.path.isfile(f):
+                    paths[key] = f
+                    break
+    for key, val in maps_raw.items():
+        if not isinstance(val, str) or not val:
+            raise MifOpError("maps.%s is a file path, got %r. %s" % (key, val, tail))
+        paths[key] = os.path.abspath(bpy.path.abspath(val))
+    if "baseColor" not in paths:
+        raise MifOpError("no base color to compose onto: %s. Bake one (bake_texture_set types BASE_COLOR) or pass "
+                         "maps.baseColor. %s" % ("nothing named %s in %s" % (pattern.replace("{object}", str(obj_name))
+                                                 .replace("{suffix}", "BC"), folder) if folder else "no folder or maps",
+                                                 tail))
+    raw_layers = params.get("layers")
+    if not isinstance(raw_layers, list) or not raw_layers:
+        raise MifOpError("layers is a list of at least one {type, blend, amount, ...}. %s" % tail)
+    if len(raw_layers) > 32:
+        raise MifOpError("at most 32 layers, got %d. %s" % (len(raw_layers), tail))
+    layers = [_cm_layer_plan(r, k, tail) for k, r in enumerate(raw_layers)]
+    need = {"cavity": "ao", "edge": "curvature", "height": "position"}
+    for k, ly in enumerate(layers):
+        src = need.get(ly["type"])
+        if src and src not in paths:
+            raise MifOpError("layers[%d] type %s reads the %s map, and there is none: bake it (bake_texture_set types %s) "
+                             "or pass maps.%s. %s" % (k, ly["type"], src, {"ao": "AO", "curvature": "CURVATURE",
+                                                                         "position": "POSITION"}[src], src, tail))
+        if ly["type"] == "image" and not os.path.isfile(os.path.abspath(bpy.path.abspath(ly["image"]))):
+            raise MifOpError("layers[%d].image: no file '%s'. %s" % (k, ly["image"], tail))
+    out_folder = take(params, "outFolder", kind=str)
+    out_dir = os.path.abspath(bpy.path.abspath(out_folder)) if out_folder else \
+        os.path.join(os.path.dirname(paths["baseColor"]), "composed")
+    overwrite = take_bool(params, "overwrite", default=False)
+    writes = [k for k in ("baseColor", "roughness", "metallic") if k in paths
+              or (k != "baseColor" and any(ly[k] is not None for ly in layers))]
+    targets = {k: os.path.join(out_dir, os.path.splitext(os.path.basename(paths[k]))[0] + ".png") if k in paths else
+               os.path.join(out_dir, pattern.replace("{object}", str(obj_name or "Composed"))
+                            .replace("{suffix}", _CM_MAPS[k]) + ".png") for k in writes}
+    taken = [t for t in targets.values() if os.path.isfile(t)]
+    if taken and not overwrite:
+        raise MifOpError("%s already exist(s); pass overwrite true, or another outFolder. %s" % (", ".join(taken), tail))
+    if any(os.path.abspath(t) == os.path.abspath(paths.get(k, "")) for k, t in targets.items()) and not overwrite:
+        raise MifOpError("outFolder is the bake's own folder, which would write over the bake - pass overwrite true to "
+                         "mean it. %s" % tail)
+
+    bc, bc_info = _cm_read(paths["baseColor"], tail)
+    h, w = bc.shape[:2]
+    srgb_stored = (not bc_info["isFloat"]) and bc_info["colorspace"].lower() in ("srgb", "srgb - texture")
+    col = _srgb_decode(bc) if srgb_stored else bc.copy()
+    lum = lambda c: 0.2126 * c[..., 0] + 0.7152 * c[..., 1] + 0.0722 * c[..., 2]  # noqa: E731
+    # MEASURED OVER THE ISLANDS when the object is a mesh with UVs: the background outside them is filled with the
+    # covered mean, so a flat bake reads flat rather than as the edges of its islands
+    cover = None
+    ob = bpy.data.objects.get(obj_name) if obj_name else None
+    if ob is not None and ob.type == "MESH" and ob.data.uv_layers:
+        cover, _layer = _uv_cover_mask(ob.name, None, w, h, None, tail)
+        if not cover.any():
+            cover = None
+
+    def measured(c):
+        y = _srgb_encode(lum(c))
+        if cover is not None:
+            y = np.where(cover, y, y[cover].mean())
+        return _cm_detail(y)
+    before = measured(col)
+    rough = _cm_fit(_cm_read(paths["roughness"], tail)[0], h, w)[..., 0] if "roughness" in paths else np.full((h, w), 0.5)
+    metal = _cm_fit(_cm_read(paths["metallic"], tail)[0], h, w)[..., 0] if "metallic" in paths else np.zeros((h, w))
+    cache = {}
+
+    def src(key):
+        if key not in cache:
+            cache[key] = _cm_fit(_cm_read(paths[key], tail)[0], h, w)
+        return cache[key]
+    seed0 = take_float(params, "seed", default=0.0)
+    resolved = []
+    for k, ly in enumerate(layers):
+        t = ly["type"]
+        if t == "cavity":
+            # 1 - AO^power: with color black and amount 1, a multiply darkens by AO^power (AO^1.3, the builds' cavity)
+            m = 1.0 - src("ao")[..., 0].clip(0, 1) ** ly["power"]
+        elif t == "edge":
+            m = ((src("curvature")[..., 0] - 0.5) * ly["gain"]).clip(0, 1)
+        elif t == "height":
+            m = 1.0 - src("position")[..., "xyz".index(ly["axis"])].clip(0, 1)
+        elif t == "noise":
+            m = _cm_noise(h, w, ly["scale"], ly["octaves"], seed0 * 7919 + ly["seed"] * 104729 + 17)
+        else:
+            m = _cm_fit(_cm_read(ly["image"], tail)[0], h, w)[..., 0]
+        if ly["levels"] is not None:
+            lo, hi = ly["levels"]
+            m = ((m - lo) / (hi - lo)).clip(0, 1)
+        if ly["invert"]:
+            m = 1.0 - m
+        m = m.clip(0, 1)
+        a = ly["amount"]
+        mk = (m * a)[..., None]
+        blend = ly["blend"]
+        c = np.array(ly["color"] if ly["color"] is not None else
+                     {"multiply": [0.3, 0.27, 0.23], "screen": [1.0, 1.0, 1.0]}.get(blend, [0.5, 0.5, 0.5]))
+        if blend == "multiply":
+            col = col * (1.0 - mk * (1.0 - c))
+        elif blend == "mix":
+            col = col * (1.0 - mk) + c * mk
+        elif blend == "screen":
+            col = 1.0 - (1.0 - col) * (1.0 - mk * c)
+        elif blend == "add":
+            col = col + mk * c
+        else:                                                        # overlay: the mask is light and dark about 0.5
+            n = m[..., None]
+            ov = np.where(col < 0.5, 2.0 * col * n, 1.0 - 2.0 * (1.0 - col) * (1.0 - n))
+            col = col * (1.0 - a) + ov * a
+        col = col.clip(0.0, 1.0)
+        if ly["roughness"] is not None:
+            rough = rough * (1.0 - m * a) + ly["roughness"] * m * a
+        if ly["metallic"] is not None:
+            metal = metal * (1.0 - m * a) + ly["metallic"] * m * a
+        resolved.append({"type": t, "blend": blend, "amount": a, "maskMean": round(float(m.mean()), 4),
+                         "color": [round(float(x), 4) for x in c], "roughness": ly["roughness"],
+                         "metallic": ly["metallic"]})
+    after = measured(col)
+    os.makedirs(out_dir, exist_ok=True)
+    out_files = {}
+    for key in writes:
+        if key == "baseColor":
+            data, cs = (_srgb_encode(col) if srgb_stored else col), ("sRGB" if srgb_stored else "Non-Color")
+        else:
+            v = (rough if key == "roughness" else metal).clip(0, 1)
+            data, cs = np.repeat(v[..., None], 3, axis=2), "Non-Color"
+        rgba = np.ones((h, w, 4), dtype=np.float32)
+        rgba[..., :3] = data
+        name = "MifCompose_%s" % key
+        im = bpy.data.images.new(name, width=w, height=h, alpha=False)
+        try:
+            try:
+                im.colorspace_settings.name = cs
+            except TypeError:
+                pass
+            im.pixels.foreach_set(rgba.ravel())
+            path = os.path.abspath(targets[key])
+            im.filepath_raw = path
+            im.file_format = "PNG"
+            im.save()
+        finally:
+            bpy.data.images.remove(im)
+        out_files[key] = path
+    return {"ok": True, "object": obj_name, "read": paths, "written": out_files, "outFolder": out_dir,
+            "size": [w, h], "layers": resolved, "detail": {"before": before, "after": after,
+                                                          "over": "the object's UV islands" if cover is not None
+                                                          else "the whole image"},
+            "note": "the files keep the bake's names, so material_from_maps / import_pbr_texture_set read them as they "
+                    "read the bake; detail is the base color's luminance stddev per band (sRGB-encoded, 0-1)"}
+
+
 OPS = {
     "image_stats": op_image_stats,
+    "compose_maps": op_compose_maps,
     "channel_pack_image": op_channel_pack_image,
     "spray_text_art": op_spray_text_art,
     "project_image_decal": op_project_image_decal,

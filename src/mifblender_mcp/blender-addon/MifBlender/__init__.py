@@ -23,7 +23,7 @@ controls live in the 3D viewport N-panel under the "MifBridge" tab.
 bl_info = {
     "name": "MifBlender (MifBridge backend)",
     "author": "Mifsopo",
-    "version": (1, 4, 0),
+    "version": (1, 5, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar (N) > MifBridge",
     "description": "Framed-JSON socket backend so the MifBridge MCP server can drive "
@@ -37,8 +37,8 @@ bl_info = {
 # claimed lowest Blender, which its version check holds this to). It said 4.4 until then, so the add-on list showed a 3.6 or 4.2 user an add-on
 # for a newer Blender while every suite passed there. The history below is why 4.4 was the first value.
 #
-# The 4.4 floor is now CONSERVATIVE rather than unverified. Measured 2026-08-27 with
-# tools/blender_probe.py and tools/test_blender_ops.py, on four real installs:
+# By 2026-08-27 the 4.4 value was CONSERVATIVE rather than unverified. Measured then with
+# a dev tool and a dev test, on four real installs:
 #
 #   version     imports  registers  33 ops  FBX kwargs  op suite
 #   3.6.23        yes      yes        yes    all present   12/12
@@ -56,11 +56,10 @@ bl_info = {
 # addon_utils.enable, so the extensions manifest is NOT required. Determined by running
 # it, not by reading release notes.
 #
-# The floor stays at 4.4 anyway, and that is a decision rather than an oversight: the op
-# SUITE covers set_material_slots and the read ops around it, not the FBX mesh round
-# trip. The kwargs are proven present on 3.6; the round trip through them is not proven
-# on 3.6. Lower the floor when something exercises it. (It is exercised now: every release certifies the full
-# suite set, FBX round trips and the hand-off to Unreal included, on 3.6.)
+# 4.4 was kept then because the op suite did not yet exercise the FBX mesh round trip on 3.6 - the kwargs were
+# present, the round trip through them unproven. Every release now certifies the full suite set, FBX round trips and
+# the hand-off to Unreal included, on 3.6, so bl_info says 3.6 (a dev tool check_addon_version holds a
+# comment here that states another floor to it).
 
 import importlib
 import os
@@ -232,7 +231,7 @@ class MifBlenderPreferences(AddonPreferences):
                     "startup forever",
         default=True,
     )
-    # OPT-IN (artifacts.py, docs/35_ARTIFACTS.md): off, the add-on keeps no list of what it wrote
+    # OPT-IN: off, the add-on keeps no list of what it wrote
     record_artifacts: BoolProperty(
         name="Record artifacts",
         description="Keep a list of the files MifBlender's ops write, beside the call journal, so artifact_inventory can "
@@ -421,9 +420,15 @@ TOKEN_STATE = {"source": None, "error": None, "migrated": None}
 
 
 def resolve_token(token=None, settings=None):
-    """(token, source) the server starts with. An explicit token wins; else the preference's mode. Per-install in a GUI
-    Blender reads or makes the token file. A headless Blender (blender -b, a command someone typed) and a script that
-    serves the add-on without enabling it keep "dev" unless the preference is Custom or None."""
+    """(token, source) the server starts with. An explicit token wins; else the preference's mode. Per-install reads or
+    makes the token file.
+
+    HEADLESS NO LONGER MEANS "dev" (FOUND 2026-11-22). A headless Blender (blender -b ... serve_forever(), the documented
+    command) and a script that serves the add-on without enabling it used to keep "dev" - with run_python on whenever the
+    add-on was enabled in the preferences, so any local process could run Python in it during every suite run. Now, with
+    no explicit token and no Custom or None preference, they take MIF_BLENDER_TOKEN from the environment (the variable
+    the MCP server reads, so a launcher sets one value for both) and otherwise the per-install file, as a GUI Blender
+    does. "dev" is served only when someone passes or sets it."""
     if token is not None:
         return token, "argument"
     mode = effective_token_mode(settings)
@@ -432,7 +437,9 @@ def resolve_token(token=None, settings=None):
     if mode == "CUSTOM":
         return settings.token or "", "custom"
     if mode is None or bpy.app.background:
-        return token_store.LEGACY_TOKEN, "default (headless)" if mode is not None else "default (no preferences)"
+        env = (os.environ.get("MIF_BLENDER_TOKEN") or "").strip()
+        if env:
+            return env, "environment (headless)"
     tok, err = token_store.read_or_create()
     TOKEN_STATE["error"] = err
     if err:
@@ -567,7 +574,7 @@ def _deferred_autostart():
 
 
 def register():
-    # THE EXTENSION API (extensions.py, docs/32_EXTENSIONS.md section 8), under ONE fixed name: this add-on's own module
+    # THE EXTENSION API, under ONE fixed name: this add-on's own module
     # name is "MifBlender" when installed as a legacy add-on and "bl_ext.<repo>.MifBlender" as a 4.2+ extension, so a
     # separate add-on could not import it by a name it can know. First, so it is there even in background mode.
     from . import extensions as _ext

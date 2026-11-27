@@ -1586,6 +1586,108 @@ def op_export_uv_layout(params):
     return out
 
 
+# ------------------------------------------------------------------------------------------------- unwrap_organic
+_ORGANIC_KEYS = ("object", "preset", "axis", "hide", "views", "rays", "tips", "method", "uvLayer", "margin",
+                 "compare")
+
+
+def _organic_measure(obj, layer):
+    """(fill, islands, angle stretch mean, area stretch mean) of one UV layer, read through uv_info."""
+    from .ops_mesh import _uv_layout_area, op_uv_info   # noqa: PLC0415
+    rows = {}
+    for mode in ("ANGLE", "AREA"):
+        info = op_uv_info({"object": obj.name, "layer": layer, "stretch": mode})
+        lay = next((r for r in info.get("layers") or [] if r.get("name") == layer), {})
+        rows[mode] = lay
+    st = {m: (rows[m].get("stretch") or {}) for m in rows}
+    return {"fill": round(_uv_layout_area(obj.data, layer), 4), "islands": rows["AREA"].get("islandCount"),
+            "angleStretch": {"mean": st["ANGLE"].get("mean"), "worst": st["ANGLE"].get("worst")},
+            "areaStretch": {"mean": st["AREA"].get("mean"), "worst": st["AREA"].get("worst")}}
+
+
+def op_unwrap_organic(params):
+    """Seams by rule for a creature, a tube or a lathe - where the part is least seen - then a minimum-stretch unwrap,
+    measured against SMART project on the same mesh.
+
+    THE GAP (FOUND 2026-11-18 by three builds): a creature, a stump and an armoured character all took SMART project,
+    because no op placed seams for an organic or tube shape - along a belly, under the limbs, under roots and the
+    trunk's back, or a lathe's own seam. mark_seams cuts by material, vertex group, bones and angle.
+
+    preset tube | lathe | creature is uv_unwrap's seam rule of that name: every vertex's exposure is the share of
+    `views` directions (default 32, the upper half weighted double) it faces and - rays, default true - is not hidden
+    from by the part itself; hide [x,y,z] makes the surface facing it count as less seen still (a belly: [0, 0, -1]).
+    The seams are a tree of cheapest edge paths through the least-seen surface joining the part's open loops and, on a
+    closed part, its two ends along axis (tube, lathe; default the longest direction) or its limb tips (creature: up to
+    `tips`, default 6, each the vertex farthest along the surface from those already found, while it is a third as far
+    as the first) - so the part opens into one disc. Then uv_unwrap with method MINIMUM_STRETCH (on Blender 4.4 and
+    later; ANGLE before), seams cleared first, packed at margin (default 0.02), on uvLayer (default the active one).
+    compare (default true) unwraps a copy SMART and packs it the same way, then deletes the copy. Reply: the seams
+    (terminals, cut edges, their length, the exposure along them against the mesh's mean, where they run), and for the
+    organic layout and SMART's: fill, islands, and mean and worst angle and area stretch (uv_info's 1 - min(r, 1/r)).
+    Refused, nothing changed: an unknown preset or method, and everything uv_unwrap's seamRules refuse.
+    """
+    from .ops_mesh import op_uv_unwrap   # noqa: PLC0415
+    reject_unknown(params, _ORGANIC_KEYS, "unwrap_organic")
+    tail = "NOTHING was changed."
+    obj = get_object(take(params, "object", required=True, kind=str), want_mesh=True)
+    require_editable(obj, "unwrap")
+    preset = str(take(params, "preset", required=True, kind=str)).lower()
+    if preset not in ("tube", "lathe", "creature"):
+        raise MifOpError("preset is tube, lathe or creature, got %r. %s" % (preset, tail))
+    can_min = "MINIMUM_STRETCH" in {i.identifier for i in
+                                    bpy.ops.uv.unwrap.get_rna_type().properties["method"].enum_items}
+    method = str(take(params, "method", default="MINIMUM_STRETCH" if can_min else "ANGLE", kind=str)).upper()
+    if method not in ("MINIMUM_STRETCH", "ANGLE", "CONFORMAL"):
+        raise MifOpError("method is MINIMUM_STRETCH (4.4 and later), ANGLE or CONFORMAL, got %r. %s" % (method, tail))
+    if method == "MINIMUM_STRETCH" and not can_min:
+        raise MifOpError("MINIMUM_STRETCH is not in this Blender's unwrap (it arrived in 4.4) - pass method ANGLE. %s"
+                         % tail)
+    rule = {"rule": preset}
+    for k in ("axis", "hide", "views", "rays", "tips"):
+        if params.get(k) is not None:
+            rule[k] = params[k]
+    margin = take_float(params, "margin", default=0.02)
+    compare = take_bool(params, "compare", default=True)
+    layer = take(params, "uvLayer", default=None, kind=str)
+    smart = None
+    if compare:
+        me2 = obj.data.copy()
+        tmp = bpy.data.objects.new(obj.name + "_smart_probe", me2)
+        for col in obj.users_collection:
+            col.objects.link(tmp)
+        tmp.matrix_world = obj.matrix_world.copy()
+        try:
+            sub = {"object": tmp.name, "method": "SMART", "uvPack": True, "packMargin": margin, "replace": True}
+            if layer:
+                sub["uvLayer"] = layer
+            op_uv_unwrap(sub)
+            smart = _organic_measure(tmp, layer or tmp.data.uv_layers.active.name)
+        finally:
+            from .ops_common import remove_objects   # noqa: PLC0415
+            remove_objects([tmp])
+            if me2.users == 0:
+                bpy.data.meshes.remove(me2)
+    sub = {"object": obj.name, "method": method, "seamRules": [rule], "clearSeams": True, "uvPack": True,
+           "packMargin": margin, "replace": True}
+    if layer:
+        sub["uvLayer"] = layer
+    r = op_uv_unwrap(sub)
+    name = r.get("activeLayer") or layer
+    organic = _organic_measure(obj, layer or name)
+    out = {"object": obj.name, "preset": preset, "method": method, "layer": layer or name,
+           "seams": ((r.get("seams") or {}).get("rules") or [None])[0], "seamEdges": (r.get("seams") or {}).get(
+               "seamEdgesNow"), "organic": organic, "smart": smart}
+    if smart is not None:
+        out["againstSmart"] = {
+            "fill": round(organic["fill"] - smart["fill"], 4),
+            "islands": (organic["islands"] or 0) - (smart["islands"] or 0),
+            "angleStretchMean": round((organic["angleStretch"]["mean"] or 0) - (smart["angleStretch"]["mean"] or 0), 6),
+            "areaStretchMean": round((organic["areaStretch"]["mean"] or 0) - (smart["areaStretch"]["mean"] or 0), 6),
+            "note": "organic minus SMART: fewer islands means fewer seams to hide; a stretch above SMART's is what one "
+                    "disc costs on a closed part"}
+    return out
+
+
 OPS = {
     "uv_stitch": op_uv_stitch,
     "uv_set_texel_density": op_uv_set_texel_density,
@@ -1594,4 +1696,5 @@ OPS = {
     "uv_move_vertices": op_uv_move_vertices,
     "uv_relax": op_uv_relax,
     "export_uv_layout": op_export_uv_layout,
+    "unwrap_organic": op_unwrap_organic,
 }

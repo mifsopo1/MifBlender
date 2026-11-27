@@ -1,5 +1,5 @@
 """Is this MifBlender install whole, and is it the only one Blender can see? Plain Python - no bpy - so the logic is
-tested offline (tools/test_blender_install_check.py) and ping can call it on every request.
+tested offline and ping can call it on every request.
 
 WHY, 2026-09-16: on Blender 5.2.1 an upgrade left 43 `MifBlender.pre-install-*.bak`
 folders beside the add-on inside scripts/addons - Blender lists every folder holding an __init__.py as another add-on -

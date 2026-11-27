@@ -2,8 +2,8 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.mifsopo1/mifblender",
   "title": "MifBlender",
-  "description": "AI in a running Blender: 437 typed tools that check their parameters and read the result back.",
-  "version": "1.4.0",
+  "description": "AI in a running Blender: typed tools that read their result back, and each change is one undo step.",
+  "version": "1.5.0",
   "repository": {
     "url": "https://github.com/mifsopo1/MifBlender",
     "source": "github"
@@ -12,11 +12,40 @@
     {
       "registryType": "pypi",
       "identifier": "mifblender-mcp",
-      "version": "1.4.0",
+      "version": "1.5.0",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"
-      }
+      },
+      "environmentVariables": [
+        {
+          "name": "MIF_BLENDER_PORT",
+          "description": "Port the Blender add-on listens on (default 8792)",
+          "format": "number",
+          "default": "8792",
+          "isRequired": false
+        },
+        {
+          "name": "MIF_BLENDER_TOKEN",
+          "description": "Token shared with the add-on; written by 'uvx mifblender-mcp setup'",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "MIF_TOOL_PACKS",
+          "description": "Tools to load: lean (default), blender (all), or a list of packs",
+          "default": "lean",
+          "isRequired": false
+        },
+        {
+          "name": "MIF_BLENDER_TIMEOUT",
+          "description": "Seconds one call may take (default 180)",
+          "format": "number",
+          "default": "180",
+          "isRequired": false
+        }
+      ]
     }
-  ]
+  ],
+  "websiteUrl": "https://github.com/mifsopo1/MifBlender"
 }

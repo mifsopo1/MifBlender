@@ -46,7 +46,6 @@ def _k32():
                                              ctypes.POINTER(wintypes.DWORD)]
     k.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
     k.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
-    k.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
     return k
 
 
@@ -126,6 +125,67 @@ def processes(prefix):
     finally:
         k.CloseHandle(snap)
     return rows
+
+
+def parent_pids(prefix):
+    """{pid: parent pid} of LIVE processes whose exe name starts with prefix (case-blind), from the same snapshot as
+    processes(). A parent pid can outlive its process and be reused, so a caller checks the parent is live and started
+    first."""
+    if not available():
+        return {}
+    k = _k32()
+    snap = k.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snap or snap == wintypes.HANDLE(-1).value:
+        return {}
+    out = {}
+    try:
+        e = _PROCESSENTRY32W()
+        e.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+        ok = k.Process32FirstW(snap, ctypes.byref(e))
+        while ok:
+            if e.szExeFile.lower().startswith(prefix.lower()):
+                out[int(e.th32ProcessID)] = int(e.th32ParentProcessID)
+            ok = k.Process32NextW(snap, ctypes.byref(e))
+    finally:
+        k.CloseHandle(snap)
+    return out
+
+
+def process_tree():
+    """{pid: (parent pid, exe name, start time as Unix seconds or None)} of every LIVE process, from one snapshot. What a
+    session start walks to tell a client the editor launched from one somebody else did: a process is the editor's
+    descendant only through a chain of parents each seen alive and started before its child (a parent pid outlives its
+    process and can be reused)."""
+    if not available():
+        return {}
+    k = _k32()
+    snap = k.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snap or snap == wintypes.HANDLE(-1).value:
+        return {}
+    out = {}
+    try:
+        e = _PROCESSENTRY32W()
+        e.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+        ok = k.Process32FirstW(snap, ctypes.byref(e))
+        while ok:
+            pid = int(e.th32ProcessID)
+            h = _open(k, pid)
+            start = None
+            if h:
+                try:
+                    code = wintypes.DWORD(0)
+                    if k.GetExitCodeProcess(h, ctypes.byref(code)) and code.value == STILL_ACTIVE:
+                        start = _start_epoch(k, h)
+                    else:
+                        pid = None
+                finally:
+                    k.CloseHandle(h)
+            if pid is not None:
+                out[pid] = (int(e.th32ParentProcessID), e.szExeFile, start)
+            ok = k.Process32NextW(snap, ctypes.byref(e))
+    finally:
+        k.CloseHandle(snap)
+    return out
 
 
 SERVICE_STATES = {1: "stopped", 2: "start_pending", 3: "stop_pending", 4: "running", 5: "continue_pending",
@@ -224,4 +284,25 @@ def close_windows(pid, image=None):
     user32.EnumWindows(proto(cb), 0)
     for h in hits:
         user32.PostMessageW(h, WM_CLOSE, 0, 0)
+    return len(hits)
+
+
+def minimize_windows(pid):
+    """Minimize every visible, not yet minimized top-level window of pid without activating it (SW_SHOWMINNOACTIVE), so a
+    test window never takes the person's focus. Returns how many were minimized. Closes nothing."""
+    if not available():
+        return 0
+    user32 = ctypes.WinDLL("user32")
+    hits = []
+    proto = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def cb(hwnd, _lp):
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if owner.value == pid and user32.IsWindowVisible(hwnd) and not user32.IsIconic(hwnd):
+            hits.append(hwnd)
+        return True
+    user32.EnumWindows(proto(cb), 0)
+    for h in hits:
+        user32.ShowWindow(h, 7)                  # SW_SHOWMINNOACTIVE
     return len(hits)

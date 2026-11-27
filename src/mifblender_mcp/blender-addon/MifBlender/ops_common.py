@@ -244,6 +244,15 @@ def rnd(seq, places=6):
 # Param plumbing
 # ---------------------------------------------------------------------------
 
+# WHAT A CLASH OF TWO SPELLINGS MEANS, said in the refusal (found 2026-11-18: three builds sent `name` as a SECOND name -
+# a modifier's, a duplicate's, a new name - beside `object`, and read the clash as the op having no way to name it).
+_ALIAS_HINTS = {
+    ("object", "name"): (" Here, as in every op, `name` is the OBJECT (an alias of `object`). A second name has its own "
+                         "key: add_modifier's modifier name is `modifier`, rename_object's new name is `to` or "
+                         "`newName`, duplicate_object's new names are `names`."),
+}
+
+
 def take(params, *names, default=None, required=False, kind=None):
     """Read the first present key out of `names`. Aliases are first-class here
     because MifBridge's UE side accepts them too, and a caller should not have
@@ -269,8 +278,9 @@ def take(params, *names, default=None, required=False, kind=None):
             raise MifOpError(
                 "'%s' and '%s' are two names for the same parameter and were given different "
                 "values (%r and %r). Send one, or send the same value for both - this op cannot "
-                "tell which you meant."
-                % (present[0], clashing[0], first, params[clashing[0]]))
+                "tell which you meant.%s"
+                % (present[0], clashing[0], first, params[clashing[0]],
+                   _ALIAS_HINTS.get((present[0], clashing[0]), "")))
 
     for name in names:
         if name in params and params[name] is not None:
@@ -763,6 +773,24 @@ def rna_properties(holder, skip=frozenset()):
     return out
 
 
+def refuse_outside_write_roots(path, verb="written"):
+    """Raise MifOpError when `path` is outside the folders a tool may write to (write_roots.py, a byte copy of the MCP
+    server's mif_write_roots.py - the one rule every backend applies; Mifsopo, 2026-11-22, S13 "Confine writes").
+
+    The roots here: the open .blend's folder (the closest thing Blender has to a project; none for an unsaved file),
+    the scratch folders (the system temp folder and Blender's own session temp folder), and the folders the person
+    lists in ~/.mifbridge/write_roots.json. Every op that writes a caller's path reaches this through check_output_path
+    or check_writable_dir. run_python is its own gate."""
+    from . import write_roots
+    blend = bpy.data.filepath or ""
+    refused = write_roots.check(path, project=os.path.dirname(blend) if blend else None,
+                                scratch=[tempfile.gettempdir(), getattr(bpy.app, "tempdir", "") or ""])
+    if refused:
+        err = MifOpError(refused["error"].replace("Nothing was written.", "NOTHING was %s." % verb))
+        err.payload = {k: refused[k] for k in ("refusedRule", "target", "writeRoots", "setting")}   # server merges it
+        raise err
+
+
 def check_writable_dir(outdir):
     """Create `outdir` if it is missing and prove a file can be written in it. Raises OSError when it cannot.
 
@@ -780,6 +808,7 @@ def check_writable_dir(outdir):
     is closed (O_TEMPORARY on Windows, unlinked at once elsewhere), so there is no remove step to race or to leave
     a probe behind. flush() inside the block surfaces a write that cannot land.
     """
+    refuse_outside_write_roots(os.path.join(outdir, ".mif_probe"), "written")
     if not os.path.isdir(outdir):
         os.makedirs(outdir)
     with tempfile.TemporaryFile(prefix=".mif_probe_", dir=outdir) as fh:
@@ -787,7 +816,7 @@ def check_writable_dir(outdir):
         fh.flush()
 
 
-def check_output_path(raw, resolved, verb="written"):
+def check_output_path(raw, resolved, verb="written", confine=True):
     """Refuse an output path Blender cannot write, BEFORE the work that depends on it runs.
 
     Blender does not tell you until afterwards. A path containing a NUL or a control character
@@ -814,7 +843,9 @@ def check_output_path(raw, resolved, verb="written"):
         raise MifOpError("the output path '%s' names a directory, not a file - Blender would write "
                          "a file called after the format's extension alone. Pass a full path "
                          "including a file name. NOTHING was %s." % (raw or resolved, verb))
-    # every op that writes a caller's path comes through here (tools/audit_output_paths.py), so the registry needs no list
+    if confine:                         # False only where a path is stored, not written (set_render_settings)
+        refuse_outside_write_roots(resolved, verb)
+    # every op that writes a caller's path comes through here, so the registry needs no list
     # of writers: this only notes the path, and a record is made if the op ends ok with a new file there (artifacts.py)
     from . import artifacts
     artifacts.note_output(resolved)
@@ -952,7 +983,7 @@ def assign_id_name(idblock, wanted, collection):
     (bpy.data.objects, bpy.data.meshes, ...), and is what decides whether a name is taken.
 
     THE REASON THIS EXISTS. Assigning an ID a name another ID holds does not always uniquify the
-    block you assigned. Measured on all five builds 2026-09-14 (ledger B12):
+    block you assigned. Measured on all five builds 2026-09-14:
 
         4.2.17 / 4.4.0 / 5.0.1 / 5.2.1  the ASSIGNEE always becomes '<name>.001'. Predictable.
         3.6.23                          whichever of the two sorts FIRST in the datablock list is
@@ -1889,7 +1920,7 @@ def object_info(obj, with_counts=True, children=None):
     #
     # useMaxDistance SITS BESIDE distanceMax because the number is ignored while the flag is off -
     # create_force_field's own comment says so where it writes the two together, and the pair is one
-    # of the five audit_value_without_gate.py now scans for.
+    # of the five a dev test now scans for.
     fld = getattr(obj, "field", None)
     if fld is not None and getattr(fld, "type", "NONE") != "NONE":
         info["field"] = {
@@ -2230,7 +2261,7 @@ def exclude_rows(rows, params, name_of=lambda r: r.get("name", "")):
     WHY THIS SHIPS WITH `limit` AND NOT AFTER IT. Every filter this add-on had was an INCLUDE, and with no cap that
     was only ergonomics: a caller got everything and filtered their own end, and could not miss a row. A cap changes
     that - the rows you did not want fill it and hide the ones you did, which is the saturation the UE side already
-    has and the spec item says not to recreate here. So an exclusion lands with the first bound, not in a later pass.
+    has and the backlog item says not to recreate here. So an exclusion lands with the first bound, not in a later pass.
 
     The add-on's own scratch convention is a Mif name prefix, so nameExcludes:["Mif"] is the common case.
     """

@@ -1,12 +1,12 @@
 """The roadmap's grounding: what a plan's steps need, derived - never typed - from the source, the shipped data and the
-facts the server reads from a live editor. docs/30_ROADMAP.md is the design.
+facts the server reads from a live editor. the internal notes is the design.
 
 PURE. Nothing here talks to an editor, to Blender or to the network: server.py's mif_roadmap gathers the live facts
-and hands them in, and tools/test_mif_roadmap.py drives every status with no editor at all.
+and hands them in, and a dev test drives every status with no editor at all.
 
 WHAT IT DERIVES FROM THE SOURCE (scan_source), per endpoint handler H_<name> in Source/MifBridge/Private/*.cpp:
   guards     every MIF_ENGINE_AT_LEAST / MIF_ENGINE_BEFORE in the handler, WITH its direction (the rule that
-             tools/ue_capability_query.py imports from here - one copy of it);
+             a dev tool imports from here - one copy of it);
   refusals   a SHORT preprocessor arm (an #if/#else branch of a few lines) that calls Fail(...), with the
              conditions it sits under - "on an engine before 5.5 this answers <message>", "without plugin X it
              answers <message>". A long arm with a Fail inside it is a branch with an input check, not a refusal
@@ -22,7 +22,7 @@ LIMIT, said rather than hidden: a check made in a shared helper rather than in t
 
 THE CHECK ALLOWLIST. A catalog step may carry a read-only `check` (is this step already done in the project?). It may
 call only an endpoint on CHECK_ENDPOINTS - not anything in the readOnly bucket, which holds save_package and
-run_console because that bucket is about the undo stack, not about mutation (docs/15 section 1).
+run_console because that bucket is about the undo stack, not about mutation.
 """
 import difflib
 import glob
@@ -31,7 +31,7 @@ import json
 import os
 import re
 
-# ---- the guard rule, shared with tools/ue_capability_query.py ---------------------------------------------------------
+# ---- the guard rule, shared with a dev tool ---------------------------------------------------------
 HANDLER_RE = re.compile(r"^\s*(?:static\s+)?void\s+(H_[a-z0-9_]+)\s*\(")
 BOUNDARY_RE = re.compile(r"MIF_ENGINE_(AT_LEAST|BEFORE)\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)")
 
@@ -67,7 +67,7 @@ CHECK_ENDPOINTS = frozenset({
     "list_niagara_emitters", "describe_package", "list_dirty_packages",
 })
 
-# The calls that answer a preview to commit when the project's change cap is on (docs/15 section 6; bridge manual
+# The calls that answer a preview to commit when the project's change cap is on (the internal notes; bridge manual
 # section 1). A step that uses one says so, so a preview answer is expected rather than read as a failure.
 PREVIEW_ENDPOINTS = frozenset({"spawn_many", "write_datatable_rows", "delete_datatable_rows", "snap_actors_to_ground",
                                "batch"})
@@ -286,7 +286,7 @@ def _close_arm(base, fr, current, out, lines):
     fails = [j for j in body if "Fail(" in lines[j]]
     if not fails:
         return
-    # The innermost arm's conditions only: an enclosing #if is not carried (a limit docs/30 states).
+    # The innermost arm's conditions only: an enclosing #if is not carried.
     msg = _fail_message(lines, fails[0])
     # WHOLE ENDPOINT OR SOME CALLS. A refusal that names its own endpoint ("create_cloth_asset needs UE 5.6") refuses
     # every call; any other short refusal arm is about an option or an input ("dependencies:false needs UE 5.4") and
@@ -329,7 +329,7 @@ def load_catalog(path):
 
 
 def catalog_problems(goals, registered, check_params=None):
-    """Every way the catalog can name something that is not there - for tools/test_mif_roadmap.py."""
+    """Every way the catalog can name something that is not there - for a dev test."""
     out = []
     for gid, g in goals.items():
         for key in ("title", "words", "steps"):
@@ -424,7 +424,7 @@ def _engine_conds_hold(conds, engine):
 
 
 def ground_tool(tool, facts):
-    """One tool's derived facts and problems. `facts` is the dict mif_roadmap assembles (docs/30 section 3)."""
+    """One tool's derived facts and problems. `facts` is the dict mif_roadmap assembles."""
     reg = facts.get("registered") or set()
     out = {"tool": tool}
     problems = []
@@ -563,7 +563,7 @@ def ground_tool(tool, facts):
     if tool.startswith("bl_gen_") and live.get("generative") not in (None, "generative"):
         problems.append(("blocked", "a generative tool, and this project is %s - only the user changes that "
                          "(mif_project_mode)" % live.get("generative")))
-    # ---- dev-only evidence and ledger --------------------------------------------------------------------------------
+    # ---- dev-only evidence and the internal notes --------------------------------------------------------------------------------
     ledger = facts.get("ledger")
     if ledger is not None:
         rows = []
@@ -607,7 +607,7 @@ _MIXED_NOTE = ("suites calling %s pass on %s and at least one fails: a suite's v
 
 
 def _engine_cell_has(cell, engine):
-    """A ledger engine cell - one version, a range '5.3-5.8', a list, or a dash - covers `engine`?"""
+    """A the internal notes engine cell - one version, a range '5.3-5.8', a list, or a dash - covers `engine`?"""
     cell = (cell or "").replace("–", "-").replace(" ", "")
     if not cell or cell in ("-", "—"):
         return False
@@ -689,7 +689,13 @@ def normalize_steps(steps):
                 tools = [tools]
             if not isinstance(tools, list) or not all(isinstance(t, str) for t in tools):
                 return None, "step %d: tools must be a list of tool names" % k
-            if not tools and not s.get("manual"):
+            man = s.get("manual")
+            if man is not None and not (isinstance(man, dict) and all(isinstance(man.get(f), str) and man[f].strip()
+                                                                      for f in ("why", "instead"))):
+                # A string here reached ground_step's dict(step["manual"]) and raised ValueError out of the tool.
+                return None, ("step %d: manual must be {why, instead} - why the bridge cannot do it and what to do instead, "
+                              "both words - not %s" % (k, type(man).__name__ if not isinstance(man, dict) else "an object missing one"))
+            if not tools and not man:
                 return None, "step %d names no tool - a grounded step is made of calls" % k
             out.append({"id": str(s.get("id") or "step%d" % k), "say": str(s.get("say") or ""),
                         "tools": [t.strip() for t in tools], **({"manual": s["manual"]} if s.get("manual") else {})})

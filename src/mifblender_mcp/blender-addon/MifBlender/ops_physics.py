@@ -1499,7 +1499,7 @@ def op_add_fluid(params):
                                     "the liquid and renders no surface - it has been turned ON, as 4.2 and later start "
                                     "it. Pass useMesh:false to keep it off." % bpy.app.version_string)
                     if mesh_turned_on else None})
-        # A GAS DOMAIN NEEDS A VOLUME SHADER TO APPEAR. MEASURED 2026-09-17 on all five builds (docs/22 B80): with no
+        # A GAS DOMAIN NEEDS A VOLUME SHADER TO APPEAR. MEASURED 2026-09-17 on all five builds: with no
         # material it renders as a SOLID BOX in EEVEE and as NOTHING in Cycles, and a Principled Volume with no surface
         # shader renders the simulated smoke in both - which is what set_material_volume writes.
         if st.domain_type == "GAS" and not _material_volume_linked(obj):
@@ -2042,7 +2042,7 @@ def _bake_fluid_domains(sc, rebake):
                if m.type == "FLUID" and getattr(m, "fluid_type", None) == "DOMAIN" and m.domain_settings is not None]
     # ONE SNAPSHOT, BEFORE ANYTHING RUNS. A bake steps the whole scene, so every other REPLAY domain simulates along with
     # it: judged one at a time, a REPLAY domain reached after an ALL domain's fluid.bake_all found the frames that bake
-    # had just written and was reported "kept" (tools/test_blender_fire_reach.py F122, 2026-09-21). "Kept" means
+    # had just written and was reported "kept". "Kept" means
     # complete before this call began - after any rebake free.
     todo = []
     for ob, ds in domains:
@@ -2791,7 +2791,7 @@ def op_bake_physics(params):
     whose group holds a simulation zone. diskCache true writes the bake beside the saved .blend (a node bake's
     bake_target DISK; false packs a node bake into the file, 4.4 and later); toFrame N steps the caches to frame N
     without baking (Blender's Calculate to Frame); free empties them. A node-simulation bake runs headless from 4.2
-    and needs a saved file before 4.4; on 3.6 its operator never returns under -b and is refused (ledger B267).
+    and needs a saved file before 4.4; on 3.6 its operator never returns under -b and is refused.
 
     ONE BAKE NODE (1.3, 4.2+): object + bakeNode (the Bake node's name or bake id; modifier when two share one) bakes that
     node alone (object.geometry_node_bake_single) - bakeMode STILL | ANIMATION, diskCache, free. The whole-cache node
@@ -3475,7 +3475,7 @@ _SIM_READBACK = {
     # one on each, and only the live holder contributes.
     "FLUID": (
         ("@modifier", (("fluidType", "fluid_type", str),)),
-        # useMesh ADDED 2026-09-21 (tools/audit_value_without_gate.py): mesh generation decides whether a LIQUID
+        # useMesh ADDED 2026-09-21: mesh generation decides whether a LIQUID
         # domain renders a surface at all, and a new domain starts with it OFF on 3.6. add_fluid turns it on and
         # says so in its own reply, but nothing READ it afterwards - an agent that reconnects, or inherits a file,
         # could not tell a liquid that renders from one that simulates and shows nothing.
@@ -3757,7 +3757,7 @@ def op_physics_info(params):
         # 2026-09-15 use_gravity was readable only out of that op's own `applied`, which means only
         # by making a write. So a caller could read a gravity of -9.81 from a scene that has gravity
         # switched off entirely. Sixth of these found on one day; the first five are in
-        # audit_value_without_gate.py's docstring.
+        # a dev test's docstring.
         "gravity": [round(float(v), 6) for v in sc.gravity],
         "useGravity": bool(sc.use_gravity),
     }

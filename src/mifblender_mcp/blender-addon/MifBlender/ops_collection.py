@@ -178,7 +178,7 @@ def _collections_index():
     """{object name: [collection names]} for the WHOLE blend, in one pass.
 
     _collections_of asks the question for one object by scanning every collection, and
-    `name in c.objects` is a linear scan (ledger A12), so calling it once per object made
+    `name in c.objects` is a linear scan, so calling it once per object made
     op_list_collections quadratic in objects x collections. MEASURED on 4.4.0 headless with 8000
     objects across 8 collections: 0.026s at 1000 objects, 0.105s at 2000, 0.419s at 4000, 1.695s
     at 8000 - exactly four times the work for twice the objects, three doublings running - and the
@@ -395,7 +395,7 @@ def op_link_objects(params):
     move = take_bool(params, "move", default=False)
 
     before = len(coll.objects)
-    # ONE PASS EACH, not one scan per object: `name in coll.objects` is a linear scan (ledger A12)
+    # ONE PASS EACH, not one scan per object: `name in coll.objects` is a linear scan
     # and so is the per-object `in c.objects` the move path used to do across every collection.
     in_coll = {o.name for o in coll.objects}
     root = _scene_root()
@@ -705,7 +705,7 @@ def op_delete_collection(params):
     joints, freed, not_freed, bake_note, joints_note = [], [], [], None, None
     if delete_objects:
         # THROUGH ops_scene._delete, the rigid-body-safe path delete_object and clear_scene use (2026-09-28): a bare
-        # bpy.data.objects.remove frees a rigid body or joint without taking it out of Bullet's world (docs/22 B51, the
+        # bpy.data.objects.remove frees a rigid body or joint without taking it out of Bullet's world (the internal notes, the
         # crash through delete_object on 5.2.1 and 4.2.17), and this was that bare remove - the same shape the 2026-09-21
         # pack-rule review found in import_mesh's clear. So a joint holding one of the collection's bodies goes with it
         # and is named, and a rigid body bake the delete leaves stale is freed and said. purge=False, as before.

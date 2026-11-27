@@ -1273,7 +1273,9 @@ def op_select_faces(params):
 _BISECT_KEYS = {"object", "name", "planeCo", "planeNo", "planeNormal", "axis",
                 "clearInner", "clearOuter", "fill", "threshold", "faces", "nearBone"}
 _SHADE_KEYS = {"object", "name", "smooth", "autoSmoothAngle", "indices", "weightedNormals",
-               "weightedNormalsMode", "keepSharp"}
+               "weightedNormalsMode", "keepSharp", "unit"}
+# Under this, a fractional autoSmoothAngle reads as radians (pi is 3.14...), and is refused unless a unit is named.
+_SHADE_RADIANS_BELOW = 3.2
 
 _BISECT_AXES = {"X": (1.0, 0.0, 0.0), "Y": (0.0, 1.0, 0.0), "Z": (0.0, 0.0, 1.0)}
 _MAX_CAP_ROWS = 1000
@@ -1394,6 +1396,7 @@ def op_bisect_plane(params):
     bm = bmesh.new()
     region_faces = None
     caps = []
+    nonconvex_caps = 0
     try:
         bm.from_mesh(mesh)
         bm.faces.ensure_lookup_table()
@@ -1448,6 +1451,16 @@ def op_bisect_plane(params):
                      and len(e.link_faces) == 1]
             if edges:
                 caps = bmesh.ops.holes_fill(bm, edges=edges).get("faces", [])
+            # A NON-CONVEX CAP IS TRIANGULATED HERE (found 2026-11-18): holes_fill makes one n-gon per loop, and a star-
+            # shaped stump section's n-gon was triangulated downstream across its notches - black shards past the roots
+            # in the render. bmesh's own triangulation (beauty) keeps every triangle inside the outline; a convex cap
+            # stays one face.
+            bent = [f for f in caps if f.is_valid and len(f.verts) > 3 and not _face_is_convex(f)]
+            if bent:
+                bm.normal_update()
+                made = bmesh.ops.triangulate(bm, faces=bent, quad_method="BEAUTY", ngon_method="BEAUTY")
+                caps = list(dict.fromkeys([f for f in caps if f.is_valid] + list(made.get("faces", []))))
+                nonconvex_caps = len(bent)
         # THE CAPS ARE NAMED (2026-11-07). fill defaults on with a clear, and a garment cut capped that way hid its
         # opening: the shirt's hem and neck came back closed, and only a later fold_boundary_under reported "no open
         # boundary". The default stays - a solid cut wants its cap - and the reply now says which faces it added: their
@@ -1501,13 +1514,16 @@ def op_bisect_plane(params):
         "capped": bool(capped),
         "cappedFaces": capped[:_MAX_CAP_ROWS],
         "cappedFaceCount": len(capped),
+        # Caps whose outline turns back on itself, triangulated inside it (0 when every cap stayed one convex face).
+        "nonConvexCaps": nonconvex_caps,
     }
     if capped:
         out_fill["capNote"] = (
             "the cut was CAPPED with %d face(s) (cappedFaces), so it leaves no opening. A garment cut - a hem, a cuff, "
-            "a neckline - wants the opening: pass fill:false.%s"
+            "a neckline - wants the opening: pass fill:false.%s%s"
             % (len(capped), " fill was not sent: it is on by default with a clear." if out_fill["fillFrom"] == "default"
-               else ""))
+               else "", (" %d cap(s) were not convex, so each was triangulated inside its outline (one n-gon would be "
+                         "cut across its notches downstream)." % nonconvex_caps) if nonconvex_caps else ""))
     return {
         "ok": True,
         "object": obj.name,
@@ -1523,6 +1539,14 @@ def op_bisect_plane(params):
         "delta": {"vertices": after[0] - before[0], "edges": after[1] - before[1],
                   "faces": after[2] - before[2]},
     }
+
+
+def _face_is_convex(face):
+    """Whether every corner of a face turns the same way about its normal (a bmesh face, normal current)."""
+    n = face.normal
+    vs = [v.co for v in face.verts]
+    k = len(vs)
+    return all((vs[i] - vs[i - 1]).cross(vs[(i + 1) % k] - vs[i]).dot(n) >= -1e-12 for i in range(k))
 
 
 def _is_smooth_by_angle(mod):
@@ -1583,7 +1607,12 @@ def op_set_shading(params):
       object / name (str)        required, must be a MESH
       smooth (bool)              smooth or flat, applied to every face or to `indices`
       indices (list[int])        only these faces. Omit for all of them.
-      autoSmoothAngle (float)    DEGREES. Faces meeting at a sharper angle stay flat.
+      autoSmoothAngle (float)    DEGREES. Faces meeting at a sharper angle stay flat. Every other angle in the
+                                 add-on is radians, so a value under 3.2 with a fractional part (0.6, 0.52) is
+                                 REFUSED as probably radians unless `unit` is passed (found 2026-11-18: 0.6 meant
+                                 as radians became 0.6 degrees, answered ok)
+      unit (str)                 "deg" (autoSmoothAngle is degrees, as always) or "rad" (it is radians and is
+                                 converted). The reply's autoSmoothAngleDeg is the angle that was set, in degrees
       weightedNormals (bool)     add a Weighted Normal modifier - the fix for a bevelled corner
                                  that shades wrong no matter what the smooth flags say. It is kept
                                  BELOW any Smooth by Angle modifier (weightedNormalsMoved says when
@@ -1640,6 +1669,20 @@ def op_set_shading(params):
                          % (" and ".join(orphaned), "" if len(orphaned) > 1 else "s",
                             "they" if len(orphaned) > 1 else "it"))
     angle = take_float(params, "autoSmoothAngle", default=None)
+    unit = take(params, "unit", kind=str)
+    if unit is not None:
+        unit = unit.strip().lower()
+        if unit not in ("deg", "rad"):
+            raise MifOpError("unit is \"deg\" or \"rad\" (the unit of autoSmoothAngle), got %r. NOTHING was changed."
+                             % unit)
+        if angle is None:
+            raise MifOpError("unit names the unit of autoSmoothAngle, which was not passed. NOTHING was changed.")
+        if unit == "rad":
+            angle = math.degrees(angle)
+    elif angle is not None and 0.0 < angle < _SHADE_RADIANS_BELOW and angle != round(angle):
+        raise MifOpError("autoSmoothAngle is in DEGREES, and %g reads as radians (%.1f degrees) - every other angle "
+                         "here is radians. Pass unit \"rad\" to have it converted, or unit \"deg\" if %g degrees "
+                         "is meant. NOTHING was changed." % (angle, math.degrees(angle), angle))
     if smooth is None and angle is None and weighted is None:
         raise MifOpError("nothing to do - pass smooth, autoSmoothAngle or weightedNormals. "
                          "NOTHING was changed.")
@@ -1813,6 +1856,8 @@ def op_set_shading(params):
         "smoothFaces": smooth_faces,
         "flatFaces": len(mesh.polygons) - smooth_faces,
         "autoSmoothAngle": angle,
+        # THE UNIT IN THE KEY: the reply echoed 0.6 with no unit when 0.6 radians was meant.
+        "autoSmoothAngleDeg": angle,
         # WHICH ROUTE WAS TAKEN, because they are different mechanisms with different consequences:
         # the 4.1+ one adds a MODIFIER, which shows up in list_modifiers, applies in export, and can
         # be removed - none of which is true of the old property.
@@ -1832,6 +1877,7 @@ def op_set_shading(params):
 _OVERLAP_KEYS = {"a", "b", "objects", "tolerance", "maxSamples", "evaluated"}
 
 _DEFAULT_OVERLAP_SAMPLES = 2000
+_OVERLAP_GRID = 7          # cell centers per axis over the common box when faces cross and no sample is inside
 
 
 def _world_bvh(obj, depsgraph, use_eval):
@@ -2073,8 +2119,25 @@ def op_objects_overlap(params):
             winding.append({"object": obj_a.name, "pointsOfOther": len(sam_b), "insideByParity": b_in,
                             "insideByFaceNormals": b_in_n})
 
+    # FACES CROSS AND NO SAMPLE IS INSIDE: a shutter whose edge cut 3 cm into a window
+    # frame answered TOUCHING, because every vertex and face center of each lay on or outside the other - the shared
+    # volume held none of them. Before TOUCHING is answered, a grid of cell centers over the two boxes' common box is
+    # asked: a point inside both (deeper than tolerance from each surface) is shared volume. Two boxes flush against each
+    # other have a common box of zero thickness, every center on a surface, so they stay TOUCHING.
+    grid_both = 0
+    if pairs and not (a_in or b_in):
+        lo = [max(box_a[0][i], box_b[0][i]) for i in range(3)]
+        hi = [min(box_a[1][i], box_b[1][i]) for i in range(3)]
+        if all(hi[i] - lo[i] > 2.0 * tol for i in range(3)):
+            n = _OVERLAP_GRID
+            for ix in range(n):
+                for iy in range(n):
+                    for iz in range(n):
+                        p = mathutils.Vector([lo[k] + (hi[k] - lo[k]) * ((ix, iy, iz)[k] + 0.5) / n for k in range(3)])
+                        if _inside_parity(tree_a, p, tol, box_a) and _inside_parity(tree_b, p, tol, box_b):
+                            grid_both += 1
     if pairs:
-        verdict = "INTERSECTING" if (a_in or b_in) else "TOUCHING"
+        verdict = "INTERSECTING" if (a_in or b_in or grid_both) else "TOUCHING"
     elif sam_b and b_in == len(sam_b):
         verdict = "B_INSIDE_A"
     elif sam_a and a_in == len(sam_a):
@@ -2143,6 +2206,7 @@ def op_objects_overlap(params):
         "facePairsNote": ("the number of intersecting face pairs is unreliable - overlap() "
                           "under-reports badly on coincident geometry. Use it as yes/no."),
         "samplesInsideOther": {"aInB": a_in, "bInA": b_in},
+        "gridInsideBoth": grid_both,
         "samplesTested": {"a": len(sam_a), "b": len(sam_b), "strideA": stride_a,
                           "strideB": stride_b},
         "aabbSaysOverlap": aabb_overlap,
@@ -2380,8 +2444,9 @@ def _coplanar_tris(obj, depsgraph, use_eval, owner):
         source.to_mesh_clear()
 
 
-def _clip_area(subject, clip):
-    """(area, centroid) of convex 2D polygon `subject` clipped by convex counter-clockwise polygon `clip`."""
+def _clip_area(subject, clip, corners=None):
+    """(area, centroid) of convex 2D polygon `subject` clipped by convex counter-clockwise polygon `clip`; the clipped
+    polygon's corners are appended to the list `corners` when one is given."""
     out = list(subject)
     for i in range(len(clip)):
         a, b = clip[i], clip[(i + 1) % len(clip)]
@@ -2410,6 +2475,8 @@ def _clip_area(subject, clip):
         cy += (y0 + y1) * c
     if abs(a2) < 1e-18:
         return 0.0, None
+    if corners is not None:
+        corners.extend(out)
     return abs(a2) / 2.0, (cx / (3.0 * a2), cy / (3.0 * a2))
 
 
@@ -2451,7 +2518,8 @@ def op_coplanar_overlaps(params):
     same depth, so which one wins changes pixel by pixel and frame by frame.
 
     HOW. Every triangle of the objects, in world space, is grouped by facing (within 1 degree) and by plane (within
-    planeToleranceCm, default 0.15 cm: 1 mm apart still fights at a distance, 2 mm does not - from use). Two triangles of
+    planeToleranceCm, default 0.15 cm: 1 mm apart still fights at a distance, 2 mm does not - from use), judged by the
+    pair's own two planes at every corner of their overlap. Two triangles of
     a group whose 2D shapes overlap are clipped one by the other, and the overlap polygon's OWN area is what is reported -
     not the triangles', so a 1 cm strip along a big triangle reads as the strip. Then the overlaps nobody can see are
     dropped, each by a measurement from just above the overlap:
@@ -2544,16 +2612,29 @@ def op_coplanar_overlaps(params):
             continue
         u = rep.orthogonal().normalized()
         v = rep.cross(u)
-        dist = {i: rep.dot((tris[i][3][0] + tris[i][3][1] + tris[i][3][2]) / 3.0) for i in idx}
-        idx.sort(key=lambda i: dist[i])
-        groups, cur = [], [idx[0]]
+        # EACH TRIANGLE'S SPAN ALONG THE CLUSTER'S NORMAL, NOT ITS CENTROID'S (FOUND 2026-11-26 on a banked road's decal
+        # layer). Within a 1-degree cluster a triangle's own normal leans off the representative one, so its centroid's
+        # height along it moves with where the triangle sits: a 7 m road triangle and a decal 2 cm over it read as one
+        # plane (224 false overlaps), and two faces in one tilted plane whose centroids lie metres apart read as two
+        # (a missed overlap). Triangles whose spans come within tol are grouped; the pair is then judged at its overlap
+        # by each triangle's own plane.
+        span = {i: (min(rep.dot(p) for p in tris[i][3]), max(rep.dot(p) for p in tris[i][3])) for i in idx}
+        idx.sort(key=lambda i: span[i][0])
+        groups, cur, top = [], [idx[0]], span[idx[0]][1]
         for i in idx[1:]:
-            if dist[i] - dist[cur[-1]] <= tol:
+            if span[i][0] <= top + tol:
                 cur.append(i)
+                top = max(top, span[i][1])
             else:
                 groups.append(cur)
-                cur = [i]
+                cur, top = [i], span[i][1]
         groups.append(cur)
+
+        def height(i, x, y):
+            """where triangle i's own plane meets the line through (x, y) along rep"""
+            n0, p0 = tris[i][4], tris[i][3][0]
+            nr = n0.dot(rep)
+            return (n0.dot(p0) - x * n0.dot(u) - y * n0.dot(v)) / nr if abs(nr) > 1e-9 else rep.dot(p0)
         for g in groups:
             if len(g) < 2:
                 continue
@@ -2572,17 +2653,24 @@ def op_coplanar_overlaps(params):
                     ti, tj = tris[i], tris[j]
                     if ti[0] == tj[0] and ti[1] == tj[1]:
                         continue
-                    if abs(dist[i] - dist[j]) > tol:
+                    if span[j][0] > span[i][1] + tol or span[i][0] > span[j][1] + tol:
                         continue
-                    area, c2 = _clip_area(flat[j], flat[i])
+                    corners = []
+                    area, c2 = _clip_area(flat[j], flat[i], corners)
                     if area <= 0.0 or c2 is None:
                         continue
+                    # IN ONE PLANE OVER THE WHOLE OVERLAP, at every corner of it: two faces that merely cross, or touch
+                    # along an edge at different heights (a sliver of overlap whose area centroid is ill-defined), do not
+                    # draw the same depth across it
+                    if any(abs(height(i, x, y) - height(j, x, y)) > tol for x, y in corners):
+                        continue
+                    hi_, hj_ = height(i, c2[0], c2[1]), height(j, c2[0], c2[1])
                     a, b = sorted(((ti[0], ti[1], i), (tj[0], tj[1], j)))
                     key = (a[0], a[1], b[0], b[1])
                     row = pairs.setdefault(key, [0.0, None])
                     row[0] += area
                     if row[1] is None or area > row[1][0]:
-                        d = (dist[i] + dist[j]) / 2.0
+                        d = (hi_ + hj_) / 2.0
                         point = rep * d + u * c2[0] + v * c2[1]
                         row[1] = (area, point, rep, a[2], b[2], (flat[a[2]], flat[b[2]]), c2)
 

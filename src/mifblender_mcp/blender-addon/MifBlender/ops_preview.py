@@ -1,4 +1,4 @@
-"""THE BULK PREVIEW, Blender's half (docs/15_SAFETY_GATE_AND_JOURNAL.md section 5, "The Blender half").
+"""THE BULK PREVIEW, Blender's half.
 
 The Unreal plugin's handshake, with the same field names, for the add-on's bulk writes:
 
@@ -59,8 +59,8 @@ _JOURNAL = {}
 
 
 def _modules():
-    from . import ops_create, ops_file, ops_garment, ops_mesh, ops_rig, ops_rigify, ops_topology
-    return (ops_create, ops_file, ops_garment, ops_mesh, ops_rig, ops_rigify, ops_topology)
+    from . import ops_create, ops_file, ops_garment, ops_mesh, ops_rig, ops_rigify, ops_scene, ops_topology
+    return (ops_create, ops_file, ops_garment, ops_mesh, ops_rig, ops_rigify, ops_scene, ops_topology)
 
 
 def specs():

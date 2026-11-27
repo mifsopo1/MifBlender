@@ -28,7 +28,7 @@ import math
 import bpy
 
 from .ops_anim import _anim_holders, _bone_of_path, _fcurves
-from .ops_common import (MifOpError, finite_floats, finite_int, get_object, reject_unknown, require_editable, rnd,
+from .ops_common import (MifOpError, finite_float, finite_floats, finite_int, get_object, reject_unknown, require_editable, rnd,
                          simulation_guard, take, take_bool, take_float)
 from .ops_pose import (_armature, key_bone_channels, pick_bones, restore_bone_selection, rotation_path,
                        select_bones)
@@ -1676,6 +1676,588 @@ def op_match_world_transform(params):
     return reply
 
 
+# ---------------------------------------------------------------------------------------------------------- pose_seams
+# FOUND 2026-11-19: store creature clips keyed on every frame with linear tangents still jumped the whole
+# pose in one frame (18 of 31 clips, an upper arm 162 degrees) and flipped a hand's twist 164 degrees in one frame. A
+# person scrubbing saw the pop; no clipping measure did. What worked: per frame, each bone's parent-relative rotation
+# against the frame before, and its twist about bone Y against the frame before; at a seam each jumping bone continues
+# from the frame before and the offset fades out over 6 frames (twice for seams close together). That brought the
+# largest per-frame turn to 44 degrees and the largest twist jump to 21.
+#
+# THE FADE is done on the bone's basis (its own channels): parent-relative = Rrel @ B with Rrel fixed, so holding the
+# parent-relative rotation at the frame before is holding B there. With O = B(s-1) @ B(s)^-1 at a seam frame s, every
+# frame f of s .. s+N-1 becomes slerp(1, O, 1 - (f - s) / N) @ B(f): frame s repeats s-1's rotation and the offset is
+# gone by s+N. Seams are taken in frame order on the values already faded, so a second seam inside a window composes.
+
+_PS_KEYS = ("object", "name", "action", "actions", "frameRange", "bones", "namePrefix", "all", "turnDeg", "twistDeg",
+            "fadeBonesAboveDeg", "fix", "fadeFrames", "maxPasses", "maxRows")
+
+
+def _ps_scan(obj, pbs, start, end, turn_lim, twist_lim):
+    """Per frame and bone: parent-relative quaternion, the turn and twist jump against the frame before; and each
+    bone's basis rotation, for the fade."""
+    scene = bpy.context.scene
+    rel, basis = {}, {}
+    for f in range(start, end + 1):
+        scene.frame_set(f)
+        mats = {pb.name: pb.matrix.copy() for pb in obj.pose.bones}
+        row, brow = {}, {}
+        for pb in pbs:
+            m = mats[pb.name]
+            r = (mats[pb.parent.name].inverted_safe() @ m) if pb.parent else m
+            row[pb.name] = r.to_quaternion()
+            brow[pb.name] = pb.matrix_basis.to_quaternion()
+        rel[f], basis[f] = row, brow
+    jumps = {}
+    worst_turn, worst_twist = (0.0, None, None), (0.0, None, None)
+    for f in range(start + 1, end + 1):
+        row = {}
+        for pb in pbs:
+            a, b = rel[f - 1][pb.name], rel[f][pb.name]
+            d = a.rotation_difference(b).angle
+            turn = math.degrees(min(d, 2 * math.pi - d))
+            tw = lambda q: math.degrees(2.0 * math.atan2(q.y, q.w))  # noqa: E731
+            twist = (tw(b) - tw(a) + 180.0) % 360.0 - 180.0
+            row[pb.name] = (turn, twist)
+            if turn > worst_turn[0]:
+                worst_turn = (turn, f, pb.name)
+            if abs(twist) > abs(worst_twist[0]):
+                worst_twist = (twist, f, pb.name)
+        jumps[f] = row
+    seams, flips = [], []
+    for f in range(start + 1, end + 1):
+        over = sorted(((n, t, w) for n, (t, w) in jumps[f].items() if t > turn_lim), key=lambda x: -x[1])
+        if over:
+            seams.append({"frame": f, "bones": [{"bone": n, "turnDeg": round(t, 3), "twistJumpDeg": round(w, 3)}
+                                                for n, t, w in over]})
+        for n, (t, w) in jumps[f].items():
+            if abs(w) > twist_lim:
+                flips.append({"frame": f, "bone": n, "twistJumpDeg": round(w, 3), "turnDeg": round(t, 3)})
+    stats = {"maxTurnDeg": round(worst_turn[0], 3), "maxTurnAt": {"frame": worst_turn[1], "bone": worst_turn[2]},
+             "maxTwistJumpDeg": round(abs(worst_twist[0]), 3),
+             "maxTwistJumpAt": {"frame": worst_twist[1], "bone": worst_twist[2]}}
+    return {"jumps": jumps, "basis": basis, "seams": seams, "flips": flips, "stats": stats}
+
+
+def _ps_write(pb, quat, frame, prev):
+    """Write a basis rotation into the bone's own channels at frame and key it; returns what the next frame continues."""
+    from mathutils import Quaternion   # noqa: PLC0415,F401
+    mode = pb.rotation_mode
+    if mode == "QUATERNION":
+        q = quat.copy()
+        if prev is not None:
+            q.make_compatible(prev)
+        pb.rotation_quaternion = q
+        out = q
+    elif mode == "AXIS_ANGLE":
+        axis, ang = quat.to_axis_angle()
+        pb.rotation_axis_angle = (ang, axis[0], axis[1], axis[2])
+        out = None
+    else:
+        e = quat.to_euler(mode, prev) if prev is not None else quat.to_euler(mode)
+        pb.rotation_euler = e
+        out = e
+    pb.keyframe_insert(rotation_path(pb), frame=frame, group=pb.name)
+    return out
+
+
+def _ps_fix(obj, pbs, scan, start, end, fade_above, n_fade):
+    """Fade every seam's jumping bones; returns the (frame, bone) seams faded."""
+    from mathutils import Quaternion   # noqa: PLC0415
+    basis = {f: dict(row) for f, row in scan["basis"].items()}
+    done, touched = [], {}
+    by_name = {pb.name: pb for pb in pbs}
+    seam_set = {s["frame"] for s in scan["seams"]}
+    seam_frames = sorted(seam_set | {fl["frame"] for fl in scan["flips"]})
+    for s in seam_frames:
+        row = scan["jumps"][s]
+        flipped = {fl["bone"] for fl in scan["flips"] if fl["frame"] == s}
+        # a whole-pose seam takes every bone turning past fade_above with it; a flip alone only the flipped bone
+        names = [n for n, (t, _w) in row.items() if (s in seam_set and t > fade_above) or n in flipped]
+        for n in names:
+            o = basis[s - 1][n] @ basis[s][n].inverted()
+            if o.w < 0:
+                o.negate()
+            for f in range(s, min(end, s + n_fade - 1) + 1):
+                w = 1.0 - (f - s) / float(n_fade)
+                basis[f][n] = Quaternion().slerp(o, w) @ basis[f][n]
+                touched.setdefault(n, set()).add(f)
+            done.append({"frame": s, "bone": n, "offsetDeg": round(math.degrees(o.angle), 3)})
+    scene = bpy.context.scene
+    for n, frames in touched.items():
+        pb = by_name[n]
+        prev = None
+        first = min(frames)
+        if first - 1 >= start:
+            scene.frame_set(first - 1)
+            prev = (pb.rotation_quaternion.copy() if pb.rotation_mode == "QUATERNION" else
+                    None if pb.rotation_mode == "AXIS_ANGLE" else pb.rotation_euler.copy())
+        for f in sorted(frames):
+            prev = _ps_write(pb, basis[f][n], f, prev)
+    return done
+
+
+def op_pose_seams(params):
+    """Scan an armature's actions for one-frame pose seams and twist flips, and with fix fade them out.
+
+    params:
+      object (str)              the armature
+      action (str) | actions [] the actions to scan (default the assigned one); each is assigned in turn and the one
+                                assigned before is put back
+      frameRange [s, e]         default each action's own range
+      bones [..] | namePrefix | all   the bones scanned (default all)
+      turnDeg (float)           a seam: a bone whose parent-relative rotation turns more than this in one frame
+                                (default 60; fast authored motion measured up to 44)
+      twistDeg (float)          a flip: a bone whose twist about its own Y relative to its parent jumps more than this
+                                in one frame (default 90) - judged frame to frame, never by the absolute twist, which
+                                goes unstable near a 180-degree fold
+      fix (bool)                fade them (default false: read only)
+      fadeBonesAboveDeg (float) at a seam frame, every bone turning more than this there is faded with the one that
+                                crossed turnDeg, so the rest of a whole-pose jump goes too (default 15)
+      fadeFrames (int)          the frames the offset fades over (default 6)
+      maxPasses (int)           scan-and-fade passes while seams remain (default 3)
+      maxRows (int)             seams and flips listed per action (default 200)
+    Rotation only: a location jump is not looked at. A fixed frame is keyed on the bone's rotation channel.
+    Reply per action: frames, seams [{frame, bones [{bone, turnDeg, twistJumpDeg}]}], flips [{frame, bone,
+    twistJumpDeg, turnDeg}], before {maxTurnDeg, maxTwistJumpDeg and where}, and with fix: faded [{frame, bone,
+    offsetDeg}], passes, after (the same measures on the faded action) and seamsLeft / flipsLeft.
+    """
+    reject_unknown(params, _PS_KEYS, "pose_seams")
+    obj = _armature(params, "changed")
+    fix = take_bool(params, "fix", default=False)
+    if fix:
+        require_editable(obj, "animate")
+    if params.get("action") is not None and params.get("actions") is not None:
+        raise MifOpError("pass action or actions, not both. %s" % _TAIL)
+    names = params.get("actions")
+    if names is None:
+        one = take(params, "action", default=None, kind=str)
+        if one is not None:
+            names = [one]
+        else:
+            cur = obj.animation_data.action if obj.animation_data else None
+            if cur is None:
+                raise MifOpError("'%s' has no action assigned - name one with action or actions. %s" % (obj.name, _TAIL))
+            names = [cur.name]
+    if not isinstance(names, list) or not names or any(not isinstance(n, str) for n in names):
+        raise MifOpError("actions is a non-empty list of action names. %s" % _TAIL)
+    missing = [n for n in names if bpy.data.actions.get(n) is None]
+    if missing:
+        raise MifOpError("no action named %s. %s" % (", ".join(missing[:10]), _TAIL))
+    pbs = pick_bones(obj, params, "changed", default_all=True)
+    if not pbs:
+        raise MifOpError("'%s' has no bones to scan. %s" % (obj.name, _TAIL))
+    turn_lim = take_float(params, "turnDeg", default=60.0)
+    twist_lim = take_float(params, "twistDeg", default=90.0)
+    fade_above = take_float(params, "fadeBonesAboveDeg", default=15.0)
+    for k, v in (("turnDeg", turn_lim), ("twistDeg", twist_lim), ("fadeBonesAboveDeg", fade_above)):
+        if not 0.0 < v <= 180.0:
+            raise MifOpError("%s is a turn in degrees, over 0 and at most 180, got %r. %s" % (k, v, _TAIL))
+    n_fade = finite_int(params.get("fadeFrames", 6), "fadeFrames")
+    passes = finite_int(params.get("maxPasses", 3), "maxPasses")
+    max_rows = finite_int(params.get("maxRows", 200), "maxRows")
+    if n_fade < 1 or passes < 1 or max_rows < 1:
+        raise MifOpError("fadeFrames, maxPasses and maxRows are whole numbers of at least 1. %s" % _TAIL)
+    fr = params.get("frameRange")
+    if fr is not None and (not isinstance(fr, list) or len(fr) != 2
+                           or any(isinstance(v, bool) or not isinstance(v, int) for v in fr) or fr[1] <= fr[0]):
+        raise MifOpError("frameRange is [start, end] whole frames, end after start, got %r. %s" % (fr, _TAIL))
+    scene = bpy.context.scene
+    ad = obj.animation_data or obj.animation_data_create()
+    saved = (ad.action, scene.frame_current)
+    rows = []
+    try:
+        for name in names:
+            act = bpy.data.actions[name]
+            start, end = fr if fr is not None else (int(round(v)) for v in act.frame_range)
+            if end <= start:
+                raise MifOpError("action '%s' spans frame %d only - there is no frame before another to compare. %s"
+                                 % (name, start, _TAIL if not rows else "Actions before it were already done."))
+            _assign_action(obj, act)
+            scan = _ps_scan(obj, pbs, start, end, turn_lim, twist_lim)
+            row = {"action": name, "frameStart": start, "frameEnd": end, "frames": end - start + 1,
+                   "bonesScanned": len(pbs), "seams": scan["seams"][:max_rows], "seamCount": len(scan["seams"]),
+                   "flips": scan["flips"][:max_rows], "flipCount": len(scan["flips"]), "before": scan["stats"]}
+            if fix:
+                faded, n = [], 0
+                while (scan["seams"] or scan["flips"]) and n < passes:
+                    faded += _ps_fix(obj, pbs, scan, start, end, fade_above, n_fade)
+                    n += 1
+                    scan = _ps_scan(obj, pbs, start, end, turn_lim, twist_lim)
+                row.update(faded=faded[:max_rows * 4], fadedCount=len(faded), passes=n, after=scan["stats"],
+                           seamsLeft=scan["seams"][:max_rows], flipsLeft=scan["flips"][:max_rows])
+            rows.append(row)
+    finally:
+        _assign_action(obj, saved[0])
+        scene.frame_set(saved[1])
+    out = {"object": obj.name, "turnDeg": turn_lim, "twistDeg": twist_lim, "fixed": fix, "actions": rows,
+           "seamCount": sum(r["seamCount"] for r in rows), "flipCount": sum(r["flipCount"] for r in rows),
+           "maxTurnDeg": max(r["before"]["maxTurnDeg"] for r in rows),
+           "maxTwistJumpDeg": max(r["before"]["maxTwistJumpDeg"] for r in rows)}
+    if fix:
+        out["after"] = {"maxTurnDeg": max(r["after"]["maxTurnDeg"] for r in rows),
+                        "maxTwistJumpDeg": max(r["after"]["maxTwistJumpDeg"] for r in rows),
+                        "seamsLeft": sum(len(r["seamsLeft"]) for r in rows),
+                        "flipsLeft": sum(len(r["flipsLeft"]) for r in rows)}
+    return out
+
+
+
+# ----------------------------------------------------------------------------------------------------- self_clipping
+# FOUND 2026-11-19: a review flagged claws through a creature's chest; measured, 16-31 of 31 clips per body went past
+# 25 cm, up to 11.5 m. Physics capsules are too coarse a proxy (they flagged Idle), and a nearest-face or ray-parity test
+# flips at random on open, overlapping surfaces such as scale plates. What worked: a signed-distance grid of the BODY
+# region at the rest pose, inside decided by the generalized winding number (which stays well defined on an open or
+# self-overlapping surface), and each posed LIMB vertex mapped into the rest frame of its nearest body bone and sampled
+# there; the depth less the vertex's own rest depth is the clipping.
+#
+# THE WINDING NUMBER: w(p) = sum over triangles of the signed solid angle / 4 pi (van Oosterom-Strackee), 1 inside a
+# closed outward surface, 0 outside, 0.5 a half-space at an open edge. Exact near each cluster of triangles; far from a
+# cluster (over twice its radius) its dipole, sum(area vector) . (c - p) / |c - p|^3 - the first-order fast winding
+# number, which keeps a 40^3 grid over tens of thousands of triangles to seconds.
+
+_SC_KEYS = ("object", "armature", "limbBones", "bodyBones", "action", "actions", "frameRange", "frameStep",
+            "tolerance", "gridResolution", "maxRows")
+
+
+def _sc_wn_exact(p, tri):
+    import numpy as np   # noqa: PLC0415
+    a = tri[None, :, 0, :] - p[:, None, :]
+    b = tri[None, :, 1, :] - p[:, None, :]
+    c = tri[None, :, 2, :] - p[:, None, :]
+    la, lb, lc = (np.linalg.norm(x, axis=2) for x in (a, b, c))
+    det = np.einsum("ijk,ijk->ij", a, np.cross(b, c))
+    den = (la * lb * lc + np.einsum("ijk,ijk->ij", a, b) * lc + np.einsum("ijk,ijk->ij", b, c) * la
+           + np.einsum("ijk,ijk->ij", c, a) * lb)
+    return (2.0 * np.arctan2(det, den)).sum(axis=1) / (4.0 * math.pi)
+
+
+def _sc_winding(points, tris, bins=8):
+    """Generalized winding number of `tris` (T, 3, 3) at `points` (P, 3)."""
+    import numpy as np   # noqa: PLC0415
+    cent = tris.mean(axis=1)
+    lo, hi = cent.min(axis=0), cent.max(axis=0)
+    cell = np.maximum((hi - lo) / bins, 1e-9)
+    key = np.clip(((cent - lo) / cell).astype(int), 0, bins - 1)
+    key = key[:, 0] * bins * bins + key[:, 1] * bins + key[:, 2]
+    area_vec = 0.5 * np.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])
+    out = np.zeros(len(points))
+    for k in np.unique(key):
+        idx = np.nonzero(key == k)[0]
+        t = tris[idx]
+        c = cent[idx].mean(axis=0)
+        r = np.linalg.norm(t.reshape(-1, 3) - c, axis=1).max()
+        d = points - c
+        dist = np.linalg.norm(d, axis=1)
+        near = dist < 2.0 * r + 1e-9
+        far = ~near
+        if far.any():
+            nvec = area_vec[idx].sum(axis=0)
+            out[far] += (-(d[far] @ nvec)) / (4.0 * math.pi * dist[far] ** 3)
+        ni = np.nonzero(near)[0]
+        chunk = max(16, 1500000 // max(1, len(t)))      # bounds the (points x triangles) arrays to ~1.5M pairs
+        for s in range(0, len(ni), chunk):
+            sl = ni[s:s + chunk]
+            out[sl] += _sc_wn_exact(points[sl], t)
+    return out
+
+
+def _sc_sample(grid, lo, cell, pts):
+    """Trilinear sample of grid (nx, ny, nz) at pts (N, 3); outside the grid -> -inf (outside the body)."""
+    import numpy as np   # noqa: PLC0415
+    n = np.array(grid.shape)
+    u = (pts - lo) / cell
+    inside = np.all((u >= 0) & (u <= n - 1), axis=1)
+    u = np.clip(u, 0, n - 1 - 1e-6)
+    i0 = np.floor(u).astype(int)
+    f = u - i0
+    out = np.zeros(len(pts))
+    for dx in (0, 1):
+        for dy in (0, 1):
+            for dz in (0, 1):
+                w = ((f[:, 0] if dx else 1 - f[:, 0]) * (f[:, 1] if dy else 1 - f[:, 1])
+                     * (f[:, 2] if dz else 1 - f[:, 2]))
+                out += w * grid[np.minimum(i0[:, 0] + dx, n[0] - 1), np.minimum(i0[:, 1] + dy, n[1] - 1),
+                                np.minimum(i0[:, 2] + dz, n[2] - 1)]
+    out[~inside] = -np.inf
+    return out
+
+
+def _sc_dominant(obj, n_verts, deform):
+    """Each vertex's bone with the largest weight (None where it has none)."""
+    names = {g.index: g.name for g in obj.vertex_groups if g.name in deform}
+    dom = [None] * n_verts
+    for v in obj.data.vertices:
+        best, bw = None, 0.0
+        for ge in v.groups:
+            nm = names.get(ge.group)
+            if nm is not None and ge.weight > bw:
+                best, bw = nm, ge.weight
+        dom[v.index] = best
+    return dom
+
+
+def op_self_clipping(params):
+    """Measure how far a skinned mesh's limbs go into its own body, per clip and frame.
+
+    params:
+      object (str)          the skinned mesh (its armature modifier's armature, or armature)
+      limbBones [..]        the bones whose vertices are tested - each with every bone below it (an upper arm takes the
+                            forearm, hand and claws): hands, claws, forearms, a tail
+      bodyBones [..]        the body region (torso, head, legs) - exactly these bones; default every deforming bone not
+                            under limbBones
+      action | actions      the clips (default the armature's assigned one); each is assigned in turn and put back
+      frameRange [s, e]     default each clip's own; frameStep (default 1)
+      tolerance (float)     clipping past this is counted (default 0.5% of the body's rest diagonal)
+      gridResolution (int)  signed-distance cells along the body's longest side (default 40, 12-128)
+      maxRows (int)         frames listed per clip (default 200)
+    THE MEASURE: a signed-distance grid of the body region's triangles at the rest pose (inside by the generalized
+    winding number, so open or overlapping plates do not flip it); per frame each limb vertex, posed, is taken into the
+    rest frame of the body bone whose posed segment is nearest and sampled there; clipping = its depth less its own rest
+    depth (each floored at 0). Assumes the mesh's rest shape is bound at the armature's rest pose.
+    Reply per clip: deepest {clipping, vertex, frame, limbBone, bodyBone, worldPosition}, framesPastTolerance (and their
+    count), perFrameMax over the scanned frames' worst, and clear: for the deepest vertex, the swing at each joint of
+    its limb chain (up to three, the vertex's own bone first) that would lift it clear, estimated from the depth
+    gradient - {bone, swingDeg, axisWorld}. Refused: no limb or body vertices, a mesh whose modifiers change its
+    vertex count, a clip with no frames.
+    """
+    import numpy as np   # noqa: PLC0415
+    from mathutils import Vector   # noqa: PLC0415
+    from mathutils.bvhtree import BVHTree   # noqa: PLC0415
+    reject_unknown(params, _SC_KEYS, "self_clipping")
+    tail = "Nothing was measured."
+    obj = get_object(take(params, "object", required=True, kind=str))
+    if obj.type != "MESH":
+        raise MifOpError("'%s' is a %s - self_clipping measures a skinned MESH. %s" % (obj.name, obj.type, tail))
+    arm_name = take(params, "armature", default=None, kind=str)
+    if arm_name is None:
+        mod = next((m for m in obj.modifiers if m.type == "ARMATURE" and m.object is not None), None)
+        if mod is None:
+            raise MifOpError("'%s' has no armature modifier with an armature - name one with armature. %s"
+                             % (obj.name, tail))
+        arm = mod.object
+    else:
+        arm = get_object(arm_name)
+    if arm.type != "ARMATURE":
+        raise MifOpError("'%s' is not an armature. %s" % (arm.name, tail))
+    bones = arm.data.bones
+    limbs = params.get("limbBones")
+    if not isinstance(limbs, list) or not limbs or any(not isinstance(b, str) for b in limbs):
+        raise MifOpError("limbBones is a non-empty list of bone names (hands, forearms, a tail). %s" % tail)
+    missing = [b for b in limbs if bones.get(b) is None]
+    if missing:
+        raise MifOpError("'%s' has no bone %s. %s" % (arm.name, ", ".join(missing[:10]), tail))
+    limb_set = set()
+    for b in limbs:
+        limb_set.add(b)
+        limb_set.update(c.name for c in bones[b].children_recursive)
+    deform = {b.name for b in bones if b.use_deform}
+    body_raw = params.get("bodyBones")
+    if body_raw is None:
+        body_set = deform - limb_set
+    else:
+        if not isinstance(body_raw, list) or not body_raw or any(not isinstance(b, str) for b in body_raw):
+            raise MifOpError("bodyBones is a non-empty list of bone names. %s" % tail)
+        missing = [b for b in body_raw if bones.get(b) is None]
+        if missing:
+            raise MifOpError("'%s' has no bone %s. %s" % (arm.name, ", ".join(missing[:10]), tail))
+        both = sorted(set(body_raw) & limb_set)
+        if both:
+            raise MifOpError("%s %s both body and limb (under limbBones). %s"
+                             % (", ".join(both[:10]), "is" if len(both) == 1 else "are", tail))
+        body_set = set(body_raw)
+    names = params.get("actions")
+    if names is None:
+        one = take(params, "action", default=None, kind=str)
+        cur = arm.animation_data.action if arm.animation_data else None
+        names = [one] if one else ([cur.name] if cur else None)
+        if names is None:
+            raise MifOpError("'%s' has no action assigned - name the clips with action or actions. %s" % (arm.name, tail))
+    if not isinstance(names, list) or not names or any(not isinstance(n, str) for n in names):
+        raise MifOpError("actions is a non-empty list of action names. %s" % tail)
+    missing = [n for n in names if bpy.data.actions.get(n) is None]
+    if missing:
+        raise MifOpError("no action named %s. %s" % (", ".join(missing[:10]), tail))
+    step = finite_int(params.get("frameStep", 1), "frameStep")
+    res = finite_int(params.get("gridResolution", 40), "gridResolution")
+    max_rows = finite_int(params.get("maxRows", 200), "maxRows")
+    if step < 1 or not 12 <= res <= 128 or max_rows < 1:
+        raise MifOpError("frameStep >= 1, gridResolution 12-128, maxRows >= 1. %s" % tail)
+    fr = params.get("frameRange")
+    if fr is not None and (not isinstance(fr, list) or len(fr) != 2
+                           or any(isinstance(v, bool) or not isinstance(v, int) for v in fr) or fr[1] < fr[0]):
+        raise MifOpError("frameRange is [start, end] whole frames, got %r. %s" % (fr, tail))
+
+    # THE REST BODY, in armature space
+    me = obj.data
+    nv = len(me.vertices)
+    to_arm = arm.matrix_world.inverted() @ obj.matrix_world
+    rest = np.empty(nv * 3)
+    me.vertices.foreach_get("co", rest)
+    rest = rest.reshape(-1, 3)
+    m3 = np.array(to_arm.to_3x3())
+    tr = np.array(to_arm.translation)
+    rest = rest @ m3.T + tr
+    dom = _sc_dominant(obj, nv, deform)
+    is_body = np.array([d in body_set for d in dom])
+    limb_idx = np.array([i for i, d in enumerate(dom) if d in limb_set], dtype=int)
+    if not len(limb_idx):
+        raise MifOpError("no vertex of '%s' is weighted mostly to %s or the bones under them. %s"
+                         % (obj.name, ", ".join(limbs[:6]), tail))
+    me.calc_loop_triangles()
+    tri_v = np.empty(len(me.loop_triangles) * 3, dtype=int)
+    me.loop_triangles.foreach_get("vertices", tri_v)
+    tri_v = tri_v.reshape(-1, 3)
+    body_tris = tri_v[is_body[tri_v].sum(axis=1) >= 2]
+    if not len(body_tris):
+        raise MifOpError("no face of '%s' belongs to the body region (%d bones) - nothing to clip into. %s"
+                         % (obj.name, len(body_set), tail))
+    tris = rest[body_tris]
+    blo, bhi = tris.reshape(-1, 3).min(axis=0), tris.reshape(-1, 3).max(axis=0)
+    diag = float(np.linalg.norm(bhi - blo))
+    tol = params.get("tolerance")
+    tol = 0.005 * diag if tol is None else finite_float(tol, "tolerance")
+    if tol < 0:
+        raise MifOpError("tolerance is a distance of 0 or more. %s" % tail)
+    cell = float((bhi - blo).max()) / (res - 1)
+    pad = 2 * cell
+    lo = blo - pad
+    dims = np.ceil((bhi + pad - lo) / cell).astype(int) + 1
+    gx, gy, gz = (lo[i] + cell * np.arange(dims[i]) for i in range(3))
+    gpts = np.stack(np.meshgrid(gx, gy, gz, indexing="ij"), axis=-1).reshape(-1, 3)
+    wn = _sc_winding(gpts, tris)
+    bvh = BVHTree.FromPolygons([Vector(p) for p in rest], [tuple(int(i) for i in t) for t in body_tris])
+    dist = np.array([(bvh.find_nearest(Vector(p))[3] or 0.0) for p in gpts])
+    grid = np.where(wn > 0.5, dist, -dist).reshape(tuple(dims))   # depth: positive inside
+    rest_depth = np.maximum(_sc_sample(grid, lo, cell, rest[limb_idx]), 0.0)
+
+    body_bones = sorted(body_set & set(b.name for b in bones))
+    rest_inv = {b: np.array(bones[b].matrix_local) for b in body_bones}
+    limb_dom = [dom[i] for i in limb_idx]
+    scene = bpy.context.scene
+    ad = arm.animation_data or arm.animation_data_create()
+    saved = (ad.action, scene.frame_current)
+    clips = []
+    try:
+        for name in names:
+            act = bpy.data.actions[name]
+            start, end = fr if fr is not None else (int(round(v)) for v in act.frame_range)
+            frames = list(range(start, end + 1, step))
+            if not frames:
+                raise MifOpError("clip '%s' has no frames to measure. %s" % (name, tail))
+            _assign_action(arm, act)
+            per = []
+            deepest = None
+            for f in frames:
+                scene.frame_set(f)
+                dg = bpy.context.evaluated_depsgraph_get()
+                ev = obj.evaluated_get(dg)
+                em = ev.to_mesh()
+                try:
+                    if len(em.vertices) != nv:
+                        raise MifOpError("'%s' evaluates to %d vertices against %d in its mesh - a modifier other "
+                                         "than the armature changes the count; turn it off for the measure. %s"
+                                         % (obj.name, len(em.vertices), nv, tail))
+                    co = np.empty(nv * 3)
+                    em.vertices.foreach_get("co", co)
+                finally:
+                    ev.to_mesh_clear()
+                posed = co.reshape(-1, 3)[limb_idx] @ m3.T + tr
+                # the nearest posed body bone segment
+                heads = np.array([list(arm.pose.bones[b].head) for b in body_bones])
+                tails = np.array([list(arm.pose.bones[b].tail) for b in body_bones])
+                seg = tails - heads
+                t = np.clip(np.einsum("nbk,bk->nb", posed[:, None, :] - heads[None], seg)
+                            / np.maximum((seg * seg).sum(axis=1), 1e-12), 0, 1)
+                near = np.linalg.norm(posed[:, None, :] - (heads[None] + t[..., None] * seg[None]), axis=2).argmin(1)
+                mapped = np.empty_like(posed)
+                for bi, b in enumerate(body_bones):
+                    sel = near == bi
+                    if not sel.any():
+                        continue
+                    pm = np.array(arm.pose.bones[b].matrix)
+                    m = rest_inv[b] @ np.linalg.inv(pm)
+                    mapped[sel] = posed[sel] @ m[:3, :3].T + m[:3, 3]
+                depth = np.maximum(_sc_sample(grid, lo, cell, mapped), 0.0)
+                clip = np.maximum(depth - rest_depth, 0.0)
+                k = int(clip.argmax())
+                per.append((f, float(clip[k])))
+                if deepest is None or clip[k] > deepest["clipping"]:
+                    vi = int(limb_idx[k])
+                    wpos = arm.matrix_world @ Vector(posed[k])
+                    deepest = {"clipping": round(float(clip[k]), 5), "vertex": vi, "frame": f,
+                               "limbBone": limb_dom[k], "bodyBone": body_bones[int(near[k])],
+                               "worldPosition": [round(v, 5) for v in wpos],
+                               "_mapped": mapped[k].copy(), "_posed": posed[k].copy(), "_body": body_bones[int(near[k])]}
+            if deepest is not None and deepest["clipping"] > 0:
+                deepest["clear"] = _sc_clear(arm, deepest, grid, lo, cell, limb_set, step=cell)
+            if deepest is not None:
+                for k in ("_mapped", "_posed", "_body"):
+                    deepest.pop(k, None)
+            past = [f for f, c in per if c > tol]
+            clips.append({"action": name, "frameStart": frames[0], "frameEnd": frames[-1], "framesMeasured": len(frames),
+                          "deepest": deepest, "framesPastTolerance": past[:max_rows], "framesPastCount": len(past),
+                          "perFrameMax": [{"frame": f, "clipping": round(c, 5)} for f, c in per][:max_rows]})
+    finally:
+        _assign_action(arm, saved[0])
+        scene.frame_set(saved[1])
+    return {"object": obj.name, "armature": arm.name, "tolerance": round(tol, 6), "bodyDiagonal": round(diag, 5),
+            "gridCell": round(cell, 6), "gridDims": [int(d) for d in dims], "bodyTriangles": int(len(body_tris)),
+            "limbVertices": int(len(limb_idx)), "bodyBones": len(body_bones), "limbBones": sorted(limb_set)[:200],
+            "clips": clips, "clipsPastTolerance": sum(1 for c in clips if c["framesPastCount"]),
+            "worst": max((dict(c["deepest"], action=c["action"]) for c in clips if c["deepest"]),
+                         key=lambda d: d["clipping"], default=None)}
+
+
+def _sc_clear(arm, deepest, grid, lo, cell, limb_set, step):
+    """The swing at each joint of the deepest vertex's limb chain that would lift it clear, from the depth gradient:
+    the outward direction in the body bone's rest frame taken to the pose, and the turn about each joint's head that
+    moves the vertex that far along it (first order)."""
+    import numpy as np   # noqa: PLC0415
+    from mathutils import Vector   # noqa: PLC0415
+    q = deepest["_mapped"]
+    g = np.zeros(3)
+    for i in range(3):
+        e = np.zeros(3)
+        e[i] = step
+        a = _sc_sample(grid, lo, cell, np.array([q + e, q - e]))
+        a = np.where(np.isfinite(a), a, -1e9)
+        g[i] = (a[0] - a[1]) / (2 * step)
+    if np.linalg.norm(g) < 1e-12:
+        return []
+    out_rest = Vector(-g / np.linalg.norm(g))         # depth falls fastest this way: out of the body
+    b = deepest["_body"]
+    pm = arm.pose.bones[b].matrix
+    rm = arm.data.bones[b].matrix_local
+    out_dir = ((pm @ rm.inverted()).to_3x3() @ out_rest).normalized()
+    v = Vector(deepest["_posed"])
+    need = deepest["clipping"]
+    rows = []
+    pb = arm.pose.bones.get(deepest["limbBone"])
+    while pb is not None and pb.name in limb_set and len(rows) < 3:
+        r = v - pb.head
+        axis = r.cross(out_dir)
+        if axis.length > 1e-9 and r.length > 1e-9:
+            perp = axis.length / out_dir.length     # |r| sin(angle between r and the way out)
+            ang = math.degrees(math.asin(min(1.0, need / perp))) if perp > 1e-9 else None
+            aw = (arm.matrix_world.to_3x3() @ axis).normalized()
+            rows.append({"bone": pb.name, "swingDeg": None if ang is None else round(ang, 3),
+                         "axisWorld": [round(x, 5) for x in aw],
+                         "note": None if need <= perp else "the vertex is nearer this joint than it is deep - this "
+                                                           "joint alone cannot clear it"})
+        pb = pb.parent
+    return rows
+
+
+def _assign_action(obj, act):
+    ad = obj.animation_data or obj.animation_data_create()
+    ad.action = act
+    if act is not None and "action_slot" in ad.bl_rna.properties and ad.action_slot is None:
+        slot = next((s for s in act.slots if s.target_id_type == "OBJECT"), None)
+        if slot is not None:
+            ad.action_slot = slot
+
+
 OPS = {
     "motion_paths": op_motion_paths,
     "spread_pose": op_spread_pose,
@@ -1683,4 +2265,6 @@ OPS = {
     "edit_action_slots": op_edit_action_slots,
     "set_nla_strip": op_set_nla_strip,
     "match_world_transform": op_match_world_transform,
+    "pose_seams": op_pose_seams,
+    "self_clipping": op_self_clipping,
 }

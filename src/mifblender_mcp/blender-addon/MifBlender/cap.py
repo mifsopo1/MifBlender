@@ -1,4 +1,4 @@
-"""THE CHANGE CAP, Blender's half (docs/15_SAFETY_GATE_AND_JOURNAL.md section 6).
+"""THE CHANGE CAP, Blender's half.
 
 Decided 2026-10-01: any single call that would change MORE than N distinct things must not write. It answers the list
 of what it would change instead, and only a commit carrying that answer's previewId applies it - so the user always sees
@@ -16,8 +16,8 @@ OVER THE CAP:
   - batch answers a PREVIEW: ok:false, capped:true, the targets, a previewId. batch called with {previewId} alone
     commits exactly the stored request, once, within 10 minutes - refused, writing nothing, when a target named then
     no longer exists (or a name it would create is taken now).
-  - an op with a bulk preview plan (ops_preview.specs(): transform_objects, purge_orphans, fit_mesh and every other op
-    with a PREVIEW entry) answers its own preview - every change with its value before - and commits through that
+  - an op with a bulk preview plan (ops_preview.specs(): transform_objects, purge_orphans, clear_scene, fit_mesh and every
+    other op with a PREVIEW entry) answers its own preview - every change with its value before - and commits through that
     handshake: planned again, refused on any difference, read back, rolled back on a mismatch.
   - the other many-target ops (COUNTERS below without a preview) REFUSE, naming the count and the two ways on: split
     the call, or have the user raise the file's cap. separate_mesh is counted from what the separate WILL make (the
@@ -118,6 +118,8 @@ def _type_filter(params):
 
 
 def _count_clear_scene(params):
+    if params.get("dryRun") is True:
+        return []
     want = _type_filter(params)
     return ["object:" + o.name for o in bpy.data.objects if not want or o.type == want]
 
@@ -146,6 +148,13 @@ def _count_delete_collection(params):
         keys += ["object:" + o.name for o in coll.all_objects]
         keys += ["collection:" + c.name for c in coll.children_recursive]
     return keys
+
+
+def _count_set_object_visibility(params):
+    # objects, pattern or collection: each object the selector matches is a target (ops_scene.visibility_selection)
+    from .ops_scene import visibility_selection
+    objs, _sel = visibility_selection(params)
+    return ["object:" + o.name for o in objs]
 
 
 def _count_join_objects(params):
@@ -233,6 +242,8 @@ def _count_separate_mesh(params):
     if obj is None or obj.type != "MESH":
         return []                                       # the op refuses it, naming the object
     mode = str(params.get("mode") or "loose").lower()
+    if params.get("mode") is None and any(params.get(k) is not None for k in ("faces", "vertexGroup", "loop")):
+        mode = "selection"                              # as the op infers it (op_separate_mesh)
     if mode == "selection":
         return ([] if params.get("duplicate") is True else ["object:" + obj.name]) + ["new:separate_mesh.part"]
     if mode not in ("loose", "material"):
@@ -256,10 +267,15 @@ COUNTERS = {
     "transform_objects": _count_transform_objects,
     "fit_mesh": _count_fit_mesh,
     "separate_mesh": _count_separate_mesh,
+    "set_object_visibility": _count_set_object_visibility,
 }
 # batch's preview is the cap's own (a fingerprint of its targets); every op with a plan in ops_preview.py previews through
 # the bulk preview handshake instead (gate below).
-PREVIEWABLE = ("batch",)
+# join_objects, separate_mesh and delete_object PREVIEW TOO (found 2026-11-18): a 54-keycap join, a 29-part character's
+# separate and a 170-part delete were refused over the cap with no way on but batches, and a driver that missed the
+# refusal went on as if the delete had happened. Each now answers the targets and a previewId, and {previewId} alone runs
+# exactly the stored request once - the decided cap is kept, the person still sees the list, and it is one call more.
+PREVIEWABLE = ("batch", "join_objects", "separate_mesh", "delete_object")
 
 
 def _generic(op, params, index):
@@ -343,6 +359,9 @@ def _fingerprint(op, params, keys):
         row = [k, found is not None, getattr(found, "type", None)]
         if op == "transform_objects" and found is not None:
             row.append([round(v, 5) for col in found.matrix_world for v in col])
+        if op in ("join_objects", "separate_mesh") and getattr(found, "type", None) == "MESH":
+            # The geometry a join merges or a separate splits: a commit over a mesh edited since is refused.
+            row.append([len(found.data.vertices), len(found.data.polygons)])
         out.append(row)
     return out
 
@@ -367,6 +386,13 @@ def new_id():
 
 def _whose(cap):
     return {"file": "this file's cap", "env": "the cap MIF_CHANGE_CAP sets"}.get(cap["source"], "the default cap")
+
+
+# THE THIRD WAY ON, NAMED (FOUND 2026-11-26 by a modelling job): a preview answer named the previewId handshake and
+# smaller calls, never the step that raises the cap itself, so a caller clearing a large scratch scene did not learn
+# that project_mode changeCap exists. Every preview answer now ends with it.
+_RAISE = (" Or have the user raise the file's cap with project_mode changeCap (MCP: mif_project_mode change_cap; 0 turns "
+          "it off), then send the call again.")
 
 
 def gate(op, params):
@@ -402,7 +428,7 @@ def gate(op, params):
         raise MifCapped(
             "this would change %d items, over %s of %d, so nothing was written - review the list (changes), then "
             "commit with {\"previewId\": \"%s\"} on %s, and nothing else. To do it in smaller steps, send at most %d "
-            "items per call." % (len(keys), _whose(cap), cap["cap"], pid, op, cap["cap"]), planned)
+            "items per call.%s" % (len(keys), _whose(cap), cap["cap"], pid, op, cap["cap"], _RAISE), planned)
     if op in PREVIEWABLE:
         _prune()
         pid = new_id()
@@ -410,29 +436,26 @@ def gate(op, params):
         _PREVIEWS[pid] = {"op": op, "params": dict(params), "keys": keys, "fingerprint": _fingerprint(op, params, keys),
                           "created": now, "expires": now + PREVIEW_TTL, "spent": False}
         payload.update(previewId=pid, expiresInSeconds=int(PREVIEW_TTL), dryRun=True)
+        why = ""
+        if op == "join_objects":
+            # A JOIN WRITES ONE OBJECT, yet a consuming join removes each source, and each removal counts.
+            payload["removedSources"] = len(keys) - 1
+            why = (" A consuming join counts each source it removes as well as the target; keepSources true joins "
+                   "copies and counts as the one object it writes.")
+        elif op == "separate_mesh":
+            payload["newObjects"] = len(keys) - 1
+            why = (" separate_mesh mode %s would leave '%s' as %d objects (%d new); one separate cannot be split, but "
+                   "the pieces can come off a few at a time with mode selection (faces)."
+                   % (str(params.get("mode") or "loose").lower(), params.get("object", params.get("name")),
+                      len(keys), len(keys) - 1))
+        steps = ("" if op == "separate_mesh" else
+                 " To do it in smaller steps, send at most %d items per call." % cap["cap"])
         raise MifCapped(
             "this would change %d items, over %s of %d, so nothing was written - review the list (targets), then "
-            "commit with {\"previewId\": \"%s\"} on %s, and nothing else. To do it in smaller steps, send at most %d "
-            "items per call." % (len(keys), _whose(cap), cap["cap"], pid, op, cap["cap"]), payload)
+            "commit with {\"previewId\": \"%s\"} on %s, and nothing else.%s%s%s"
+            % (len(keys), _whose(cap), cap["cap"], pid, op, why, steps, _RAISE), payload)
     if op == "import_mesh":
         raise MifCapped(_import_mesh_refusal(keys, cap, payload, params), payload)
-    if op == "separate_mesh":
-        # ONE SEPARATE CANNOT BE SPLIT into smaller calls, so "split it" is not the way on here.
-        payload["newObjects"] = len(keys) - 1
-        raise MifCapped(
-            "separate_mesh mode %s would leave '%s' as %d objects (%d new), over %s of %d, so nothing was written. Take "
-            "the pieces off a few at a time with mode selection (faces), or ask the user to raise the file's cap "
-            "(mif_project_mode change_cap)." % (str(params.get("mode") or "loose").lower(),
-                                                params.get("object", params.get("name")), len(keys), len(keys) - 1,
-                                                _whose(cap), cap["cap"]), payload)
-    if op == "join_objects":
-        # A CONSUMING JOIN REMOVES EVERY SOURCE, and each removal counts. keepSources is the one-write way on.
-        payload["removedSources"] = len(keys) - 1
-        raise MifCapped(
-            "join_objects consumes its %d source(s): with the target that is %d items, over %s of %d, so nothing was "
-            "written. keepSources true joins copies and leaves the sources, which counts as the one object it writes; "
-            "or join in calls of at most %d sources, or ask the user to raise the file's cap (mif_project_mode "
-            "change_cap)." % (len(keys) - 1, len(keys), _whose(cap), cap["cap"], cap["cap"] - 1), payload)
     raise MifCapped(
         "this would change %d items, over %s of %d, and %s has no preview, so nothing was written. Split it into calls "
         "of at most %d items, or ask the user to raise the file's cap (mif_project_mode change_cap)."

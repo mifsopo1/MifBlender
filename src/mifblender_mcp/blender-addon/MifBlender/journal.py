@@ -32,7 +32,7 @@ user with three Blenders should have one place to look:
   Windows  %LOCALAPPDATA%\\MifBridge\\Blender\\journal.jsonl
   macOS    ~/Library/Logs/MifBridge/Blender/journal.jsonl
   other    $XDG_STATE_HOME/mifbridge/blender/journal.jsonl   (~/.local/state when XDG_STATE_HOME is unset)
-MIF_BLENDER_JOURNAL names another file. run_blender_suites points the Blenders it starts at a scratch one, so a
+MIF_BLENDER_JOURNAL names another file. the suite runner points the Blenders it starts at a scratch one, so a
 certification run does not bury the user's own sessions.
 
 SEVERAL BLENDERS WRITE ONE FILE, so every record carries its pid and a per-process seq, and the file is opened for

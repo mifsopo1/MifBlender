@@ -72,6 +72,12 @@ PRINCIPLED_ALIASES = {
     "transmission": ("Transmission Weight", "Transmission"),
     "sheen":        ("Sheen Weight", "Sheen"),
     "clearcoat":    ("Coat Weight", "Clearcoat"),
+    # THE COAT'S OWN SETTINGS (2026-11-25): clearcoat was the weight alone, so a wet eye or a lacquer lived with the
+    # default coat roughness (0.03). 4.0 and later have Coat Roughness, Coat IOR and Coat Tint; 3.6 has Clearcoat
+    # Roughness and neither of the others, which are refused by name there.
+    "coatRoughness": ("Coat Roughness", "Clearcoat Roughness"),
+    "coatIor":      ("Coat IOR",),
+    "coatTint":     ("Coat Tint",),
     "anisotropic":  ("Anisotropic",),
     # SUBSURFACE (2026-10-06): skin, wax and glaze. 4.0 and later call the weight "Subsurface Weight" and add Subsurface
     # Scale; 3.6 has "Subsurface" and no scale, so subsurfaceScale resolves on no socket there and is refused by name.
@@ -175,6 +181,21 @@ def _material_json(mat, deep=False, nodes=False):
     out["settings"] = {key: (round(float(getattr(mat, attr)), 6) if isinstance(getattr(mat, attr), float)
                              else getattr(mat, attr))
                        for key, (attr, _builds) in _MATSET_MAP.items() if attr in mat.bl_rna.properties}
+    # BLEND METHOD READ BESIDE WHAT DECIDES IT (2026-11-25). From 4.2 blend_method is a lossy shim over
+    # surface_render_method: OPAQUE, CLIP and HASHED all store as HASHED (set_material_settings measured it), so a
+    # polished steel never given alpha read "HASHED" and was blamed for a double-sided glTF. The glTF exporter takes
+    # doubleSided from use_backface_culling, which a new material leaves off - measured on 4.2 and 5.0.1: doubleSided
+    # true, and absent after set_material_settings backfaceCulling true.
+    if "surface_render_method" in mat.bl_rna.properties:
+        out["surfaceRenderMethod"] = mat.surface_render_method
+        if out["blendMethod"] == "HASHED" and mat.surface_render_method == "DITHERED":
+            out["blendMethodNote"] = ("on this Blender blend_method reads HASHED for every opaque, clipped or hashed "
+                                      "material; surfaceRenderMethod DITHERED is what it renders with - opaque unless "
+                                      "its alpha is below 1")
+    out["exportsDoubleSided"] = not bool(mat.use_backface_culling)
+    if out["exportsDoubleSided"]:
+        out["doubleSidedNote"] = ("backface culling is off, so a glTF export writes this material doubleSided; "
+                                  "set_material_settings backfaceCulling true exports it single-sided")
     # THE VIEWPORT DISPLAY (what Solid view and an asset preview show), the read twin of set_material_properties'
     # viewportColor, viewportMetallic and viewportRoughness (2026-10-05)
     out["viewport"] = _viewport_read(mat)
@@ -204,7 +225,9 @@ def _material_json(mat, deep=False, nodes=False):
     wear = [n for n in tree_nodes if n.name.startswith("MifWear")]
     if wear:
         out["weathering"] = {"nodes": len(wear),
-                             "masks": sorted(n.name[8:] for n in wear if n.name[8:] in ("Wear", "Grime")),
+                             "masks": sorted(n.name[8:] for n in wear if n.name[8:] in ("Wear", "Grime", "Rust",
+                                                                                         "Scratch")),
+                             "outputs": sorted(n.name for n in wear if n.name[8:] in _WEAR_OUTPUTS.values()),
                              "regions": sorted(n.attribute_name[len(_WEAR_ATTR):] for n in wear
                                                if n.type == "ATTRIBUTE" and n.attribute_name.startswith(_WEAR_ATTR)),
                              "edgeSource": ("bevel" if any(n.type == "BEVEL" for n in wear) else
@@ -428,6 +451,20 @@ def op_create_material(params):
             # THE MISSING INPUT ABOVE IS STILL FATAL EVEN HERE, deliberately. A socket that does not
             # exist on this Blender means the caller is asking for something this version cannot do,
             # which is a different fact from "that input is driven by a node".
+            # UNDER A WEATHERING CHAIN the value lives on the chain's named constant (MifWear BaseColor /
+            # BaseRoughness / BaseMetallic), the same held-value path set_material_properties writes - so re-running a
+            # material script with new colors works on a weathered material (2026-11-25; it refused "LINKED to MifWear
+            # GrimeMix"). A chain over a texture of its own has no constant: skipped with skipLinkedInputs, else refused.
+            if not created and sock.is_linked and sock.links[0].from_node.name.startswith(_WEAR_PREFIX):
+                try:
+                    held = _wear_held_value(mat, sock)
+                except MifOpError:
+                    if not skip_linked:
+                        raise
+                    skipped[prop] = sock.links[0].from_node.name
+                    continue
+                staged.append((prop, held, _coerce_socket(sock, prop, val)))
+                continue
             if skip_linked and sock.is_linked:
                 src = sock.links[0].from_node if sock.links else None
                 skipped[prop] = src.name if src else "(unknown node)"
@@ -436,7 +473,8 @@ def op_create_material(params):
             staged.append((prop, sock, _coerce_socket(sock, prop, val)))
         for prop, sock, value in staged:
             sock.default_value = value
-            applied[prop] = sock.name
+            applied[prop] = ("%s.%s" % (sock.node.name, sock.name) if sock.node.name.startswith(_WEAR_PREFIX)
+                             else sock.name)
     except MifOpError:
         if created:
             bpy.data.materials.remove(mat)
@@ -444,7 +482,7 @@ def op_create_material(params):
 
     if source is not None:
         # THROUGH assign_id_name: a plain `mat.name = name` on 3.6 can rename the material that already held the name
-        # (ledger B12) - the copy takes the suffix on every build instead.
+        # - the copy takes the suffix on every build instead.
         assign_id_name(mat, name, bpy.data.materials)
     out = _material_json(mat)
     out["created"] = created
@@ -506,6 +544,9 @@ def _coerce_socket(sock, prop, val):
             raise MifOpError("'%s' expects %d components on this Blender, got %d"
                              % (prop, want, len(vals)))
         return vals
+    if prop == "clearcoat" and isinstance(val, dict):
+        raise MifOpError("'clearcoat' is the coat's weight, a number; coatRoughness, coatIor and coatTint set the rest "
+                         "of the coat, got %r. NOTHING was changed." % (val,))
     return finite_float(val, prop)
 
 
@@ -571,10 +612,18 @@ def _viewport_read(mat):
 # Bevel and Pointiness are Cycles nodes: EEVEE shades the chain without edge wear (AO grime still shows). Baking is
 # Cycles, so bake_texture_set (BASE_COLOR, ROUGHNESS, METALLIC, NORMAL) carries the whole look to any engine.
 _WEAR_PREFIX = "MifWear"
-_WEAR_KEYS = ("edgeWear", "grime", "roughnessVariation", "colorVariation", "scale", "seed", "regions", "objects",
-              "armature")
+_WEAR_KEYS = ("edgeWear", "grime", "rust", "scratches", "roughnessVariation", "colorVariation", "scale", "seed",
+              "regions", "objects", "armature")
 _WEAR_EDGE_KEYS = ("amount", "width", "source", "color", "roughness", "metallic", "bump")
 _WEAR_GRIME_KEYS = ("amount", "distance", "color", "roughness")
+# RUST AND SCRATCHES (2026-11-25): a worn-metal prop needed a hand-built ~30-node chain per material for them. Both are off
+# unless given; true takes the defaults. rust.scale and scratches.density multiply the chain's own scale.
+_WEAR_RUST_KEYS = ("amount", "scale", "streaks", "color", "roughness", "bump")
+_WEAR_SCRATCH_KEYS = ("amount", "density", "length", "direction", "color", "roughness", "metallic", "bump")
+# THE STABLE INTERFACE: what feeds each Principled input is a Reroute of this name whatever layers are on, and a later
+# weathering call updates the chain IN PLACE (the same node names), so a link made into or out of a MifWear node survives
+# a re-tune. The masks are MifWear Wear, Grime, Rust and Scratch (each a 0-1 Map Range result) when that layer is on.
+_WEAR_OUTPUTS = {"Base Color": "ColorOut", "Roughness": "RoughOut", "Metallic": "MetalOut", "Normal": "NormalOut"}
 
 
 def _wear_unit(block, key, default, lo, hi, where):
@@ -609,13 +658,13 @@ def _weathering_plan(raw):
     if raw is True:
         raw = {}
     if not isinstance(raw, dict):
-        raise MifOpError("weathering is {edgeWear, grime, roughnessVariation, colorVariation, scale, seed}, true for "
-                         "the defaults, or false to remove it; got %r. NOTHING was changed." % (raw,))
+        raise MifOpError("weathering is {edgeWear, grime, rust, scratches, roughnessVariation, colorVariation, scale, "
+                         "seed}, true for the defaults, or false to remove it; got %r. NOTHING was changed." % (raw,))
     bad = sorted(set(raw) - set(_WEAR_KEYS))
     if bad:
         raise MifOpError("weathering has no %s - its keys are %s. NOTHING was changed."
                          % (", ".join(bad), ", ".join(_WEAR_KEYS)))
-    plan = {"remove": False}
+    plan = {"remove": False, "given": set()}
     for key, keys in (("edgeWear", _WEAR_EDGE_KEYS), ("grime", _WEAR_GRIME_KEYS)):
         blk = raw.get(key, True)
         if blk is False or blk is None:
@@ -636,6 +685,8 @@ def _weathering_plan(raw):
              "roughness": _wear_unit(blk, "roughness", None, 0.0, 1.0, where)}
         if key == "edgeWear":
             p["width"] = _wear_unit(blk, "width", 0.02, 1e-4, 10.0, where)
+            if blk.get("width") is not None:
+                plan["given"].add("edgeWear.width")
             p["metallic"] = _wear_unit(blk, "metallic", None, 0.0, 1.0, where)
             p["bump"] = _wear_unit(blk, "bump", 0.0, 0.0, 1.0, where)
             src = str(blk.get("source", "bevel")).lower()
@@ -646,14 +697,54 @@ def _weathering_plan(raw):
             p["source"] = src
         else:
             p["distance"] = _wear_unit(blk, "distance", 0.2, 1e-4, 100.0, where)
+            if blk.get("distance") is not None:
+                plan["given"].add("grime.distance")
             if p["roughness"] is None:
                 p["roughness"] = 0.9
             if p["color"] is None:
                 p["color"] = [0.035, 0.028, 0.02, 1.0]
         plan[key] = p
+    for key, keys in (("rust", _WEAR_RUST_KEYS), ("scratches", _WEAR_SCRATCH_KEYS)):
+        blk = raw.get(key)
+        if blk is None or blk is False:
+            plan[key] = None
+            continue
+        if blk is True:
+            blk = {}
+        if not isinstance(blk, dict):
+            raise MifOpError("weathering.%s is {%s}, true or false; got %r. NOTHING was changed."
+                             % (key, ", ".join(keys), blk))
+        bad = sorted(set(blk) - set(keys))
+        if bad:
+            raise MifOpError("weathering.%s has no %s - its keys are %s. NOTHING was changed."
+                             % (key, ", ".join(bad), ", ".join(keys)))
+        where = "weathering.%s" % key
+        if key == "rust":
+            p = {"amount": _wear_unit(blk, "amount", 0.4, 0.0, 1.0, where),
+                 "scale": _wear_unit(blk, "scale", 1.0, 0.01, 100.0, where),
+                 "streaks": _wear_unit(blk, "streaks", 0.5, 0.0, 1.0, where),
+                 "color": _wear_color(blk, "color", where) or [0.23, 0.085, 0.03, 1.0],
+                 "roughness": _wear_unit(blk, "roughness", 0.85, 0.0, 1.0, where),
+                 "bump": _wear_unit(blk, "bump", 0.3, 0.0, 1.0, where)}
+        else:
+            direction = str(blk.get("direction", "any")).lower()
+            if direction not in ("any", "x", "y", "z"):
+                raise MifOpError("weathering.scratches.direction is any (default: every way) or x, y or z (the object "
+                                 "axis they run along); got %r. NOTHING was changed." % blk.get("direction"))
+            p = {"amount": _wear_unit(blk, "amount", 0.5, 0.0, 1.0, where),
+                 "density": _wear_unit(blk, "density", 1.0, 0.01, 100.0, where),
+                 "length": _wear_unit(blk, "length", 4.0, 1.0, 50.0, where),
+                 "direction": direction,
+                 "color": _wear_color(blk, "color", where),
+                 "roughness": _wear_unit(blk, "roughness", None, 0.0, 1.0, where),
+                 "metallic": _wear_unit(blk, "metallic", None, 0.0, 1.0, where),
+                 "bump": _wear_unit(blk, "bump", 0.2, 0.0, 1.0, where)}
+        plan[key] = p
     plan["roughnessVariation"] = _wear_unit(raw, "roughnessVariation", 0.15, 0.0, 1.0, "weathering")
     plan["colorVariation"] = _wear_unit(raw, "colorVariation", 0.12, 0.0, 1.0, "weathering")
     plan["scale"] = _wear_unit(raw, "scale", 4.0, 1e-3, 1e4, "weathering")
+    if raw.get("scale") is not None:
+        plan["given"].add("scale")
     plan["seed"] = _wear_unit(raw, "seed", 0.0, -1e6, 1e6, "weathering")
     plan["regions"] = _wear_regions_plan(raw.get("regions"))
     for key in ("objects", "armature"):
@@ -671,10 +762,109 @@ def _weathering_plan(raw):
         raise MifOpError("weathering.armature is an armature's name, got %r. NOTHING was changed." % (arm,))
     plan["armature"] = arm
     if plan["edgeWear"] is None and plan["grime"] is None and not plan["roughnessVariation"] \
-            and not plan["colorVariation"] and not plan["regions"]:
+            and not plan["colorVariation"] and not plan["regions"] and plan["rust"] is None and plan["scratches"] is None:
         raise MifOpError("weathering with edgeWear and grime off and no variation adds nothing - pass false to remove "
                          "it. NOTHING was changed.")
     return plan
+
+
+_WEAR_THIN_MAX_VERTS = 400000          # loose parts are found per object up to this many vertices; past it, not measured
+
+
+def _wear_thinnest(objs):
+    """(object name, thickness in metres) of the thinnest loose part - the smallest extent of its world bounding box - or
+    None. A plate is thin along its own normal, which an axis-aligned box measures when the plate is axis-aligned."""
+    import numpy as np                                               # noqa: PLC0415
+    best = None
+    for o in objs:
+        me = o.data
+        nv = len(me.vertices)
+        if not nv or nv > _WEAR_THIN_MAX_VERTS:
+            continue
+        co = np.empty(nv * 3, dtype=np.float64)
+        me.vertices.foreach_get("co", co)
+        co = co.reshape(nv, 3)
+        mw = np.array(o.matrix_world, dtype=np.float64)
+        co = co @ mw[:3, :3].T + mw[:3, 3]
+        ed = np.empty(len(me.edges) * 2, dtype=np.int64)
+        me.edges.foreach_get("vertices", ed)
+        parent = np.arange(nv)
+
+        def root(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+        for a, b in ed.reshape(-1, 2):
+            ra, rb = root(a), root(b)
+            if ra != rb:
+                parent[ra] = rb
+        roots = np.array([root(i) for i in range(nv)])
+        for r in np.unique(roots):
+            pts = co[roots == r]
+            if len(pts) < 4:
+                continue
+            t = float((pts.max(axis=0) - pts.min(axis=0)).min())
+            if t > 1e-6 and (best is None or t < best[1]):
+                best = (o.name, t)
+    return best
+
+
+def _wear_size_defaults(mat, plan):
+    """Defaults from the object's size, and the width checked against the thinnest part (2026-11-25).
+
+    MEASURED BY TWO BUILDS: edgeWear width 0.02 m on a 0.4 m prop turned every thin plate (8 mm visor cheeks, a 24 mm
+    keyboard front) into "edge" - bare metal everywhere; grime distance 0.2 and scale 4 were tuned on a 1 m prop. So a
+    value not given comes from the meshes using the material (weathering.objects narrows them): size = the median of
+    their largest world dimensions, width 0.02 x size (2 mm to 5 cm) and at most 0.35 x the thinnest loose part,
+    distance 0.2 x size (2 cm to 1 m), scale 4 / the median largest LOCAL dimension (the noise is in object space; 0.25
+    to 100). A 1 m object keeps the old defaults. Returns (resolved, warnings)."""
+    objs = [o for o in bpy.data.objects if o.type == "MESH" and any(sl.material == mat for sl in o.material_slots)]
+    if plan.get("objects"):
+        objs = [o for o in objs if o.name in plan["objects"]] or objs
+    resolved, warns = {}, []
+    if not objs:
+        resolved["from"] = "the fixed defaults: no mesh uses the material, so it has no size"
+        return resolved, warns
+    world = sorted(max(o.dimensions) for o in objs)
+    size = world[len(world) // 2]
+    local = []
+    for o in objs:
+        bb = [tuple(v) for v in o.bound_box]
+        local.append(max(max(c[i] for c in bb) - min(c[i] for c in bb) for i in range(3)))
+    local.sort()
+    lsize = local[len(local) // 2]
+    thin = _wear_thinnest(objs)
+    resolved.update(objectSize=round(size, 6), objects=len(objs),
+                    thinnestPart=({"object": thin[0], "thickness": round(thin[1], 6)} if thin else None))
+    edge, grime = plan.get("edgeWear"), plan.get("grime")
+    given = plan.get("given") or set()
+    if edge is not None:
+        if "edgeWear.width" in given:
+            resolved["edgeWear.width"] = {"value": edge["width"], "from": "given"}
+        else:
+            w = min(max(0.02 * size, 0.002), 0.05)
+            why = "0.02 x the object's size %.3g m" % size
+            if thin and w > 0.35 * thin[1]:
+                w, why = max(0.35 * thin[1], 0.0005), "0.35 x the thinnest part (%s, %.3g m)" % (thin[0], thin[1])
+            edge["width"] = round(w, 6)
+            resolved["edgeWear.width"] = {"value": edge["width"], "from": why}
+        if thin and edge["width"] > 0.5 * thin[1]:
+            warns.append("edgeWear width %.3g m is over half the thickness of a part of '%s' (%.3g m): the whole of "
+                         "that part reads as edge - bare edge color everywhere. Narrow it, or leave width unset."
+                         % (edge["width"], thin[0], thin[1]))
+    if grime is not None:
+        if "grime.distance" in given:
+            resolved["grime.distance"] = {"value": grime["distance"], "from": "given"}
+        else:
+            grime["distance"] = round(min(max(0.2 * size, 0.02), 1.0), 6)
+            resolved["grime.distance"] = {"value": grime["distance"], "from": "0.2 x the object's size %.3g m" % size}
+    if "scale" in given:
+        resolved["scale"] = {"value": plan["scale"], "from": "given"}
+    elif lsize > 1e-6:
+        plan["scale"] = round(min(max(4.0 / lsize, 0.25), 100.0), 6)
+        resolved["scale"] = {"value": plan["scale"], "from": "4 / the object's local size %.3g" % lsize}
+    return resolved, warns
 
 
 def _wear_held_value(mat, sock):
@@ -701,35 +891,78 @@ def _weathering_remove(mat, bsdf):
     if not nodes:
         return []
     restored = []
-    # (principled input, the chain node whose input holds the original source, that input's identifier, const node)
-    entries = (("Base Color", "MifWear ColorVar", "Color", "MifWear BaseColor"),
-               ("Roughness", "MifWear RoughVar", None, "MifWear BaseRoughness"),
-               ("Metallic", "MifWear MetalMix", "A_Float", "MifWear BaseMetallic"),
-               ("Normal", "MifWear Bump", "Normal", None))
-    for input_name, holder, ident, const in entries:
+    originals = _wear_originals(tree, nodes)
+    for input_name, orig in originals.items():
         sock = bsdf.inputs.get(input_name)
-        node = nodes.get(holder)
-        if sock is None or node is None:
+        if sock is None:
             continue
-        hin = node.inputs[0] if ident is None else next(s for s in node.inputs if s.identifier == ident)
-        src = hin.links[0].from_socket if hin.is_linked else None
         for lk in list(sock.links):
             tree.links.remove(lk)
-        if src is not None and src.node.name == const:
-            sock.default_value = (tuple(src.node.outputs[0].default_value) if input_name == "Base Color"
-                                  else float(src.node.outputs[0].default_value))
-        elif src is not None and not src.node.name.startswith(_WEAR_PREFIX):
-            tree.links.new(src, sock)
+        _wear_restore(tree, sock, orig)
         restored.append(input_name)
     for n in list(_wear_nodes(tree)):
         tree.nodes.remove(n)
     return restored
 
 
+# (principled input, the chain nodes that may hold its original source - the first present wins, in chain order -, that
+# input's identifier, the const node a constant was moved onto)
+_WEAR_ENTRIES = (("Base Color", ("MifWear ColorVar",), "Color", "MifWear BaseColor"),
+                 ("Roughness", ("MifWear RoughVar",), None, "MifWear BaseRoughness"),
+                 ("Metallic", ("MifWear MetalMix",), "A_Float", "MifWear BaseMetallic"),
+                 ("Normal", ("MifWear Bump", "MifWear ScratchBump", "MifWear RustBump"), "Normal", None))
+
+
+def _wear_originals(tree, nodes):
+    """{principled input: ("const", value) | ("link", socket) | ("none", None)} for every input the chain drives - what
+    fed it before the chain. Read before a rebuild or a removal, so either can put it back."""
+    out = {}
+    for input_name, holders, ident, const in _WEAR_ENTRIES:
+        node = next((nodes[h] for h in holders if h in nodes), None)
+        if node is None:
+            continue
+        hin = node.inputs[0] if ident is None else next(s for s in node.inputs if s.identifier == ident)
+        src = hin.links[0].from_socket if hin.is_linked else None
+        if src is not None and src.node.name == const:
+            v = src.node.outputs[0].default_value
+            out[input_name] = ("const", tuple(v) if input_name == "Base Color" else float(v))
+        elif src is not None and not src.node.name.startswith(_WEAR_PREFIX):
+            out[input_name] = ("link", src)
+        else:
+            out[input_name] = ("none", None)
+    return out
+
+
+def _wear_restore(tree, sock, orig):
+    kind, val = orig
+    if kind == "const":
+        sock.default_value = val
+    elif kind == "link":
+        tree.links.new(val, sock)
+
+
+# THE NODES A CALL MAY REUSE: set by _weathering_apply for the length of one build. A node of the same name and type is
+# reused in place - its own MifWear links into it dropped, links from anything else kept, its location kept - so a
+# re-tune keeps the names and the links a caller made; a node the new build does not reach is removed at the end.
+_WEAR_REUSE = {"old": {}, "touched": set()}
+
+
 def _wear_new(tree, frame, bl, name, loc, **props):
-    n = tree.nodes.new(bl)
-    n.name = n.label = "%s %s" % (_WEAR_PREFIX, name)
-    n.location = loc
+    full = "%s %s" % (_WEAR_PREFIX, name)
+    old = _WEAR_REUSE["old"].pop(full, None)
+    if old is not None and old.bl_idname == bl:
+        n = old
+        for sock in n.inputs:
+            for lk in list(sock.links):
+                if lk.from_node.name.startswith(_WEAR_PREFIX):
+                    tree.links.remove(lk)
+    else:
+        if old is not None:
+            tree.nodes.remove(old)
+        n = tree.nodes.new(bl)
+        n.name = n.label = full
+        n.location = loc
+    _WEAR_REUSE["touched"].add(full)
     n.parent = frame
     for k, v in props.items():
         setattr(n, k, v)
@@ -773,13 +1006,28 @@ def _wear_mix(tree, frame, name, loc, data_type, a, b, fac):
     return next(s for s in mx.outputs if s.identifier == "Result_" + kind)
 
 
-def _wear_source(tree, frame, sock, bl, name, loc):
-    """What feeds a Principled input: its link, or its constant moved onto a named RGB / Value node."""
-    if sock.is_linked:
+def _wear_source(tree, frame, sock, bl, name, loc, orig=None):
+    """What feeds a Principled input: its link, or its constant moved onto a named RGB / Value node. `orig` is what fed
+    it before an existing chain (_wear_originals), when the chain is being rebuilt in place."""
+    if orig is not None and orig[0] == "link":
+        return orig[1]
+    if orig is not None and orig[0] == "const":
+        n = _wear_new(tree, frame, bl, name, loc)
+        n.outputs[0].default_value = orig[1]
+        return n.outputs[0]
+    if sock.is_linked and not sock.links[0].from_node.name.startswith(_WEAR_PREFIX):
         return sock.links[0].from_socket
     n = _wear_new(tree, frame, bl, name, loc)
     n.outputs[0].default_value = sock.default_value
     return n.outputs[0]
+
+
+def _wear_out(tree, frame, src, sock, loc):
+    """src -> the named Reroute for this Principled input (_WEAR_OUTPUTS) -> the input."""
+    rr = _wear_new(tree, frame, "NodeReroute", _WEAR_OUTPUTS[sock.name], loc)
+    tree.links.new(src, rr.inputs[0])
+    tree.links.new(rr.outputs[0], sock)
+    return rr
 
 
 # REGIONS FOR CLOTHES (1.4, 2026-11-07): edge wear and AO grime follow the mesh's shape; a garment wears where the body
@@ -1104,15 +1352,60 @@ def _wear_write_attrs(masks):
         me.update()
 
 
+def _wear_external_links(tree, bsdf):
+    """Links with one end on a MifWear node and the other on a node of the caller's own (the Principled BSDF aside)."""
+    out = set()
+    for lk in tree.links:
+        a, b = lk.from_node.name.startswith(_WEAR_PREFIX), lk.to_node.name.startswith(_WEAR_PREFIX)
+        if a != b and lk.to_node != bsdf and lk.from_node != bsdf:
+            out.add((lk.from_node.name, lk.from_socket.identifier, lk.to_node.name, lk.to_socket.identifier))
+    return out
+
+
 def _weathering_apply(mat, bsdf, plan):
+    """Build the chain, or UPDATE the one there IN PLACE: every node keeps its name, links a caller made into or out of
+    MifWear nodes survive, a node this plan does not use is removed, and an input the chain no longer drives gets back
+    what fed it before the chain."""
+    tree = mat.node_tree
+    existing = {n.name: n for n in _wear_nodes(tree)}
+    originals = _wear_originals(tree, existing)
+    before = _wear_external_links(tree, bsdf)
+    _WEAR_REUSE["old"], _WEAR_REUSE["touched"] = dict(existing), set()
+    try:
+        frame = _WEAR_REUSE["old"].pop("%s Frame" % _WEAR_PREFIX, None)
+        if frame is None or frame.bl_idname != "NodeFrame":
+            frame = tree.nodes.new("NodeFrame")
+            frame.name = frame.label = "%s Frame" % _WEAR_PREFIX
+        out = _weathering_build(mat, bsdf, plan, originals, frame)
+        for n in list(_WEAR_REUSE["old"].values()):
+            tree.nodes.remove(n)
+        for input_name, orig in originals.items():
+            sock = bsdf.inputs.get(input_name)
+            if sock is None or (sock.is_linked and sock.links[0].from_node.name.startswith(_WEAR_PREFIX)):
+                continue
+            if not sock.is_linked:
+                _wear_restore(tree, sock, orig)
+    finally:
+        _WEAR_REUSE["old"], _WEAR_REUSE["touched"] = {}, set()
+    after = _wear_external_links(tree, bsdf)
+    out["nodes"] = len(_wear_nodes(tree))
+    out["updatedInPlace"] = bool(existing)
+    out["externalLinksKept"] = len(before & after)
+    out["externalLinksLost"] = sorted("%s.%s -> %s.%s" % k for k in before - after)
+    out["outputs"] = {k: "%s %s" % (_WEAR_PREFIX, v) for k, v in _WEAR_OUTPUTS.items()
+                      if tree.nodes.get("%s %s" % (_WEAR_PREFIX, v)) is not None}
+    return out
+
+
+def _weathering_build(mat, bsdf, plan, originals, frame):
     tree = mat.node_tree
     base_x, base_y = bsdf.location[0] - 1700, bsdf.location[1] + 300
-    frame = tree.nodes.new("NodeFrame")
-    frame.name = frame.label = "%s Frame" % _WEAR_PREFIX
     s_col, s_rough = bsdf.inputs["Base Color"], bsdf.inputs["Roughness"]
     s_metal, s_nrm = bsdf.inputs["Metallic"], bsdf.inputs["Normal"]
-    base_col = _wear_source(tree, frame, s_col, "ShaderNodeRGB", "BaseColor", (base_x, base_y))
-    base_r = _wear_source(tree, frame, s_rough, "ShaderNodeValue", "BaseRoughness", (base_x, base_y - 200))
+    base_col = _wear_source(tree, frame, s_col, "ShaderNodeRGB", "BaseColor", (base_x, base_y),
+                            originals.get("Base Color"))
+    base_r = _wear_source(tree, frame, s_rough, "ShaderNodeValue", "BaseRoughness", (base_x, base_y - 200),
+                          originals.get("Roughness"))
     # ---- coordinates and the two noises (object space: the same pattern on every bake, no UVs needed)
     tc = _wear_new(tree, frame, "ShaderNodeTexCoord", "Coords", (base_x - 600, base_y - 600))
     mp = _wear_new(tree, frame, "ShaderNodeMapping", "Mapping", (base_x - 400, base_y - 600))
@@ -1177,6 +1470,54 @@ def _weathering_apply(mat, bsdf, plan):
         t = _wear_math(tree, frame, "GrimePatchy", (x + 1000, base_y - 1600), "MULTIPLY", occ, mod)
         thr = 1.0 - grime_p["amount"]
         grime = _wear_maprange(tree, frame, "Grime", (x + 1200, base_y - 1600), t, thr * 0.8, thr * 0.8 + 0.35)
+    # ---- rust: patches of its own noise, fed by the grime (cavities rust first), with streaks running down the object's
+    # z - a noise stretched along z - added under the threshold
+    rust_p = plan.get("rust")
+    rust = None
+    if rust_p is not None:
+        y = base_y - 2950
+        nz = _wear_new(tree, frame, "ShaderNodeTexNoise", "RustNoise", (x - 200, y))
+        tree.links.new(mp.outputs["Vector"], nz.inputs["Vector"])
+        nz.inputs["Scale"].default_value = 1.2 * rust_p["scale"]
+        nz.inputs["Detail"].default_value = 6.0
+        rn = _wear_maprange(tree, frame, "RustNoiseC", (x, y), nz.outputs["Fac"], 0.32, 0.68)
+        if grime is not None:
+            fed = _wear_math(tree, frame, "RustGrimeFed", (x + 200, y + 80), "MULTIPLY", grime, 0.8)
+            rn = _wear_math(tree, frame, "RustSeed", (x + 400, y), "MAXIMUM", rn, fed)
+        st = _wear_new(tree, frame, "ShaderNodeVectorMath", "RustStretch", (x - 400, y - 220), operation="MULTIPLY")
+        tree.links.new(mp.outputs["Vector"], st.inputs[0])
+        st.inputs[1].default_value = (1.0, 1.0, 0.08)
+        sn = _wear_new(tree, frame, "ShaderNodeTexNoise", "RustStreakNoise", (x - 200, y - 220))
+        tree.links.new(st.outputs["Vector"], sn.inputs["Vector"])
+        sn.inputs["Scale"].default_value = 3.0 * rust_p["scale"]
+        sn.inputs["Detail"].default_value = 2.0
+        sk = _wear_maprange(tree, frame, "RustStreakC", (x, y - 220), sn.outputs["Fac"], 0.4, 0.7)
+        sk = _wear_math(tree, frame, "RustStreaks", (x + 200, y - 220), "MULTIPLY", sk, 0.5 * rust_p["streaks"])
+        t = _wear_math(tree, frame, "RustSum", (x + 600, y), "ADD", rn, sk)
+        thr = 1.0 - rust_p["amount"]
+        rust = _wear_maprange(tree, frame, "Rust", (x + 1200, y), t, thr, thr + 0.15)
+    # ---- scratches: thin lines (a Voronoi's distance to its cell edges) in patches, stretched along an axis
+    scr_p = plan.get("scratches")
+    scratch = None
+    if scr_p is not None:
+        y = base_y - 3400
+        sm = _wear_new(tree, frame, "ShaderNodeMapping", "ScratchMap", (x - 400, y))
+        tree.links.new(tc.outputs["Object"], sm.inputs["Vector"])
+        k = 3.0 * plan["scale"] * scr_p["density"]
+        sc = [k, k, k]
+        if scr_p["direction"] != "any":
+            sc["xyz".index(scr_p["direction"])] = k / scr_p["length"]
+        sm.inputs["Scale"].default_value = sc
+        sm.inputs["Location"].default_value = (seed * 5.17, seed * 9.73, seed * 2.29)
+        vo = _wear_new(tree, frame, "ShaderNodeTexVoronoi", "ScratchCells", (x - 200, y), feature="DISTANCE_TO_EDGE")
+        tree.links.new(sm.outputs["Vector"], vo.inputs["Vector"])
+        vo.inputs["Scale"].default_value = 4.0
+        # 0.04 of a cell: about 0.8 mm at the default scale - a texel or two at a game texture's density, where a
+        # thinner line averages away in the bake (0.012 baked a 0.49 peak at 96 px on a 1 m cube)
+        lines = _wear_maprange(tree, frame, "ScratchLines", (x, y), vo.outputs["Distance"], 0.0, 0.04, 1.0, 0.0)
+        thr = 1.0 - scr_p["amount"]
+        patch = _wear_maprange(tree, frame, "ScratchPatch", (x, y - 200), n_grime, thr, thr + 0.2)
+        scratch = _wear_math(tree, frame, "Scratch", (x + 1200, y), "MULTIPLY", lines, patch, clamp=True)
     # ---- region masks (clothes): the vertex attribute times strength, broken up by the grime noise
     regions = []
     for k, rg in enumerate(plan.get("regions") or []):
@@ -1188,7 +1529,7 @@ def _weathering_apply(mat, bsdf, plan):
         mod = _wear_math(tree, frame, "Region %s Break" % rg["region"], (x + 400, y + 80), "ADD", n_grime, 0.4)
         t = _wear_math(tree, frame, "Region %s Patchy" % rg["region"], (x + 600, y), "MULTIPLY", t, mod, clamp=True)
         regions.append((rg, _wear_maprange(tree, frame, "Region %s Mask" % rg["region"], (x + 800, y), t, 0.05, 0.75)))
-    # ---- base color: value breakup, then the wear color on the edges, then the grime in the cavities
+    # ---- base color: value breakup, then the wear color on the edges, scratches and rust, then the grime in the cavities
     cv = plan["colorVariation"]
     hsv = _wear_new(tree, frame, "ShaderNodeHueSaturation", "ColorVar", (x + 1400, base_y))
     tree.links.new(base_col, hsv.inputs["Color"])
@@ -1197,24 +1538,33 @@ def _weathering_apply(mat, bsdf, plan):
     # SATURATION AND A LITTLE HUE VARY TOO, at a broader scale than the value: a value-only breakup measured a
     # saturation sd of 0.010 on a painted box against 0.040-0.138 on the worn wood and paint scans; +-1.5 x cv on the
     # chip noise overshot (0.174 on the metal against 0.096-0.103 for the painted metal scans) and read as clouds
-    # (tools/measure_weathering.py)
+
     tree.links.new(_wear_maprange(tree, frame, "SatVar", (x + 1200, base_y - 300), n_grime, 0.0, 1.0,
                                   1.0 - 0.75 * cv, 1.0 + 0.75 * cv), hsv.inputs["Saturation"])
     tree.links.new(_wear_maprange(tree, frame, "HueVar", (x + 1200, base_y - 450), n_break, 0.0, 1.0,
                                   0.5 - 0.05 * cv, 0.5 + 0.05 * cv), hsv.inputs["Hue"])
     col = hsv.outputs["Color"]
-    if wear is not None:
-        if edge_p["color"] is not None:
-            wear_col = edge_p["color"]
-        else:
-            # NO COLOR GIVEN: the surface's own color, lighter and grayer - paint or oxide rubbed back to the
-            # material under it. Derived from the input, so a textured base wears in its own colors.
+    lifted = []
+
+    def lift_col():
+        # NO COLOR GIVEN: the surface's own color, lighter and grayer - paint or oxide rubbed back to the material under
+        # it. Derived from the input, so a textured base wears in its own colors. One node, shared by wear and scratches.
+        if not lifted:
             lift = _wear_new(tree, frame, "ShaderNodeHueSaturation", "WearColor", (x + 1400, base_y + 250))
             lift.inputs["Saturation"].default_value = 0.45
             lift.inputs["Value"].default_value = 1.9
             tree.links.new(base_col, lift.inputs["Color"])
-            wear_col = lift.outputs["Color"]
+            lifted.append(lift.outputs["Color"])
+        return lifted[0]
+    if wear is not None:
+        wear_col = edge_p["color"] if edge_p["color"] is not None else lift_col()
         col = _wear_mix(tree, frame, "WearMix", (x + 1650, base_y), "RGBA", col, wear_col, wear)
+    if scratch is not None:
+        sc_col = (scr_p["color"] if scr_p["color"] is not None else
+                  edge_p["color"] if wear is not None and edge_p["color"] is not None else lift_col())
+        col = _wear_mix(tree, frame, "ScratchMix", (x + 1700, base_y + 120), "RGBA", col, sc_col, scratch)
+    if rust is not None:
+        col = _wear_mix(tree, frame, "RustMix", (x + 1750, base_y + 240), "RGBA", col, rust_p["color"], rust)
     if grime is not None:
         col = _wear_mix(tree, frame, "GrimeMix", (x + 1850, base_y), "RGBA", col, grime_p["color"], grime)
     for k, (rg, m) in enumerate(regions):
@@ -1229,17 +1579,26 @@ def _weathering_apply(mat, bsdf, plan):
             rc = lift.outputs["Color"]
         col = _wear_mix(tree, frame, "Region %s ColorMix" % rg["region"], (x + 2050 + 200 * k, base_y), "RGBA", col,
                         rc, m)
-    tree.links.new(col, s_col)
-    # ---- roughness: noise variation, then smoother where handled, rougher where dirty
+    _wear_out(tree, frame, col, s_col, (x + 2700, base_y))
+    # ---- roughness: noise variation, then smoother where handled, rougher where dirty or rusted
     rv = plan["roughnessVariation"]
     var = _wear_maprange(tree, frame, "RoughVarRange", (x + 1200, base_y - 400), n_fine, 0.0, 1.0, -rv, rv)
     r = _wear_math(tree, frame, "RoughVar", (x + 1400, base_y - 400), "ADD", base_r, var, clamp=True)
+    smooth = []
+
+    def smoothed():
+        if not smooth:
+            smooth.append(_wear_math(tree, frame, "WearRough", (x + 1400, base_y - 600), "MULTIPLY", base_r, 0.6,
+                                     clamp=True))
+        return smooth[0]
     if wear is not None:
-        if edge_p["roughness"] is not None:
-            wr = edge_p["roughness"]
-        else:
-            wr = _wear_math(tree, frame, "WearRough", (x + 1400, base_y - 600), "MULTIPLY", base_r, 0.6, clamp=True)
+        wr = edge_p["roughness"] if edge_p["roughness"] is not None else smoothed()
         r = _wear_mix(tree, frame, "WearRoughMix", (x + 1650, base_y - 400), "FLOAT", r, wr, wear)
+    if scratch is not None:
+        sr = scr_p["roughness"] if scr_p["roughness"] is not None else smoothed()
+        r = _wear_mix(tree, frame, "ScratchRoughMix", (x + 1700, base_y - 520), "FLOAT", r, sr, scratch)
+    if rust is not None:
+        r = _wear_mix(tree, frame, "RustRoughMix", (x + 1750, base_y - 640), "FLOAT", r, rust_p["roughness"], rust)
     if grime is not None:
         r = _wear_mix(tree, frame, "GrimeRoughMix", (x + 1850, base_y - 400), "FLOAT", r, grime_p["roughness"], grime)
     for k, (rg, m) in enumerate(regions):
@@ -1249,26 +1608,52 @@ def _weathering_apply(mat, bsdf, plan):
                             base_r, 0.12, clamp=True)
         r = _wear_mix(tree, frame, "Region %s RoughMix" % rg["region"], (x + 2050 + 200 * k, base_y - 400), "FLOAT", r,
                       rr, m)
-    tree.links.new(r, s_rough)
-    spliced = ["baseColor", "roughness"]
-    # ---- metallic: bare metal where the coating wore through
-    if wear is not None and edge_p["metallic"] is not None:
-        base_m = _wear_source(tree, frame, s_metal, "ShaderNodeValue", "BaseMetallic", (base_x, base_y - 400))
-        m = _wear_mix(tree, frame, "MetalMix", (x + 1650, base_y - 700), "FLOAT", base_m, edge_p["metallic"], wear)
-        tree.links.new(m, s_metal)
-        spliced.append("metallic")
-    # ---- normal: the chipped edge sits a little below the coat
+    _wear_out(tree, frame, r, s_rough, (x + 2700, base_y - 400))
+    spliced = ["baseColor", "roughness", "metallic"]
+    # ---- metallic, ALWAYS BUILT (a downstream graph built against MetalMix failed on a material without it): bare metal
+    # where the coating wore through or was scratched, max(wear, scratch), and none under rust; a constant when unused
+    base_m = _wear_source(tree, frame, s_metal, "ShaderNodeValue", "BaseMetallic", (base_x, base_y - 400),
+                          originals.get("Metallic"))
+    exposed = wear if (wear is not None and edge_p["metallic"] is not None) else None
+    target = edge_p["metallic"] if wear is not None and edge_p["metallic"] is not None else None
+    if scratch is not None:
+        s_metal_v = scr_p["metallic"] if scr_p["metallic"] is not None else target
+        if s_metal_v is not None:
+            target = s_metal_v if target is None else target
+            exposed = scratch if exposed is None else _wear_math(tree, frame, "MetalExposed", (x + 1450, base_y - 820),
+                                                                 "MAXIMUM", exposed, scratch)
+    m = _wear_mix(tree, frame, "MetalMix", (x + 1650, base_y - 700), "FLOAT", base_m,
+                  target if target is not None else base_m, exposed if exposed is not None else 0.0)
+    if rust is not None:
+        m = _wear_mix(tree, frame, "RustMetal", (x + 1850, base_y - 700), "FLOAT", m, 0.0, rust)
+    _wear_out(tree, frame, m, s_metal, (x + 2700, base_y - 700))
+    # ---- normal: the chipped edge and the scratches sit a little below the coat, rust a little above it
+    orig_n = originals.get("Normal")
+    if orig_n is not None:
+        nrm_src = orig_n[1] if orig_n[0] == "link" else None
+    else:
+        nrm_src = s_nrm.links[0].from_socket if s_nrm.is_linked else None
+    bumps = []
     if wear is not None and edge_p["bump"]:
-        bump = _wear_new(tree, frame, "ShaderNodeBump", "Bump", (x + 1850, base_y - 900), invert=True)
-        bump.inputs["Strength"].default_value = edge_p["bump"]
-        bump.inputs["Distance"].default_value = 0.002
-        tree.links.new(wear, bump.inputs["Height"])
-        if s_nrm.is_linked:
-            tree.links.new(s_nrm.links[0].from_socket, bump.inputs["Normal"])
-        tree.links.new(bump.outputs["Normal"], s_nrm)
+        bumps.append(("Bump", wear, edge_p["bump"], 0.002, True))
+    if scratch is not None and scr_p["bump"]:
+        bumps.append(("ScratchBump", scratch, scr_p["bump"], 0.0005, True))
+    if rust is not None and rust_p["bump"]:
+        bumps.append(("RustBump", rust, rust_p["bump"], 0.001, False))
+    for k, (nm, h, strength, dist, inv) in enumerate(bumps):
+        bump = _wear_new(tree, frame, "ShaderNodeBump", nm, (x + 1850 + 200 * k, base_y - 900), invert=inv)
+        bump.inputs["Strength"].default_value = strength
+        bump.inputs["Distance"].default_value = dist
+        tree.links.new(h, bump.inputs["Height"])
+        if nrm_src is not None:
+            tree.links.new(nrm_src, bump.inputs["Normal"])
+        nrm_src = bump.outputs["Normal"]
+    if bumps:
+        _wear_out(tree, frame, nrm_src, s_nrm, (x + 2700, base_y - 900))
         spliced.append("normal")
     return {"spliced": spliced, "nodes": len(_wear_nodes(tree)) + 0,
-            "edgeWear": edge_p, "grime": grime_p, "roughnessVariation": rv, "colorVariation": cv,
+            "edgeWear": edge_p, "grime": grime_p, "rust": rust_p, "scratches": scr_p,
+            "roughnessVariation": rv, "colorVariation": cv,
             "scale": plan["scale"], "seed": seed, "regions": plan.get("regionRows") or [],
             "regionsSkipped": plan.get("regionsSkipped") or [],
             "preview": "Cycles renders the whole chain; EEVEE shows no edge wear (Bevel and Pointiness are Cycles "
@@ -1307,8 +1692,26 @@ def op_set_material_properties(params):
     grime {amount 0.5, distance 0.2 m, color, roughness 0.9} where Ambient Occlusion is low, both broken up by object-space
     noise; roughnessVariation (0.15) and colorVariation (0.12) vary the whole surface. Whatever fed an input stays under
     the chain (a texture weathers in its own colors); a later baseColor / roughness / metallic writes the value under
-    it. Calling again replaces it; weathering false removes it and restores each input. Cycles renders it (Bevel and
-    Pointiness are Cycles nodes); bake_texture_set BASE_COLOR, ROUGHNESS, METALLIC, NORMAL carries it to Unreal.
+    it. Calling again UPDATES IT IN PLACE (2026-11-25): the same node names, the links a caller made into or out of a
+    MifWear node kept (externalLinksKept), a layer turned off removed; weathering false removes it and restores each
+    input. Cycles renders it (Bevel and Pointiness are Cycles nodes); bake_texture_set BASE_COLOR, ROUGHNESS, METALLIC,
+    NORMAL carries it to Unreal.
+
+    RUST AND SCRATCHES (2026-11-25), each off unless given: rust {amount 0.4, scale 1 (x the chain's), streaks 0.5 (down
+    the object's z), color, roughness 0.85, bump 0.3} - its own noise, fed by the grime, metallic 0 under it; scratches
+    {amount 0.5, density 1, length 4, direction any | x | y | z, color, roughness, metallic, bump 0.2} - Voronoi edge
+    lines in patches, bare metal where metallic is given (metallic = max(wear, scratch) x (1 - rust)).
+    SIZED TO THE OBJECT (2026-11-25): edgeWear.width, grime.distance and scale, when not given, come from the meshes
+    using the material (_wear_size_defaults): width 0.02 x the size and at most 0.35 x the thinnest loose part, distance
+    0.2 x the size, scale 4 / the local size - a 1 m object keeps 0.02, 0.2 and 4. weathering.resolved names each value
+    and its source; a width over half the thinnest part's thickness is warned.
+    THE STABLE NAMES: each Principled input is fed by the Reroute MifWear ColorOut / RoughOut / MetalOut / NormalOut
+    whatever layers are on; the masks are MifWear Wear, Grime, Rust and Scratch; MifWear MetalMix and MetalOut are always
+    built (a constant pass-through when nothing exposes metal), so a graph built against them works on every material.
+
+    COAT (2026-11-25): clearcoat is the coat's weight; coatRoughness, coatIor and coatTint [r, g, b] are its other
+    sockets (Coat Roughness, Coat IOR, Coat Tint on 4.0 and later; 3.6 has Clearcoat Roughness and refuses the other two
+    by name). describe_material reads each back.
 
     REGIONS FOR CLOTHES (1.4): weathering.regions [{region, strength, kind, vertexGroup | bones, radius, color,
     roughness}] - knees and seat (kind wear: the cloth rubbed pale and rougher, front and back), cuffs and hems (grime:
@@ -1418,15 +1821,23 @@ def op_set_material_properties(params):
         sock.default_value = staged[prop]
     wear_out = None
     if wplan is not None:
-        restored = _weathering_remove(mat, bsdf)
+        # REMOVED only when asked; otherwise the chain there is UPDATED IN PLACE (_weathering_apply), so its node names
+        # and the links a caller made into or out of it survive a re-tune
+        restored = _weathering_remove(mat, bsdf) if wplan["remove"] else []
         cleared = _wear_clear_attrs(mat)
         if region_masks:
             _wear_write_attrs(region_masks)
+        if not wplan["remove"]:
+            resolved_w, size_warns = _wear_size_defaults(mat, wplan)
         wear_out = {"removed": True, "restored": restored} if wplan["remove"] else _weathering_apply(mat, bsdf, wplan)
+        if not wplan["remove"]:
+            wear_out["resolved"] = resolved_w
+            if size_warns:
+                wear_out["warnings"] = size_warns
         if cleared and wplan["remove"]:
             wear_out["regionAttributesRemoved"] = ["%s.%s" % c for c in cleared]
         if not wplan["remove"]:
-            wear_out["replacedPrevious"] = bool(restored)
+            wear_out["replacedPrevious"] = wear_out["updatedInPlace"]
     if method_id is not None:
         bsdf.subsurface_method = method_id
     for attr, value in viewport.items():
@@ -1579,8 +1990,14 @@ def _shift(a, dy, dx, fill):
 _NEIGH = [(dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1) if dy or dx]
 
 
-def fix_normal_blobs(image, max_tilt_deg, min_blob_px):
-    """Repair blobs of extreme tilt in a tangent-space normal map image in place. Returns the counts."""
+def count_normal_blobs(image, max_tilt_deg, min_blob_px):
+    """fix_normal_blobs' rule, counted: tiltedTexels, blobs, blobTexels. Reads the image and changes nothing."""
+    _px, _n, tilted, mask, blobs = _normal_blob_mask(image, max_tilt_deg, min_blob_px)
+    return {"tiltedTexels": int(tilted.sum()), "blobs": blobs, "blobTexels": int(mask.sum())}
+
+
+def _normal_blob_mask(image, max_tilt_deg, min_blob_px):
+    """(pixels, decoded normals, the tilted mask, the blob mask grown back, the blob count) - fix_normal_blobs' rule."""
     import numpy as np   # noqa: PLC0415
     w, h = image.size
     px = np.array(image.pixels[:], dtype=np.float64).reshape(h, w, 4)
@@ -1618,6 +2035,14 @@ def fix_normal_blobs(image, max_tilt_deg, min_blob_px):
         for dy, dx in _NEIGH:
             grown |= _shift(mask, dy, dx, False)
         mask = grown
+    return px, n, tilted, mask, blobs
+
+
+def fix_normal_blobs(image, max_tilt_deg, min_blob_px):
+    """Repair blobs of extreme tilt in a tangent-space normal map image in place. Returns the counts."""
+    import numpy as np   # noqa: PLC0415
+    w, h = image.size
+    px, n, tilted, mask, blobs = _normal_blob_mask(image, max_tilt_deg, min_blob_px)
     filled = int(mask.sum())
     if filled == 0:
         return {"tiltedTexels": int(tilted.sum()), "blobs": 0, "texelsFilled": 0}
@@ -1721,6 +2146,158 @@ def op_fix_normal_map(params):
     return out
 
 
+_SENTINEL = (1.0, 0.0, 1.0, 1.0)
+
+
+def _read_px(image):
+    import numpy as np                                          # noqa: PLC0415
+    w, h = image.size
+    px = np.empty(w * h * 4, dtype=np.float32)
+    image.pixels.foreach_get(px)
+    return px.reshape(h, w, 4)
+
+
+def _write_px(image, px):
+    image.pixels.foreach_set(px.astype("float32").ravel())
+    image.update()
+
+
+def _is_sentinel(px):
+    return (px[..., 0] > 0.99) & (px[..., 1] < 0.01) & (px[..., 2] > 0.99)
+
+
+def _grow(mask, n):
+    """mask grown by n texels (8-connected)."""
+    out = mask.copy()
+    for _ in range(max(0, int(n))):
+        g = out.copy()
+        for dy, dx in _NEIGH:
+            g |= _shift(out, dy, dx, False)
+        out = g
+    return out
+
+
+_MASK_CACHE = {}
+
+
+def _piece_masks(plan, w, h, islands=None):
+    """Each low's texels at this size - its active UV layer's faces rasterised at texel centres, as a bake writes them.
+    islands, a list, gets each low's (island id per texel, -1 outside; the island of each polygon)."""
+    import numpy as np                                          # noqa: PLC0415
+    from .ops_detailbake import _uv_raster                      # noqa: PLC0415
+    out = []
+    for low, _s, _c in plan:
+        lay = low.data.uv_layers.active.name if low.data.uv_layers.active else low.data.uv_layers[0].name
+        # rasterised once per mesh state: a set bakes five maps of one low at one size
+        uvd = np.empty(len(low.data.loops) * 2, dtype=np.float32)
+        low.data.uv_layers[lay].data.foreach_get("uv", uvd)
+        key = (low.name, lay, w, h, len(low.data.loops), len(low.data.polygons), float(uvd.sum()), float((uvd * uvd).sum()))
+        hit = _MASK_CACHE.get(key)
+        if hit is None:
+            hit = _uv_raster(low, lay, w, h)[:2]
+            if len(_MASK_CACHE) > 8:
+                _MASK_CACHE.clear()
+            _MASK_CACHE[key] = hit
+        ids, isl = hit
+        out.append(ids >= 0)
+        if islands is not None:
+            islands.append((ids, isl))
+    return out
+
+
+def _probe_mask(mask, ids):
+    """The texels of `mask` four-way inside their island, plus every texel of an island too small to have an inside."""
+    import numpy as np                                          # noqa: PLC0415
+    inner = mask.copy()
+    for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        inner &= _shift(ids, dy, dx, -1) == ids
+    have = set(np.unique(ids[inner]).tolist())
+    small = [k for k in np.unique(ids[mask]).tolist() if k not in have]
+    if small:
+        inner |= np.isin(ids, small) & mask
+    return inner
+
+
+def _island_coverage(plan, islands, written):
+    """Per low: its UV islands at this size, and the ones the bake wrote no texel of - by object and material, with
+    their share of the covered texels (FOUND 2026-11-18: every claw island of a creature came back at the background in
+    all three maps, and the bake answered ok)."""
+    import numpy as np                                          # noqa: PLC0415
+    rows, empty = [], []
+    total = sum(int((ids >= 0).sum()) for ids, _i in islands) or 1
+    for (low, _s, _c), (ids, isl), wr in zip(plan, islands, written):
+        flat = ids[ids >= 0]
+        if not flat.size:
+            rows.append({"object": low.name, "islands": 0})
+            continue
+        uniq, counts = np.unique(flat, return_counts=True)
+        got = np.unique(ids[(ids >= 0) & wr])
+        first = {}
+        for pi, k in enumerate(isl):
+            first.setdefault(k, pi)
+        mats = low.data.materials
+        miss = [(int(k), int(c)) for k, c in zip(uniq, counts) if k not in set(got.tolist())]
+        for k, c in miss:
+            mi = low.data.polygons[first[k]].material_index if k in first else 0
+            empty.append({"object": low.name, "island": k, "texels": c, "share": round(c / total, 6),
+                          "material": (mats[mi].name if mi < len(mats) and mats[mi] is not None else None)})
+        rows.append({"object": low.name, "islands": int(len(uniq)), "islandsEmpty": len(miss)})
+    share = round(sum(e["share"] for e in empty), 6)
+    return {"perObject": rows, "islandsEmpty": len(empty), "emptyShare": share, "empty": empty[:40]}
+
+
+def _normal_check(image, plan, masks, written, sources, probes=None):
+    """A baked tangent-space normal map read back (FOUND 2026-11-18: an ok NORMAL map held 94 blobs of bad ray hits that
+    fix_normal_map filled - 74,877 texels - and thin strips of saturated garbage where rays missed the high or hit its
+    inside). invalid: a texel whose decoded vector is not near unit length or points into the surface (z below 0);
+    blobs: fix_normal_map's rule (tilted past 70 degrees, 40 texels or more), counted, nothing changed; missed: island
+    texels no ray wrote (known when the islands were checked); flatShaded: a target whose faces are all flat, so the map
+    bakes against the facets."""
+    import numpy as np                                          # noqa: PLC0415
+    px = _read_px(image)
+    n = px[..., :3].astype(np.float64) * 2.0 - 1.0
+    ln = np.linalg.norm(n, axis=-1)
+    area = np.zeros(ln.shape, dtype=bool)
+    if masks is not None:
+        for m_ in masks:
+            area |= m_
+    else:
+        area = ~((px[..., 0] > 0.99) & (px[..., 1] < 0.01) & (px[..., 2] > 0.99))
+    bad = area & ((np.abs(ln - 1.0) > 0.2) | (n[..., 2] < 0.0))
+    blobs = count_normal_blobs(image, 70.0, 40)
+    missed = None
+    if masks is not None:
+        missed = int(sum(int((m_ & ~(w_ if w_ is not None else np.zeros_like(m_))).sum())
+                         for m_, w_ in zip(probes or masks, written)))
+    flat = [low.name for low, _s, _c in plan if low.data.polygons and not any(p.use_smooth for p in low.data.polygons)]
+    out = {"texels": int(area.sum()), "texelsInvalid": int(bad.sum()), "blobs": blobs["blobs"],
+           "blobTexels": blobs["blobTexels"], "texelsMissed": missed, "flatShaded": flat or None, "warnings": []}
+    if flat:
+        out["warnings"].append("%s %s flat shaded: the normal map bakes against the facets (shade_smooth, or remesh_mesh "
+                               "smoothNormals, first)" % (", ".join(flat[:6]), "is" if len(flat) == 1 else "are"))
+    if blobs["blobs"]:
+        out["warnings"].append("%d blob(s) of rays that hit a facing surface (%d texels) - fixNormals / blobFix, or "
+                               "fix_normal_map, fills them" % (blobs["blobs"], blobs["blobTexels"]))
+    if out["texelsInvalid"]:
+        out["warnings"].append("%d texel(s) are not a valid normal (saturated, or pointing into the surface)"
+                               % out["texelsInvalid"])
+    if missed:
+        out["warnings"].append("%d island texel(s) got no ray hit and hold the flat normal%s" % (
+            missed, "" if sources else " (a self-bake)"))
+    return out
+
+
+def _drop_image(image, into, original):
+    """A refused bake's image: removed when the call made it, put back as it was when it is the caller's."""
+    try:
+        if into is None:
+            bpy.data.images.remove(image)
+        elif original is not None:
+            _write_px(image, original)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _parse_bake_pieces(params, tail):
     """[(low, [sources], cage or None)] from bake_texture pieces, every object checked, nothing written."""
     raw = params.get("pieces")
@@ -1733,9 +2310,17 @@ def _parse_bake_pieces(params, tail):
     for k, row in enumerate(raw):
         if not isinstance(row, dict):
             raise MifOpError("pieces[%d] must be {object, source, cage}, got %r. %s" % (k, row, tail))
-        bad = sorted(set(row) - {"object", "source", "cage"})
+        bad = sorted(set(row) - {"object", "source", "cage", "extrusion", "maxRayDistance"})
         if bad:
-            raise MifOpError("pieces[%d] has unknown key(s) %s - accepted: object, source, cage. %s" % (k, bad, tail))
+            raise MifOpError("pieces[%d] has unknown key(s) %s - accepted: object, source, cage, extrusion, "
+                             "maxRayDistance. %s" % (k, bad, tail))
+        for rk in ("extrusion", "maxRayDistance"):
+            rv = row.get(rk)
+            if rv is not None and (isinstance(rv, bool) or not isinstance(rv, (int, float)) or rv < 0):
+                raise MifOpError("pieces[%d].%s is a distance of 0 or more, got %r. %s" % (k, rk, rv, tail))
+        if row.get("extrusion") is not None and row.get("cage") is not None:
+            raise MifOpError("pieces[%d] has a cage and an extrusion - the cage is where its rays start; pass one. %s"
+                             % (k, tail))
         if not isinstance(row.get("object"), str):
             raise MifOpError("pieces[%d].object names the low part baked onto. %s" % (k, tail))
         low = get_object(row["object"], want_mesh=True)
@@ -2137,6 +2722,53 @@ _COLLISION_PREFIXES = ("UCX_", "UBX_", "USP_", "UCP_")
 # What a bake ray can strike. Lights, cameras, empties, armatures and the rest cast no occlusion, so a one-object bake
 # leaves them alone.
 _GEOMETRY_TYPES = {"MESH", "CURVE", "SURFACE", "FONT", "META", "CURVES", "POINTCLOUD", "VOLUME"}
+# The ray types a high-to-low AO bake turns off on the low for the bake (camera stays: the low is the bake target).
+_LOW_RAYS = ("visible_diffuse", "visible_glossy", "visible_shadow", "visible_transmission", "visible_volume_scatter")
+
+
+def _collection_paths(scene):
+    """{collection: [its ancestors' chains]} for every collection under the scene, the scene collection excluded."""
+    out = {}
+
+    def walk(coll, chain):
+        for child in coll.children:
+            out.setdefault(child, []).append(chain + [child])
+            walk(child, chain + [child])
+    walk(scene.collection, [])
+    return out
+
+
+def bake_visibility_problems(obj, role, scene=None):
+    """Why `obj` cannot take part in a bake, in words that name the object or collection to change - [] when it can.
+
+    FOUND 2026-11-18 by three builds: a low in a collection hidden from render baked every map into Cycles' 'Object ...
+    is not enabled for rendering' after a minute, and a source left hidden from a clay shot failed as Blender's raw "No
+    valid selected objects". Render: the object's hide_render, or every collection path to it hidden from render.
+    Viewport: a bake selects its objects, and a hidden or excluded one cannot be selected."""
+    scene = scene or bpy.context.scene
+    probs = []
+    if obj.hide_render:
+        probs.append("%s '%s' is hidden from render (hide_render) - set_object_visibility hideRender false" % (role, obj.name))
+    else:
+        paths = _collection_paths(scene)
+        chains = [ch for c in obj.users_collection for ch in (paths.get(c) or ([] if c != scene.collection else [[]]))]
+        if chains and all(any(c.hide_render for c in ch) for ch in chains):
+            names = sorted({c.name for ch in chains for c in ch if c.hide_render})
+            probs.append("%s '%s' is in collection %s, hidden from render - clear the collection's hide_render"
+                         % (role, obj.name, ", ".join("'%s'" % n for n in names)))
+    vl = bpy.context.view_layer
+    # THE VIEW LAYER SYNCS LAZILY (measured 2026-11-26 on 3.6, 4.2, 5.0, 5.2): an object linked a moment ago in the
+    # same call - an op that makes a mesh and bakes it - is missing from view_layer.objects until the layer updates,
+    # so it was refused as excluded. Synced once before an absence is believed.
+    if vl.objects.get(obj.name) is None:
+        vl.update()
+    if vl.objects.get(obj.name) is None:
+        probs.append("%s '%s' is not in the view layer (its collection is excluded) - include the collection"
+                     % (role, obj.name))
+    elif not obj.visible_get():
+        probs.append("%s '%s' is hidden in the viewport (hide_viewport, the eye, or its collection) - a bake selects it, "
+                     "and a hidden object cannot be selected; set_object_visibility hideViewport false" % (role, obj.name))
+    return probs
 
 
 def op_bake_texture(params):
@@ -2166,7 +2798,9 @@ def op_bake_texture(params):
                             "colorspace", "float", "format", "source", "extrusion", "maxRayDistance", "cage",
                             "greenChannel", "blobFix", "pieces", "explode", "multires", "include",
                             # 1.3: a color-attribute target, the ID map's key, HEIGHT's range, THICKNESS's reach
-                            "target", "colorAttribute", "idBy", "heightRange", "thicknessDistance"),
+                            "target", "colorAttribute", "idBy", "heightRange", "thicknessDistance",
+                            # 1.4: what a high-to-low AO bake's rays may hit, and an existing image to bake into
+                            "aoAgainst", "image", "checkIslands"),
                    "bake_texture")
     # PER PIECE (2026-10-06): pieces [{object, source, cage}] bakes each low part from its OWN high part into the one
     # image - each pass selects only that pair, so a ray from one part cannot land on a neighbour's high. explode
@@ -2174,6 +2808,9 @@ def op_bake_texture(params):
     # AO bake is not darkened by a neighbour either. Parsed first: with pieces, object is the first piece's low.
     tail = "NOTHING was baked."
     pieces = _parse_bake_pieces(params, tail)
+    # each piece's own reach (1.4): a thin part lying on another bakes a short pass of its own
+    reaches = [{k_: row_.get(k_) for k_ in ("extrusion", "maxRayDistance") if row_.get(k_) is not None}
+               for row_ in params["pieces"]] if pieces else []
     explode = take_float(params, "explode", default=None)
     if explode is not None and not pieces:
         raise MifOpError("explode moves the pieces apart for the bake - pass pieces too. %s" % tail)
@@ -2273,9 +2910,17 @@ def op_bake_texture(params):
         raise MifOpError("extrusion pushes the low poly out when there is no cage; with cage the cage's own shape "
                          "is where rays start - pass one. %s" % tail)
     plan = pieces or [(obj, sources, cage)]
-    if bake_type in _EMIT_ROUTE and pieces:
-        raise MifOpError("a %s bake goes through a temporary emission per object, and pieces bakes each pair into one "
-                         "image - bake it once per low, or with source. %s" % (bake_type, tail))
+    hidden_probs = [p_ for low_, srcs_, _c in plan for o_, role_ in [(low_, "target")] + [(s_, "source") for s_ in srcs_]
+                    for p_ in bake_visibility_problems(o_, role_)]
+    if hidden_probs:
+        raise MifOpError("a bake cannot use a hidden object: %s. %s" % ("; ".join(hidden_probs), tail))
+    # THE EMISSION ROUTE PER PIECE (1.4, FOUND 2026-11-18): BASE_COLOR, METALLIC and the rest were refused with pieces,
+    # so a metal's two most needed maps could not be baked per part. Every piece's sources carry their temporary emission
+    # for the whole call; each pass selects one pair, so a ray still reaches only its own high. A POSITION map's box is
+    # the sources' box before explode moves them, so the two are refused together.
+    if pieces and explode is not None and bake_type in ("POSITION", "_POSITION_RAW"):
+        raise MifOpError("a POSITION map is mapped into the sources' box, and explode moves every piece along X for the "
+                         "bake - bake it without explode. %s" % tail)
     thickness = take_float(params, "thicknessDistance", default=None)
     if thickness is not None and not thickness > 0:
         raise MifOpError("thicknessDistance must be above 0 (scene units), got %g. %s" % (thickness, tail))
@@ -2299,6 +2944,20 @@ def op_bake_texture(params):
         if not isinstance(raw_inc, (list, tuple)) or not all(isinstance(n, str) for n in raw_inc):
             raise MifOpError("include is a list of object names kept visible for the bake. %s" % tail)
         include = [get_object(n) for n in dict.fromkeys(raw_inc)]
+    # AN AO BAKE FROM A SOURCE SEES THE SOURCES, NOT THE SCENE (FOUND 2026-11-18): a floor plane and the neighbours left
+    # visible darkened whole islands; only a one-object bake hid them. aoAgainst "sources" (the default for AO with a
+    # source or pieces) hides every other geometry object from render for the bake, include still keeping named
+    # neighbours; "scene" keeps them, as before. The low's own ray visibility is turned off for the bake and put back -
+    # the build that found this saw the low darken the high; on 5.0.1 and 4.2 the bake already leaves the low out.
+    ao_against = str(take(params, "aoAgainst", default="SOURCES", kind=str)).upper()
+    if ao_against not in ("SOURCES", "SCENE"):
+        raise MifOpError("aoAgainst is SOURCES (default) or SCENE, got %r. %s" % (params.get("aoAgainst"), tail))
+    if params.get("aoAgainst") is not None and (bake_type != "AO" or not sources):
+        raise MifOpError("aoAgainst chooses what a high-to-low AO bake's rays may hit - this is %s%s. %s"
+                         % (bake_type, "" if sources else " with no source", tail))
+    check_islands = take_bool(params, "checkIslands", default=False)
+    if check_islands and target == "COLOR_ATTRIBUTE":
+        raise MifOpError("checkIslands reads the image's UV islands, and target COLOR_ATTRIBUTE writes the mesh. %s" % tail)
     blob_rule = _parse_blob_fix(params.get("blobFix"), tail)
     if blob_rule is not None and bake_type != "NORMAL":
         raise MifOpError("blobFix repairs a normal map, and this is a %s bake. %s" % (bake_type, tail))
@@ -2417,6 +3076,31 @@ def op_bake_texture(params):
     # The active layer decides which channel the NEXT bake or export writes through, and a caller
     # whose call was refused has no reason to re-check it. Same reads, same defaults, same order -
     # the only difference is which state a refusal leaves behind.
+    # AN EXISTING IMAGE TO BAKE INTO (1.4, FOUND 2026-11-18): every call made a new image, so several lows could not be
+    # baked into one atlas by separate calls. image names it; what other calls wrote there is kept - the check is over the
+    # texels this call's UVs cover (_piece_masks), which are filled with the sentinel before the pass and put back if
+    # the bake did not reach them. Its size and colour space are the image's own, so a disagreeing one is refused.
+    into = None
+    if params.get("image") is not None:
+        into = bpy.data.images.get(str(params["image"]))
+        if into is None:
+            raise MifOpError("no image named %r to bake into. %s" % (params["image"], tail))
+        if target == "COLOR_ATTRIBUTE":
+            raise MifOpError("image is an image to bake into, and target COLOR_ATTRIBUTE bakes into the mesh. %s" % tail)
+        if not into.size[0] or not into.has_data and not into.pixels:
+            raise MifOpError("image '%s' has no pixels to bake into. %s" % (into.name, tail))
+        for k_, v_ in (("width", into.size[0]), ("height", into.size[1])):
+            asked_ = take_int(params, k_, default=None)
+            if asked_ is not None and asked_ != v_:
+                raise MifOpError("%s %s disagrees with image '%s' (%dx%d) - an existing image keeps its size. %s"
+                                 % (k_, params[k_], into.name, into.size[0], into.size[1], tail))
+        if params.get("imageName") is not None or want_float:
+            raise MifOpError("imageName and float shape a new image; image bakes into an existing one. %s" % tail)
+        cs_ = into.colorspace_settings.name
+        if non_colour_space is not None and cs_ != non_colour_space:
+            raise MifOpError("a %s bake is data and image '%s' is %s - set its colour space to %s first, or the map is "
+                             "written with the wrong transfer. %s" % (bake_type, into.name, cs_, non_colour_space, tail))
+        params = dict(params, width=into.size[0], height=into.size[1])
     width = take_int(params, "width", default=512)
     height = take_int(params, "height", default=512)
     if width < 1 or height < 1 or width > 8192 or height > 8192:
@@ -2496,9 +3180,12 @@ def op_bake_texture(params):
     # to an untouched one. is_dirty does not separate them either: it goes true merely from the
     # bake touching the image. Filling with magenta first means ANY value the bake writes differs
     # from the start state, so "unchanged" means untouched and nothing else.
-    image = bpy.data.images.new(image_name, width=width, height=height,
-                                **({"float_buffer": True, "alpha": False} if want_float else {}))
-    image.generated_color = (1.0, 0.0, 1.0, 1.0)
+    if into is not None:
+        image = into
+    else:
+        image = bpy.data.images.new(image_name, width=width, height=height,
+                                    **({"float_buffer": True, "alpha": False} if want_float else {}))
+        image.generated_color = (1.0, 0.0, 1.0, 1.0)
 
     # NON-COLOUR BAKES MUST NOT CARRY AN sRGB TRANSFER, and images.new() defaults to sRGB. Nothing
     # here set colorspace_settings before 2026-09-03, so every NORMAL, ROUGHNESS, AO and SHADOW map
@@ -2514,13 +3201,13 @@ def op_bake_texture(params):
     # DIFFUSE, COMBINED, EMIT and GLOSSY are radiometric colour and stay sRGB. The split is by what
     # the channel MEANS, which is why it is a table rather than a rule about scalars.
     colour_space = None
-    if non_colour_space is not None:
+    if non_colour_space is not None and into is None:
         # Resolved above, against the config's own list. Nothing here can refuse.
         image.colorspace_settings.name = non_colour_space
         colour_space = non_colour_space
     else:
         colour_space = image.colorspace_settings.name
-    if image.name != image_name:
+    if into is None and image.name != image_name:
         # Blender uniquifies silently, and a caller who then looks up image_name finds the OLD one.
         note_renamed = image.name
     else:
@@ -2546,15 +3233,22 @@ def op_bake_texture(params):
     baked = {o for low, srcs, pcage in plan for o in [low] + srcs + ([pcage] if pcage is not None else [])}
     kept = baked | set(include)
     one_object = not pieces and not sources
-    hidden = []
+    ao_sources = bake_type == "AO" and bool(sources) and ao_against == "SOURCES"
+    hidden, rays_off = [], []
     try:
         for o in scene.objects:
             if o in kept or o.hide_render:
                 continue
             collision = o.name.upper().startswith(_COLLISION_PREFIXES)
-            if collision or (one_object and o.type in _GEOMETRY_TYPES):
+            if collision or ((one_object or ao_sources) and o.type in _GEOMETRY_TYPES):
                 o.hide_render = True
                 hidden.append(o)
+        if bake_type == "AO" and sources:
+            for low_ in [p_[0] for p_ in plan]:
+                was = {a: getattr(low_, a) for a in _LOW_RAYS if hasattr(low_, a)}
+                rays_off.append((low_, was))
+                for a in was:
+                    setattr(low_, a, False)
         if bake_type in _EMIT_ROUTE:
             # THE EMITTERS: the sources of a high-to-low bake, else the object itself - whose temporary materials then
             # carry the bake target, since the slot it renders is the one the bake writes through
@@ -2629,22 +3323,59 @@ def op_bake_texture(params):
             bpy.context.view_layer.update()
 
         before = _pixel_signature(image)
+        # WHAT EACH PIECE WROTE IS READ OFF ITS OWN UV ISLANDS (1.4, FOUND 2026-11-18). It was a whole-image (min, max,
+        # mean) signature rounded to 6 places: a flat box piece bakes exactly the flat normal the first pass cleared to,
+        # and a 4 x 4-texel piece on a 2048 image moves the mean by under 1e-6, so real pieces read "wrote nothing" and
+        # a 175-piece image was thrown away. Now: no pass clears; before each pass the piece's own island texels are set
+        # to the magenta sentinel, so any value its rays write - the fill's included - shows; the islands of the pieces
+        # already baked are put back after the pass (a margin cannot overwrite them); and at the end every texel no
+        # piece wrote takes the bake's own clear value (Blender's: the flat normal for NORMAL, black for the rest).
+        import numpy as np                                      # noqa: PLC0415 - Blender ships numpy
+        isl_maps = []
+        masks = (_piece_masks(plan, width, height, isl_maps) if (pieces or into is not None or check_islands)
+                 and target != "COLOR_ATTRIBUTE" else None)
+        written_all = [None] * len(plan)
+        original = _read_px(image) if masks is not None else None
+        clear_px = (0.5, 0.5, 1.0, 1.0) if bake_type == "NORMAL" else (0.0, 0.0, 0.0, 1.0)
+        # THE SENTINEL GOES ON ISLAND INTERIORS ONLY (measured 2026-11-26, 5.0.1): with no clear, a texel on an island's
+        # edge that Blender fills as margin mixes in what was there, so a magenta edge came back 0.4 too red and blue on 3
+        # texels of a 128 roughness map. Each pass starts its islands' edges and margin ring at the clear value, as
+        # use_clear would, and the sentinel marks the texels four-way inside an island (a whole island, when it is too
+        # small to have an inside); those are what "written" and "missed" count.
+        probes = [_probe_mask(m_, ids_) for m_, (ids_, _i) in zip(masks, isl_maps)] if masks is not None else None
+        if masks is not None and into is None:
+            _write_px(image, np.broadcast_to(np.array(clear_px, dtype=np.float32), original.shape).copy())
+        isolate = bool(pieces) and not (bake_type == "AO" and ao_against == "SCENE")
+        pair_objs = [{o for o in [low_] + srcs_ + ([c_] if c_ is not None else [])} for low_, srcs_, c_ in plan]
+        t_all = time.perf_counter()
         for i, (low, srcs, pcage) in enumerate(plan):
             # SELECTION IS PART OF THE CONTRACT: bake reads the selected objects and writes into the
             # ACTIVE one. Leaving a stray selection from earlier work is one of the ways this produces
             # nothing while reporting FINISHED.
+            # EVERY OTHER PAIR IS HIDDEN FOR THIS PASS (1.4): a bake syncs every render-visible object into Cycles, so with
+            # pieces each pass carried every other piece's high as well (aoAgainst SCENE keeps them, for their occlusion)
+            others = set()
+            for j, s_ in enumerate(pair_objs):
+                if j != i:
+                    others |= s_
+            iso = [o for o in others - pair_objs[i] if isolate and not o.hide_render]
+            for o in iso:
+                o.hide_render = True
             select_only(srcs + [low])
             bpy.context.view_layer.objects.active = low
             # bpy.ops.object.bake fills every unpassed property from scene.render.bake, which the .blend
             # saves. A file last used for a high-to-low bake keeps use_selected_to_active on, and this
             # one-object bake then refused with "No valid selected objects" (2026-10-04, outfit.blend).
             # Only the first piece clears the image; the rest write their own UV islands into it.
-            kwargs = {"type": _BAKE_TYPES[bake_type], "margin": margin, "use_clear": i == 0,
+            kwargs = {"type": _BAKE_TYPES[bake_type], "margin": margin, "use_clear": i == 0 and masks is None,
                       "use_selected_to_active": bool(srcs), "use_cage": pcage is not None}
+            reach = reaches[i] if pieces else {}
             if srcs:
-                kwargs["cage_extrusion"] = extrusion if extrusion is not None else 0.01
-                if max_ray is not None:
-                    kwargs["max_ray_distance"] = max_ray
+                kwargs["cage_extrusion"] = (reach["extrusion"] if reach.get("extrusion") is not None
+                                            else extrusion if extrusion is not None else 0.01)
+                if reach.get("maxRayDistance") is not None or max_ray is not None:
+                    kwargs["max_ray_distance"] = (reach["maxRayDistance"] if reach.get("maxRayDistance") is not None
+                                                  else max_ray)
                 if pcage is not None:
                     kwargs["cage_object"] = pcage.name
             if bake_type == "NORMAL":
@@ -2654,13 +3385,56 @@ def op_bake_texture(params):
                 kwargs["pass_filter"] = {"COLOR"}
             if target == "COLOR_ATTRIBUTE":
                 kwargs["target"] = "VERTEX_COLORS"
-            prior = _pixel_signature(image) if pieces else None
-            bpy.ops.object.bake(**kwargs)
-            if pieces:
-                sig = _pixel_signature(image)
-                piece_rows.append({"object": low.name, "sources": [o.name for o in srcs],
-                                   "cage": pcage.name if pcage is not None else None, "changed": sig != prior,
-                                   "offsetX": i * explode if explode is not None else None})
+            if masks is not None:
+                saved = _read_px(image)
+                cur = saved.copy()
+                done_now = np.zeros(masks[i].shape, dtype=bool)
+                for j in range(i):
+                    done_now |= masks[j]
+                cur[_grow(masks[i], margin) & ~done_now] = clear_px
+                cur[probes[i]] = _SENTINEL
+                _write_px(image, cur)
+            t0 = time.perf_counter()
+            try:
+                bpy.ops.object.bake(**kwargs)
+            finally:
+                for o in iso:
+                    o.hide_render = False
+            secs = time.perf_counter() - t0
+            if masks is not None:
+                got = _read_px(image)
+                wrote = probes[i] & ~_is_sentinel(got)
+                done_before = np.zeros(masks[i].shape, dtype=bool)
+                for j in range(i):
+                    done_before |= masks[j]
+                keep = done_before & ~masks[i]
+                got[keep] = saved[keep]
+                if into is not None:
+                    # outside every island of this call the image is the caller's: a margin does not reach it
+                    outside = ~masks[i] & ~done_before
+                    grown = _grow(masks[i], margin)
+                    got[outside & ~grown] = saved[outside & ~grown]
+                _write_px(image, got)
+                written_all[i] = wrote
+                n_isl, n_wr = int(probes[i].sum()), int(wrote.sum())
+                row = {"object": low.name, "sources": [o.name for o in srcs],
+                       "cage": pcage.name if pcage is not None else None, "changed": n_wr > 0,
+                       "islandTexels": n_isl, "texelsWritten": n_wr, "texelsMissed": n_isl - n_wr,
+                       "seconds": round(secs, 3), "hiddenForPass": len(iso),
+                       "offsetX": i * explode if explode is not None else None}
+                if reach:
+                    row["reach"] = reach
+                piece_rows.append(row)
+        pieces_seconds = round(time.perf_counter() - t_all, 3)
+        if masks is not None:
+            # every texel no pass wrote: the bake's clear value on a new image, what was there on an existing one
+            fin = _read_px(image)
+            left = _is_sentinel(fin)
+            if into is None:
+                fin[left] = (0.5, 0.5, 1.0, 1.0) if bake_type == "NORMAL" else (0.0, 0.0, 0.0, 1.0)
+            else:
+                fin[left] = original[left]
+            _write_px(image, fin)
         after = _pixel_signature(image)
     except Exception as exc:
         for mat, node in added_nodes:
@@ -2668,15 +3442,15 @@ def op_bake_texture(params):
                 mat.node_tree.nodes.remove(node)
             except Exception:  # noqa: BLE001
                 pass
-        try:
-            bpy.data.images.remove(image)
-        except Exception:  # noqa: BLE001
-            pass
+        _drop_image(image, into, locals().get("original"))
         raise MifOpError("bake failed on '%s' (%s): %s: %s. NOTHING was written."
                          % (obj.name, bake_type, type(exc).__name__, exc))
     finally:
         for o in hidden:
             o.hide_render = False
+        for low_, was in rays_off:
+            for a, v in was.items():
+                setattr(low_, a, v)
         for o, mb in moved:
             o.matrix_basis = mb
         if moved:
@@ -2746,16 +3520,17 @@ def op_bake_texture(params):
     # mistake boolean_op made against a modifier earlier the same night, and Blender says so:
     # "ReferenceError: StructRNA of type Image has been removed".
     was_dirty = image.is_dirty
-    if not was_dirty or before == after:
+    if masks is not None:
+        was_dirty = True
+        after = _pixel_signature(image)
+    if (masks is None and (not was_dirty or before == after)) or (masks is not None and
+                                                                   not any(r_["changed"] for r_ in piece_rows)):
         for mat, node in added_nodes:
             try:
                 mat.node_tree.nodes.remove(node)
             except Exception:  # noqa: BLE001
                 pass
-        try:
-            bpy.data.images.remove(image)
-        except Exception:  # noqa: BLE001
-            pass
+        _drop_image(image, into, original)
         raise MifOpError(
             "the bake reported FINISHED and the image is still the magenta sentinel it was "
             "filled with (signature %s, dirty=%s) - so nothing was written. That is "
@@ -2765,18 +3540,36 @@ def op_bake_texture(params):
             "image would have matched exactly. The image was discarded rather than handed back "
             "blank." % (before, was_dirty))
 
+    # A PIECE THAT WROTE NOTHING IS NAMED, AND THE OTHERS' WORK IS KEPT (1.4, FOUND 2026-11-18): the whole image was
+    # discarded, so one idle piece cost a 175-piece bake. Its islands hold the bake's clear value (or, in an existing
+    # image, what was there) and the reply's idlePieces and each row's islandTexels / texelsWritten / texelsMissed
+    # say which and why.
     idle = [row["object"] for row in piece_rows if not row["changed"]]
+    idle_note = None
     if idle:
-        for mat, node in added_nodes:
-            try:
-                mat.node_tree.nodes.remove(node)
-            except Exception:  # noqa: BLE001
-                pass
-        bpy.data.images.remove(image)
-        raise MifOpError("the piece(s) %s left the image as it was - their bake wrote nothing (no UV island of their "
-                         "own, or no ray reached their source). The image was discarded rather than handed back with "
-                         "holes." % ", ".join(idle))
+        no_isl = [row["object"] for row in piece_rows if not row["changed"] and not row.get("islandTexels")]
+        idle_note = ("%d piece(s) wrote nothing and their islands hold %s: %s%s. Bake them again on their own (object "
+                     "+ source) into this image (image), or give them islands." % (
+                         len(idle), "what was there" if into is not None else "the bake's clear value",
+                         ", ".join(idle[:20]), (" - %s cover no texel at this size" % ", ".join(no_isl[:20]))
+                         if no_isl else " - no ray from their islands reached their source"))
 
+    warnings = []
+    island_cov = None
+    if check_islands and masks is not None:
+        island_cov = _island_coverage(plan, isl_maps, [w_ if w_ is not None else m_ & False
+                                                       for w_, m_ in zip(written_all, probes)])
+        if island_cov["islandsEmpty"]:
+            warnings.append("%d UV island(s) got no texel from the bake (%.2f%% of the covered texels) and hold the "
+                            "background: %s" % (island_cov["islandsEmpty"], 100 * island_cov["emptyShare"],
+                                                ", ".join("%s island %d%s" % (e["object"], e["island"],
+                                                                              " (%s)" % e["material"] if e["material"]
+                                                                              else "")
+                                                          for e in island_cov["empty"][:8])))
+    normal_check = None
+    if bake_type == "NORMAL":
+        normal_check = _normal_check(image, plan, masks, written_all, sources, probes)
+        warnings += normal_check.pop("warnings")
     blob_stats = fix_normal_blobs(image, *blob_rule) if blob_rule is not None else None
 
     saved = None
@@ -2845,8 +3638,14 @@ def op_bake_texture(params):
         "greenChannel": (green or "OPENGL") if bake_type == "NORMAL" else None,
         "blobFix": dict(zip(("maxTiltDeg", "minBlobPx"), blob_rule), **blob_stats) if blob_rule else None,
         "pieces": piece_rows or None, "explode": explode,
+        "piecesSeconds": pieces_seconds if pieces else None,
+        "idlePieces": idle or None, "idleNote": idle_note,
+        "bakedInto": into.name if into is not None else None,
+        "islandCoverage": island_cov, "normalCheck": normal_check, "warnings": warnings or None,
         # What the rays could not hit: every other geometry object for a one-object bake, collision meshes always.
         "excluded": len(hidden), "excludedNames": [o.name for o in hidden][:40],
+        "aoAgainst": ao_against if bake_type == "AO" and sources else None,
+        "lowRaysOff": [lo_.name for lo_, _w in rays_off] or None,
         "included": [o.name for o in include] or None,
     }
     if bake_type in _EMIT_ROUTE:
@@ -3131,7 +3930,7 @@ def _procedural_vec(params, key, third):
 
     A PROCEDURAL PATTERN IS 3D, and _uv_pair (built for an image's two axes) writes the third component as the
     identity. In Object or Generated space, on a face that does not face Z, a scale that reaches only X and Y
-    stretches the pattern along Z by the same factor: building the ambient cabin (2026-09-21, ledger B191) a Voronoi
+    stretches the pattern along Z by the same factor: building the ambient cabin a Voronoi
     fieldstone at scale 5.5 rendered as vertical wood grain on the chimney breast until the Mapping node's Z was
     written by hand. A number keeps meaning X and Y - scenes built on that must render as they did - and [x, y, z]
     is how a caller scales all three; the reply's scaleNote says when a 3D space got only two.
@@ -3201,6 +4000,11 @@ def op_set_material_texture(params):
                                 colour and Non-Color when it takes a value or a vector; a free or
                                 reused node keeps the image's own unless one is given.
       uvMap (str)               drive the texture from a named UV layer instead of the active one.
+      scale / offset            a number or [u, v], through a Mapping node
+      rotation (float | [x, y, z])  DEGREES: a number turns about Z, [x, y, z] about each axis as the Mapping
+                                node does - add_procedural_texture's reading (_rotation_degrees). mappingRotation
+                                reads it back off the node in degrees; rotationNote answers values that look
+                                like radians.
       strength (float)          normal input only - the Normal Map node's strength.
       normalConvention (str)    normal input only: OPENGL (default) or DIRECTX (green flipped, Unreal's
                                 maps) - the node's own switch on 5.2+, a 1 - G step before it earlier.
@@ -3212,7 +4016,9 @@ def op_set_material_texture(params):
                                 The image feeds its Height and it feeds the active Material Output's
                                 Displacement; Non-Color. The reply's displacementMethod says whether the
                                 surface moves (DISPLACEMENT / BOTH) or is only shaded (BUMP).
-      replace (bool)            replace an image already on that input. Default true.
+      replace (bool)            replace an image already on that input. Default true; the chain that fed it
+                                (its Image Texture, Normal Map, Mapping) is removed when it drives nothing else,
+                                named in replacedNodesRemoved.
 
     NORMAL IS ITS OWN CASE. The Principled Normal socket takes a VECTOR, and a tangent-space normal
     map is RGB - so this builds the Normal Map node between them. Wiring the image directly gives a
@@ -3374,9 +4180,9 @@ def op_set_material_texture(params):
     ext = take(params, "extension", default=None, kind=str)
     scale_uv = _uv_pair(params, "scale", 1.0)
     offset_uv = _uv_pair(params, "offset", 0.0)
-    rot_deg = take(params, "rotation", default=None)
-    if rot_deg is not None:
-        rot_deg = finite_float(rot_deg, "rotation")
+    # A number turns about Z, [x, y, z] about each axis, in DEGREES: add_procedural_texture's reading, shared so the
+    # two ops cannot drift (this op took a number only until 2026-11-26).
+    rot_rad, rotation_note = _rotation_degrees(params)
     if scale_uv is not None and (scale_uv[0] == 0.0 or scale_uv[1] == 0.0):
         raise MifOpError(
             "scale 0 collapses the texture to one pixel's colour across the whole surface, "
@@ -3515,8 +4321,9 @@ def op_set_material_texture(params):
         # WHY IT MATTERS, from a real one: a floor material built through this op takes the mesh's
         # UVs at 1:1, so a 2 m texture stretched over a 30 m deck and read as carpet. A Mapping node is
         # the per-texture, non-destructive answer. scale and offset take a scalar or [u, v]; rotation is
-        # DEGREES and scalar, converted to the socket's radians at the boundary.
-        want_mapping = scale_uv is not None or offset_uv is not None or rot_deg is not None
+        # DEGREES (a number about Z, or [x, y, z]), converted to the socket's radians at the boundary.
+        mapping = None
+        want_mapping = scale_uv is not None or offset_uv is not None or rot_rad is not None
         if want_mapping:
             mapping = tree.nodes.new("ShaderNodeMapping")
             _made_nodes.append(mapping)
@@ -3525,8 +4332,8 @@ def op_set_material_texture(params):
                 mapping.inputs["Scale"].default_value = scale_uv
             if offset_uv is not None:
                 mapping.inputs["Location"].default_value = offset_uv
-            if rot_deg is not None:
-                mapping.inputs["Rotation"].default_value = (0.0, 0.0, math.radians(rot_deg))
+            if rot_rad is not None:
+                mapping.inputs["Rotation"].default_value = rot_rad
             # A SOURCE IS REQUIRED. An unconnected Mapping Vector reads as a constant zero and paints the
             # whole surface one colour; a Texture Coordinate node supplies the active layer explicitly.
             if uv_node is None:
@@ -3544,7 +4351,8 @@ def op_set_material_texture(params):
         convention_route = None
         if target is not None:
             # THE OLD LINK GOES FIRST. links.new on a single-input socket replaces silently, but the node
-            # that fed it is left floating in the tree where describe_material will keep reporting it.
+            # that fed it is left floating in the tree where describe_material will keep reporting it - so the chain
+            # is removed once the new link holds (replacedNodesRemoved, below).
             for link in list(target.links):
                 replaced = link.from_node.name
                 _removed_links.append((link.from_socket, link.to_socket))
@@ -3601,6 +4409,12 @@ def op_set_material_texture(params):
             # SET ON THE IMAGE, like the colour space, so every user of it sees it - written last, after the
             # last refusal, so a refused call leaves an existing image's alpha as it was.
             img.alpha_mode = alpha_mode
+        # THE REPLACED CHAIN GOES TOO (2026-11-25). Re-running this on the same input added a second Image Texture node
+        # and left the old one floating, which describe_material then flagged "loaded and unused". Whatever fed the
+        # input before - its Image Texture, and a Normal Map, Mapping or UV node behind it - is removed when it now drives
+        # nothing; a node that still feeds anything else stays. After the last refusal, so a refused call removes nothing.
+        replaced_removed = (_remove_orphaned_chain(tree, replaced, keep=[tex] + _made_nodes)
+                            if replaced and replaced != tex.name else [])
         return {
             "ok": True,
             "material": mat.name,
@@ -3643,7 +4457,15 @@ def op_set_material_texture(params):
             "normalConventionRoute": convention_route,
             "uvMapNode": getattr(uv_node, "name", None),
             "uvMapNote": _uv_map_note(mat, uv_map),
+            # THE MAPPING AS WRITTEN, read back off the node: the rotation in degrees, as add_procedural_texture reports it
+            "mappingNode": getattr(mapping, "name", None),
+            "mappingRotation": ([round(math.degrees(float(v)), 4) for v in mapping.inputs["Rotation"].default_value]
+                                if mapping is not None else None),
+            "rotationNote": rotation_note,
             "replacedLinkFrom": replaced,
+            "replacedNodesRemoved": replaced_removed,
+            "replacedNodesKept": ([replaced] if replaced and replaced not in replaced_removed
+                                  and tree.nodes.get(replaced) is not None else []),
             "loadedFromDisk": loaded_now,
             "note": ("wired through a Normal Map node, which converts tangent-space RGB into the vector "
                      "the Normal input takes. Linking the image straight in is the usual mistake and "
@@ -3910,7 +4732,7 @@ def op_set_material_settings(params):
     # written and inert under it. Still written, because a scene is often set up under one renderer
     # and rendered with another.
     #
-    # EXCEPT displacementMethod, which Cycles renders (docs/22 B66: BUMP against DISPLACEMENT 3.87-4.56 / 255 in Cycles
+    # EXCEPT displacementMethod, which Cycles renders (the internal notes: BUMP against DISPLACEMENT 3.87-4.56 / 255 in Cycles
     # on 4.2.17-5.2.1, and BOTH apart from DISPLACEMENT as well) - it was listed inert here with every other key until
     # 2026-09-28 (the 2026-09-21 pack-rule review), so a caller setting a true displacement for a Cycles render was told
     # the write did nothing.
@@ -4013,7 +4835,131 @@ RAMP_KEYS = {"material", "tree", "group", "node", "stops", "interpolation", "col
 PROCEDURAL_KEYS = {"material", "name", "type", "nodeName", "input", "toNode", "toSocket",
                    "fromSocket", "settings", "properties", "space", "uvMap",
                    "scale", "offset", "rotation", "colorRamp", "relief", "strength",
-                   "distance", "replace"}
+                   "distance", "replace", "layer", "projection"}
+# LAYERED PATTERNS (2026-11-26): a second pattern on the same input replaced the first, so large + mid + fine breakup
+# needed a Mix node added by hand. layer {blend, factor} puts one in: what drove the input (or its value) is A, the new
+# pattern B, and the Mix drives the input. Blend is the Mix node's own (RGBA: a value socket reads its result as a value).
+_LAYER_BLENDS = {"mix": "MIX", "multiply": "MULTIPLY", "overlay": "OVERLAY", "add": "ADD", "screen": "SCREEN",
+                 "softlight": "SOFT_LIGHT", "lighten": "LIGHTEN", "darken": "DARKEN"}
+
+# BOX PROJECTION'S SPACES (1.4, found 2026-11-19 on a modular building set). A 2D pattern - brick, a wave's bands - reads
+# X and Y of its vector, so in Object space it lies flat on every vertical face: vertical stripes where a wall wants
+# courses. Box projection hands each face the two coordinates across it, chosen by the axis its normal points along most.
+# Object is the default (the pattern follows the object, as Object space does); World reads the Geometry node, so pieces
+# placed side by side share one grid. Generated, UV and the view spaces have no box form and are refused.
+_BOX_SPACES = ("Object", "World")
+
+
+def _rotation_degrees(params):
+    """add_procedural_texture's `rotation`: a number (DEGREES about Z, as before) or [x, y, z] in DEGREES, as the
+    Mapping node takes it. Returns (the (x, y, z) radians tuple or None, a note or None). Writes nothing."""
+    raw = take(params, "rotation", default=None)
+    if raw is None:
+        return None, None
+    if isinstance(raw, (list, tuple)):
+        if len(raw) != 3 or any(isinstance(v, bool) for v in raw):
+            raise MifOpError("rotation takes a number (degrees about Z) or [x, y, z] in degrees, got %r. NOTHING was "
+                             "changed." % (raw,))
+        deg = tuple(finite_floats([raw[0], raw[1], raw[2]], "rotation"))
+    elif isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise MifOpError("rotation takes a number (degrees about Z) or [x, y, z] in degrees, got %r. NOTHING was "
+                         "changed." % (raw,))
+    else:
+        deg = (0.0, 0.0, finite_float(raw, "rotation"))
+    # RADIANS SENT AS DEGREES turn the pattern by a degree or so and look like nothing happened: -1.5708 was sent to
+    # stand a brick pattern up. A non-integer within 0.002 of a multiple of pi/4 is answered, never refused.
+    quarter = math.pi / 4.0
+    looks_rad = [v for v in deg if v and v != round(v) and abs(v) < 6.3
+                 and abs(v / quarter - round(v / quarter)) * quarter < 0.002]
+    note = (("rotation is DEGREES: %s look(s) like radians (%s degrees each). Pass %s if a quarter turn was meant."
+             % (", ".join("%g" % v for v in looks_rad), ", ".join("%g" % v for v in looks_rad),
+                [round(math.degrees(v), 3) for v in deg]))
+            if looks_rad else None)
+    return tuple(math.radians(v) for v in deg), note
+
+
+def _box_projection(tree, made, space, x, y, tail):
+    """Build a box-projected coordinate for a 2D pattern and return (its output socket, the source node, the space).
+
+    Per shading point: the axis its normal points along most picks the two coordinates across the face - a face along
+    X reads (Y, Z), along Y (X, Z), along Z (X, Y) - so walls get level courses and floors and roofs the plan view. Built
+    from Separate XYZ, a Vector Math Absolute and Math nodes (no node group, so nothing outside the material is made):
+        mX = |nx| > |ny| and |nx| > |nz|        mZ = |nz| > |nx| and |nz| > |ny|
+        u  = px + mX * (py - px)                 v  = pz + mZ * (py - pz)
+    A face at exactly 45 degrees between two axes counts as the third. Every node goes on `made` for the caller's
+    rollback."""
+    want = "Object" if space is None else str(space).strip().capitalize()
+    if want not in _BOX_SPACES:
+        raise MifOpError("projection 'box' reads %s space, got space %r - Generated, UV and the view spaces have no box "
+                         "form. %s" % (" or ".join(_BOX_SPACES), space, tail))
+
+    def new(idname, dx, dy, label):
+        n = tree.nodes.new(idname)
+        made.append(n)
+        n.location = (x + dx, y + dy)
+        n.label = label
+        return n
+
+    def math_node(op, dx, dy, label):
+        n = new("ShaderNodeMath", dx, dy, label)
+        ops = [i.identifier for i in n.bl_rna.properties["operation"].enum_items]
+        if op not in ops:
+            raise MifOpError("this Blender's Math node has no %s operation (it has %s), so box projection cannot be "
+                             "built. %s" % (op, ", ".join(ops), tail))
+        n.operation = op
+        return n
+
+    if want == "World":
+        src = new("ShaderNodeNewGeometry", -1500, 0, "Box World")
+        pos, nrm = src.outputs["Position"], src.outputs["Normal"]
+    else:
+        src = new("ShaderNodeTexCoord", -1500, 0, "Box Object")
+        pos, nrm = src.outputs["Object"], src.outputs["Normal"]
+    sep_p = new("ShaderNodeSeparateXYZ", -1300, 150, "Box P")
+    absn = new("ShaderNodeVectorMath", -1300, -150, "Box |N|")
+    vops = [i.identifier for i in absn.bl_rna.properties["operation"].enum_items]
+    if "ABSOLUTE" not in vops:
+        raise MifOpError("this Blender's Vector Math node has no ABSOLUTE operation, so box projection cannot be built. "
+                         "%s" % tail)
+    absn.operation = "ABSOLUTE"
+    sep_n = new("ShaderNodeSeparateXYZ", -1120, -150, "Box N")
+    tree.links.new(pos, sep_p.inputs[0])
+    tree.links.new(nrm, absn.inputs[0])
+    tree.links.new(absn.outputs[0], sep_n.inputs[0])
+    nx, ny, nz = sep_n.outputs[0], sep_n.outputs[1], sep_n.outputs[2]
+    px, py, pz = sep_p.outputs[0], sep_p.outputs[1], sep_p.outputs[2]
+
+    def mask(a, b, c, dy, axis, others):
+        g1 = math_node("GREATER_THAN", -940, dy, "Box |n%s|>|n%s|" % (axis.lower(), others[0]))
+        g2 = math_node("GREATER_THAN", -940, dy - 120, "Box |n%s|>|n%s|" % (axis.lower(), others[1]))
+        m = math_node("MULTIPLY", -760, dy - 60, "Box mask %s" % axis)
+        tree.links.new(a, g1.inputs[0])
+        tree.links.new(b, g1.inputs[1])
+        tree.links.new(a, g2.inputs[0])
+        tree.links.new(c, g2.inputs[1])
+        tree.links.new(g1.outputs[0], m.inputs[0])
+        tree.links.new(g2.outputs[0], m.inputs[1])
+        return m.outputs[0]
+
+    def blend(m, toward, base, dy, axis):
+        d = math_node("SUBTRACT", -580, dy, "Box d%s" % axis)
+        r = math_node("MULTIPLY_ADD", -400, dy, "Box %s" % axis)
+        tree.links.new(toward, d.inputs[0])
+        tree.links.new(base, d.inputs[1])
+        tree.links.new(m, r.inputs[0])
+        tree.links.new(d.outputs[0], r.inputs[1])
+        tree.links.new(base, r.inputs[2])
+        return r.outputs[0]
+
+    m_x = mask(nx, ny, nz, 0, "X", "yz")
+    m_z = mask(nz, nx, ny, -300, "Z", "xy")
+    u = blend(m_x, py, px, 100, "U")
+    v = blend(m_z, py, pz, -200, "V")
+    comb = new("ShaderNodeCombineXYZ", -220, 0, "Box UV")
+    tree.links.new(u, comb.inputs[0])
+    tree.links.new(v, comb.inputs[1])
+    comb.inputs[2].default_value = 0.0
+    return comb.outputs[0], src, want
 
 
 def _material_or_refuse(name, tail="NOTHING was changed."):
@@ -4113,7 +5059,7 @@ def _write_ramp_stops(ramp, stops):
 
 
 # ---------------------------------------------------------------------------
-# A VOLUME SHADER - smoke, fire, fog. MEASURED 2026-09-17 on 3.6.23, 4.2.17, 4.4.0, 5.0.1 and 5.2.1 in plain bpy (docs/22
+# A VOLUME SHADER - smoke, fire, fog. MEASURED 2026-09-17 on 3.6.23, 4.2.17, 4.4.0, 5.0.1 and 5.2.1 in plain bpy (the internal notes
 # B80). A GAS fluid domain - resolution 32, a sphere INFLOW, frames 1-24 stepped, black world, one sun, 96 px - renders
 # as a SOLID LIT BOX in EEVEE (mean 61-65 of 255) and as NOTHING in Cycles while it has no material, which is the state
 # add_fluid leaves it in and how the second seat measured "frame 2 vs 40: 0.000". A Principled Volume on the output's
@@ -4218,7 +5164,7 @@ def op_set_material_volume(params):
     THE HALF OF A MATERIAL NOTHING COULD WRITE. create_material, set_material_properties and add_procedural_texture all
     work on the Principled BSDF on Surface, so add_fluid could build a smoke or fire simulation and nothing could make it
     appear - the second seat measured frame 2 against frame 40 of a GAS domain at 0.000 of 255 apart. Measured on all
-    five builds (the block above _VOLUME_INPUTS, docs/22 B80): a domain with no material renders as a solid box in EEVEE
+    five builds: a domain with no material renders as a solid box in EEVEE
     and as nothing in Cycles, and a Principled Volume renders the simulated smoke in both.
 
     ONE NODE, FOUND OR MADE. A Principled Volume already on the output's Volume socket is edited in place; with nothing
@@ -4627,6 +5573,10 @@ def op_add_procedural_texture(params):
                                         two patterns get combined through a Mix or Math node
       fromSocket (str)                  which texture output to take. Chosen from the destination
                                         when omitted - see _pick_output
+      layer {blend, factor} | blend     mix the pattern OVER what drives the destination instead of replacing
+                                        it: a Mix node (blend mix | multiply | overlay | add | screen | softlight |
+                                        lighten | darken, factor 0.5) takes the old driver (or the input's value) as
+                                        A and the pattern as B - large + mid + fine breakup is three calls
       replace (bool)                    replace whatever already drives the destination. Default
                                         true; false refuses rather than stacking. The replaced
                                         chain is removed with its link - the old driver and every
@@ -4637,7 +5587,14 @@ def op_add_procedural_texture(params):
                                         Reflect - the Texture Coordinate output to drive it from
       uvMap (str)                       a named UV layer instead, through a UV Map node
       scale / offset                    a number or [u, v], through a Mapping node
-      rotation (float)                  DEGREES about the texture plane's normal
+      rotation (float | [x, y, z])      DEGREES: a number turns about Z (the texture plane's normal), [x, y, z]
+                                        turns about each axis as the Mapping node does - [-90, 0, 0] stands an XY
+                                        pattern up on a wall facing Y. rotationNote answers values that look like
+                                        radians
+      projection (str)                  'box': each face reads the two coordinates across it, picked by the axis its
+                                        normal points along most, so a 2D pattern (brick, a wave's bands) lies level
+                                        on walls, floors and roofs alike - one call for the whole piece. space Object
+                                        (default) or World; not with uvMap. scale/offset/rotation apply after it
 
       colorRamp (list)                  stops to put between the pattern and the destination
       relief (str)                      bump | normalMap, only with input:'normal'
@@ -4777,16 +5734,34 @@ def op_add_procedural_texture(params):
                "no relief node is being built here - distance only applies to input:'normal'"))
 
     replace = take_bool(params, "replace", default=True)
-    if target is not None and target.is_linked and not replace:
+    layer = params.get("layer")
+    if layer is not None:
+        if isinstance(layer, str):
+            layer = {"blend": layer}
+        if not isinstance(layer, dict) or set(layer) - {"blend", "factor"}:
+            raise MifOpError("layer is {blend, factor} or a blend name (%s), got %r. NOTHING was changed."
+                             % (", ".join(_LAYER_BLENDS), params.get("layer")))
+        lb = str(layer.get("blend", "mix")).lower()
+        if lb not in _LAYER_BLENDS:
+            raise MifOpError("layer.blend is one of %s, got %r. NOTHING was changed." % (", ".join(_LAYER_BLENDS), lb))
+        lf = finite_float(layer.get("factor", 0.5), "layer.factor")
+        if not 0.0 <= lf <= 1.0:
+            raise MifOpError("layer.factor runs 0-1, got %g. NOTHING was changed." % lf)
+        if target is None:
+            raise MifOpError("layer mixes the pattern over what drives a destination, and this call has none - pass "
+                             "input or toNode + toSocket. NOTHING was changed.")
+        if relief is not None:
+            raise MifOpError("layer mixes colors or values; a relief (bump / normalMap) is a normal - layer two heights "
+                             "into one Bump instead (toNode the Bump's Height). NOTHING was changed.")
+        layer = (lb, lf)
+    if target is not None and target.is_linked and not replace and layer is None:
         raise MifOpError("%s is already driven by '%s' and replace:false was given. NOTHING was "
                          "changed." % (target_desc, target.links[0].from_node.name))
 
     # Mapping and coordinate parameters, all parsed before any node exists.
     scale_uv, scale_3d = _procedural_vec(params, "scale", 1.0)
     offset_uv, _offset_3d = _procedural_vec(params, "offset", 0.0)
-    rot_deg = take(params, "rotation", default=None)
-    if rot_deg is not None:
-        rot_deg = finite_float(rot_deg, "rotation")
+    rot_rad, rotation_note = _rotation_degrees(params)
     if scale_uv is not None and (scale_uv[0] == 0.0 or scale_uv[1] == 0.0 or scale_uv[2] == 0.0):
         raise MifOpError(
             "scale 0 collapses the pattern to one point's value across the whole surface, which "
@@ -4798,6 +5773,19 @@ def op_add_procedural_texture(params):
         raise MifOpError("pass `space` (a Texture Coordinate output) or `uvMap` (a named UV "
                          "layer), not both - they are two answers to the same question. NOTHING "
                          "was changed.")
+    projection = take(params, "projection", default=None, kind=str)
+    box = False
+    if projection is not None:
+        if str(projection).strip().lower() != "box":
+            raise MifOpError("projection takes 'box', got %r - leave it out for the coordinates as they come. NOTHING "
+                             "was changed." % (projection,))
+        if uv_map is not None:
+            raise MifOpError("projection 'box' builds its coordinates from the object or world position, and uvMap "
+                             "reads a UV layer instead - pass one of them. NOTHING was changed.")
+        if space is not None and str(space).strip().capitalize() not in _BOX_SPACES:
+            raise MifOpError("projection 'box' reads %s space, got space %r - Generated, UV and the view spaces have "
+                             "no box form. NOTHING was changed." % (" or ".join(_BOX_SPACES), space))
+        box = True
 
     ramp_stops = None
     if params.get("colorRamp") is not None:
@@ -4874,14 +5862,17 @@ def op_add_procedural_texture(params):
         # ---- COORDINATES ----------------------------------------------------------------------
         coord_node = None
         mapping_node = None
-        want_mapping = scale_uv is not None or offset_uv is not None or rot_deg is not None
-        if want_mapping or space is not None or uv_map is not None:
+        box_space = None
+        want_mapping = scale_uv is not None or offset_uv is not None or rot_rad is not None
+        if want_mapping or space is not None or uv_map is not None or box:
             vector_in = tex.inputs.get("Vector")
             if vector_in is None:
                 raise MifOpError(
                     "a %s has no Vector input, so it cannot be given coordinates - drop space, "
-                    "uvMap, scale, offset and rotation. %s" % (tex.bl_idname, node_tail))
-            if uv_map is not None:
+                    "uvMap, projection, scale, offset and rotation. %s" % (tex.bl_idname, node_tail))
+            if box:
+                coord_out, coord_node, box_space = _box_projection(tree, made, space, base_x, base_y, node_tail)
+            elif uv_map is not None:
                 coord_node = tree.nodes.new("ShaderNodeUVMap")
                 made.append(coord_node)
                 coord_node.uv_map = str(uv_map)
@@ -4901,7 +5892,8 @@ def op_add_procedural_texture(params):
                         % (space, bpy.app.version_string,
                            ", ".join(s.name for s in coord_node.outputs), node_tail))
                 coord_out = match[0]
-            coord_node.location = (base_x - 620, base_y)
+            if not box:
+                coord_node.location = (base_x - 620, base_y)
 
             if want_mapping:
                 mapping_node = tree.nodes.new("ShaderNodeMapping")
@@ -4911,11 +5903,10 @@ def op_add_procedural_texture(params):
                     mapping_node.inputs["Scale"].default_value = scale_uv
                 if offset_uv is not None:
                     mapping_node.inputs["Location"].default_value = offset_uv
-                if rot_deg is not None:
-                    # DEGREES IN, RADIANS ON THE SOCKET, about the texture plane's normal. The
-                    # other two axes are not what anybody means by rotating a texture.
-                    mapping_node.inputs["Rotation"].default_value = (0.0, 0.0,
-                                                                     math.radians(rot_deg))
+                if rot_rad is not None:
+                    # DEGREES IN, RADIANS ON THE SOCKET. A number is about Z, the texture plane's normal;
+                    # [x, y, z] (1.4) is each axis, which is how an XY pattern is stood up on a wall.
+                    mapping_node.inputs["Rotation"].default_value = rot_rad
                 # THE MAPPING NODE ALWAYS GETS A SOURCE. An unconnected Mapping Vector is a
                 # constant zero, not "the default coordinates" - the whole surface takes the value
                 # the pattern has at the origin and renders as a flat fill.
@@ -4981,6 +5972,29 @@ def op_add_procedural_texture(params):
             elif source_out is None:
                 source_out, from_note = _pick_output(
                     tex, target.type == "VALUE", explicit_out, node_tail)
+            layer_node = layered_over = None
+            if layer is not None:
+                # THE MIX GOES BETWEEN: what drove the destination stays, as A; the new pattern is B
+                layer_node = tree.nodes.new("ShaderNodeMix")
+                made.append(layer_node)
+                layer_node.name = layer_node.label = "%s Layer" % tex.name
+                layer_node.data_type = "RGBA"
+                layer_node.blend_type = _LAYER_BLENDS[layer[0]]
+                layer_node.location = (base_x + 820, base_y)
+                lins = {sk.identifier: sk for sk in layer_node.inputs}
+                lins["Factor_Float"].default_value = layer[1]
+                if target.is_linked:
+                    prev = target.links[0].from_socket
+                    layered_over = prev.node.name
+                    tree.links.new(prev, lins["A_Color"])
+                else:
+                    dv = target.default_value
+                    vals = list(dv)[:3] if hasattr(dv, "__len__") else [float(dv)] * 3
+                    lins["A_Color"].default_value = (vals + [1.0, 1.0, 1.0])[:3] + [1.0]
+                    layered_over = "the value %s" % [round(x, 4) for x in vals]   # the socket's own floats
+                tree.links.new(source_out, lins["B_Color"])
+                source_node = layer_node
+                source_out = next(sk for sk in layer_node.outputs if sk.identifier == "Result_Color")
 
             # THE OLD LINK IS REMOVED LAST, and it is remembered so it can be put back. links.new
             # on a single-input socket replaces silently, leaving the previous driver floating in
@@ -5025,6 +6039,7 @@ def op_add_procedural_texture(params):
         else:
             replaced = None
             restore = None
+            layer_node = layered_over = None
 
         # THE OLD CHAIN GOES WITH ITS LINK (FOUND 2026-11-10): replace removed only the link into the socket, so a
         # script re-running this each round left the previous texture, mapping and coordinate nodes floating - twenty of
@@ -5051,8 +6066,14 @@ def op_add_procedural_texture(params):
             "scaleNote": (("scale reached X and Y only, so Z stays %g - on a face that does not face Z this pattern "
                            "stretches by the X/Y factor. Pass scale as [x, y, z] to scale all three (the pattern node's "
                            "own Scale input multiplies on top of this: settings {Scale: ...})." % scale_uv[2])
-                          if scale_uv is not None and not scale_3d and uv_map is None
+                          if scale_uv is not None and not scale_3d and uv_map is None and not box
                           and str(space or "Generated").strip().lower() != "uv" else None),
+            # THE ROTATION AS WRITTEN, in degrees, read back off the node
+            "mappingRotation": ([round(math.degrees(float(v)), 4) for v in mapping_node.inputs["Rotation"].default_value]
+                                if mapping_node is not None else None),
+            "rotationNote": rotation_note,
+            "projection": "box" if box else None,
+            "projectionSpace": box_space,
             "coordinateNode": getattr(coord_node, "name", None),
             "colorRampNode": getattr(ramp_node, "name", None),
             "reliefNode": getattr(relief_node, "name", None),
@@ -5068,9 +6089,13 @@ def op_add_procedural_texture(params):
             "target": target_desc,
             "fromSocket": source_out.name if source_out is not None else None,
             "fromSocketNote": from_note,
-            "replacedLinkFrom": replaced,
+            "replacedLinkFrom": None if layer_node is not None else replaced,
             # the old chain removed with its link: the nodes that drove the replaced socket and fed nothing else
-            "replacedNodesRemoved": removed_nodes if replaced else None,
+            "replacedNodesRemoved": removed_nodes if replaced and layer_node is None else None,
+            # layer: the Mix node put between, and what it mixes the pattern over (A)
+            "layerNode": getattr(layer_node, "name", None),
+            "layeredOver": layered_over,
+            "layerBlend": ({"blend": layer[0], "factor": layer[1]} if layer_node is not None else None),
             # MEASURED, not assumed - see above. False here with a target set would mean the op
             # refused, so this is true whenever there is a target at all.
             "linked": bool(target is not None and target.is_linked),
@@ -5400,6 +6425,42 @@ def _pbr_mix_multiply(tree, a_socket, b_socket, to_socket):
     return mix
 
 
+GLTF_OUTPUT_GROUP = "glTF Material Output"
+AO_TO = ("multiply", "gltf", "none")
+
+
+def gltf_occlusion(mat, from_socket):
+    """Link from_socket (an AO image's Color, or the red of a Separate Color reading an ORM) to the Occlusion input of a
+    "glTF Material Output" group node in mat, made when there is none - the one place Blender's glTF exporter reads
+    occlusion from (io_scene_gltf2 search_node_tree.get_socket_from_gltf_material_node: a group whose tree name starts
+    with "glTF Material Output" or "glTF Settings", its input named Occlusion; the same rule in 3.6, 4.2 and 5.0). A
+    Principled BSDF has no AO input (FOUND 2026-11-18 by three builds: an ao role reported "wired" reached no file).
+    The group is empty: it shades nothing in Blender. Returns the group node's name."""
+    from .ops_nodes import _iface_new                                # noqa: PLC0415
+    group = next((g for g in bpy.data.node_groups if g.bl_idname == "ShaderNodeTree"
+                  and g.name.lower().startswith(GLTF_OUTPUT_GROUP.lower())), None)
+    if group is None:
+        group = bpy.data.node_groups.new(GLTF_OUTPUT_GROUP, "ShaderNodeTree")
+    names = ([s.name for s in group.interface.items_tree if getattr(s, "in_out", None) == "INPUT"]
+             if hasattr(group, "interface") else [s.name for s in group.inputs])
+    if "Occlusion" not in names:
+        _iface_new(group, "Occlusion", "NodeSocketFloat", "INPUT")
+    tree = mat.node_tree
+    node = next((n for n in tree.nodes if n.type == "GROUP" and n.node_tree is group), None)
+    if node is None:
+        node = tree.nodes.new("ShaderNodeGroup")
+        node.node_tree = group
+        node.name = node.label = GLTF_OUTPUT_GROUP
+        out = next((n for n in tree.nodes if n.type == "OUTPUT_MATERIAL"), None)
+        if out is not None:
+            node.location = (out.location[0], out.location[1] - 220)
+    sock = node.inputs["Occlusion"]
+    for lk in list(sock.links):
+        tree.links.remove(lk)
+    tree.links.new(from_socket, sock)
+    return node.name
+
+
 def op_import_pbr_texture_set(params):
     """A folder of PBR maps into one material in one call: each map found by its file name, wired where it belongs, in
     the colour space it needs.
@@ -5421,9 +6482,17 @@ def op_import_pbr_texture_set(params):
     the file browser's), which is the default and is named in udimFiles; udim true makes it a TILED image, which finds
     the set's other tiles (1001, 1002 ...). include limits the kinds; mapping {scale, offset} drives every image through
     one shared Mapping node. Every check runs before the first node; a failure while wiring removes what this call made.
+
+    aoTo (2026-11-25): "multiply" (the default) multiplies the AO map into the base colour as above - which drives Base
+    Color by a Mix node, so an FBX carries neither image (FOUND 2026-11-16); "gltf" wires the base colour straight to
+    its input and the AO to a "glTF Material Output" group's Occlusion, which a glTF writes as occlusionTexture; "none"
+    leaves the AO a free node. The reply's ao row says where it went.
     """
-    reject_unknown(params, ("material", "name", "folder", "include", "resolution", "mapping", "udim"),
+    reject_unknown(params, ("material", "name", "folder", "include", "resolution", "mapping", "udim", "aoTo"),
                    "import_pbr_texture_set")
+    ao_to = str(take(params, "aoTo", default="multiply", kind=str)).lower()
+    if ao_to not in AO_TO:
+        raise MifOpError("aoTo is one of %s, got %r. NOTHING was changed." % (", ".join(AO_TO), params.get("aoTo")))
     mat_name = take(params, "material", "name", required=True, kind=str)
     folder = take(params, "folder", required=True, kind=str)
     resolution = take(params, "resolution", default=None, kind=str)
@@ -5559,7 +6628,14 @@ def op_import_pbr_texture_set(params):
                                                                            "shades it as bump, moving no vertex"))
             if kind == "ao":
                 base = wired.get("baseColor")
-                if base is not None:
+                ao_tex = tree.nodes.get(r["imageNode"])
+                if ao_to == "gltf":
+                    grp = gltf_occlusion(mat, ao_tex.outputs["Color"])
+                    row.update({"how": "glTF Occlusion (the %s group) - base colour left straight to its input"
+                                % GLTF_OUTPUT_GROUP, "gltfNode": grp, "aoTo": "gltf"})
+                elif ao_to == "none":
+                    row.update({"how": "a free node (aoTo none)", "aoTo": "none"})
+                elif base is not None:
                     base_tex = tree.nodes.get(base["node"])
                     ao_tex = tree.nodes.get(r["imageNode"])
                     mix = _pbr_mix_multiply(tree, base_tex.outputs["Color"], ao_tex.outputs["Color"],
@@ -5605,6 +6681,368 @@ def op_import_pbr_texture_set(params):
             "notes": notes or None}
 
 
+# ------------------------------------------------------------------------------------------------- floating decals
+# A LABEL ON A BAKED PROP (2026-11-25). No op made a label or a sticker: a build made each as a floating plane on the
+# high poly with ~35 Math / White Noise nodes for a barcode, wave bands for hazard stripes and a ramp on UV distance for a
+# roundel, aged them by hand, and baked them into the low. build_decal makes that plane in one call: a dense mesh shaped
+# to the pattern (a disc for a roundel, the letters for stencil text), shrink-wrapped onto the surface at a small
+# offset (each vertex to its nearest surface point, out along that face's normal), an opaque material with the pattern
+# and its aging, and the names to put in bake_texture_set's source.
+# OPAQUE ON PURPOSE: a selected-to-active bake takes the first surface its ray meets, so a decal's shape is its
+# geometry, not an alpha - the parts that are not label are not there.
+_DECAL_PATTERNS = ("hazard", "barcode", "roundel", "stencil")
+_DECAL_KEYS = {"name", "object", "location", "normal", "up", "size", "pattern", "text", "colors", "age", "underColor",
+               "offset", "resolution", "seed", "stripes", "collection"}
+_DECAL_COLORS = {"hazard": ([0.9, 0.62, 0.02], [0.02, 0.02, 0.02]),
+                 "barcode": ([0.85, 0.85, 0.82], [0.02, 0.02, 0.02]),
+                 "roundel": ([0.6, 0.03, 0.03], [0.85, 0.85, 0.85], [0.02, 0.06, 0.3]),
+                 "stencil": ([0.02, 0.02, 0.02],)}
+
+
+def _decal_vec(params, key, tail, required=False):
+    v = params.get(key)
+    if v is None:
+        if required:
+            raise MifOpError("%s [x, y, z] is required. %s" % (key, tail))
+        return None
+    if not isinstance(v, (list, tuple)) or len(v) != 3:
+        raise MifOpError("%s is [x, y, z], got %r. %s" % (key, v, tail))
+    return finite_floats(list(v), key)
+
+
+def _decal_mesh(pattern, w, h, res, text, bm_mod):
+    """(verts, faces) in decal space: x right, y up, z out of the surface, centred on the origin, w x h."""
+    if pattern == "stencil":
+        cu = bpy.data.curves.new("MifDecalText", "FONT")
+        cu.body = text
+        cu.align_x, cu.align_y = "CENTER", "CENTER"
+        tmp = bpy.data.objects.new("MifDecalText", cu)
+        try:
+            me = tmp.to_mesh()
+            vs = [tuple(v.co) for v in me.vertices]
+            fs = [tuple(f.vertices) for f in me.polygons]
+            tmp.to_mesh_clear()
+        finally:
+            # THROUGH remove_objects, as every removal in the add-on goes: a bare objects.remove leaves a None in the
+            # view layer until its next update, and the next op of a batch reads it (test_blender_view_layer_after_delete)
+            from .ops_common import remove_objects                 # noqa: PLC0415
+            remove_objects([tmp])
+            bpy.data.curves.remove(cu)
+        if not fs:
+            return [], []                  # refused by the caller, after the temporary curve is gone
+        xs, ys = [v[0] for v in vs], [v[1] for v in vs]
+        k = w / max(max(xs) - min(xs), 1e-9)
+        cx, cy = (max(xs) + min(xs)) / 2, (max(ys) + min(ys)) / 2
+        if (max(ys) - min(ys)) * k > h:
+            k = h / max(max(ys) - min(ys), 1e-9)
+        return [((x - cx) * k, (y - cy) * k, 0.0) for x, y, _z in vs], fs
+    if pattern == "roundel":
+        rings, seg = max(4, res // 2), max(24, res * 3)
+        vs = [(0.0, 0.0, 0.0)]
+        fs = []
+        for r in range(1, rings + 1):
+            rad = r / float(rings)
+            for k in range(seg):
+                a = 2 * math.pi * k / seg
+                vs.append((0.5 * w * rad * math.cos(a), 0.5 * h * rad * math.sin(a), 0.0))
+        for k in range(seg):
+            fs.append((0, 1 + k, 1 + (k + 1) % seg))
+        for r in range(1, rings):
+            a0, a1 = 1 + (r - 1) * seg, 1 + r * seg
+            for k in range(seg):
+                k1 = (k + 1) % seg
+                fs.append((a0 + k, a1 + k, a1 + k1, a0 + k1))
+        return vs, fs
+    nx = max(2, int(round(res * max(1.0, w / h))))
+    ny = max(2, int(round(res * max(1.0, h / w))))
+    vs = [((i / nx - 0.5) * w, (j / ny - 0.5) * h, 0.0) for j in range(ny + 1) for i in range(nx + 1)]
+    fs = [(j * (nx + 1) + i, j * (nx + 1) + i + 1, (j + 1) * (nx + 1) + i + 1, (j + 1) * (nx + 1) + i)
+          for j in range(ny) for i in range(nx)]
+    return vs, fs
+
+
+def _decal_material(name, pattern, colors, age, under, seed, aspect, stripes):
+    """An opaque Principled material drawing the pattern on the decal's UVs (0-1 over its bounds), then aged."""
+    mat = bpy.data.materials.new(name)
+    mat.use_nodes = True
+    tree = mat.node_tree
+    bsdf = next(n for n in tree.nodes if n.type == "BSDF_PRINCIPLED")
+    nodes = []
+
+    def node(bl, loc, **props):
+        n = tree.nodes.new(bl)
+        n.location = loc
+        for k, v in props.items():
+            setattr(n, k, v)
+        nodes.append(n)
+        return n
+
+    def math_(op, a, b, loc, clamp=False):
+        m = node("ShaderNodeMath", loc, operation=op, use_clamp=clamp)
+        for i, v in enumerate((a, b)):
+            if hasattr(v, "links"):
+                tree.links.new(v, m.inputs[i])
+            elif v is not None:
+                m.inputs[i].default_value = v
+        return m.outputs[0]
+
+    def mix(a, b, fac, loc):
+        mx = node("ShaderNodeMix", loc)
+        mx.data_type = "RGBA"
+        ins = {s.identifier: s for s in mx.inputs}
+        for ident, v in (("A_Color", a), ("B_Color", b), ("Factor_Float", fac)):
+            if hasattr(v, "links"):
+                tree.links.new(v, ins[ident])
+            else:
+                ins[ident].default_value = list(v) + [1.0] if isinstance(v, list) and len(v) == 3 else v
+        return next(s for s in mx.outputs if s.identifier == "Result_Color")
+
+    tc = node("ShaderNodeTexCoord", (-1800, 0))
+    sep = node("ShaderNodeSeparateXYZ", (-1600, 0))
+    tree.links.new(tc.outputs["UV"], sep.inputs[0])
+    u, v = sep.outputs["X"], sep.outputs["Y"]
+    c = colors
+    if pattern == "hazard":
+        s = math_("ADD", math_("MULTIPLY", u, aspect, (-1400, 100)), v, (-1200, 100))
+        s = math_("FRACT", math_("MULTIPLY", s, float(stripes), (-1000, 100)), None, (-800, 100))
+        band = math_("GREATER_THAN", s, 0.5, (-600, 100))
+        col = mix(c[0], c[1], band, (-400, 0))
+    elif pattern == "barcode":
+        cells = math_("FLOOR", math_("MULTIPLY", u, 64.0, (-1400, 200)), None, (-1200, 200))
+        wn = node("ShaderNodeTexWhiteNoise", (-1000, 200))
+        wn.noise_dimensions = "1D"
+        tree.links.new(cells, wn.inputs["W"])
+        bar = math_("GREATER_THAN", wn.outputs["Value"], 0.45, (-800, 200))
+        inu = math_("MULTIPLY", math_("GREATER_THAN", u, 0.08, (-1000, 400)), math_("LESS_THAN", u, 0.92, (-1000, 500)),
+                    (-800, 400))
+        inv = math_("MULTIPLY", math_("GREATER_THAN", v, 0.38, (-1000, 600)), math_("LESS_THAN", v, 0.88, (-1000, 700)),
+                    (-800, 600))
+        bars = math_("MULTIPLY", math_("MULTIPLY", bar, inu, (-600, 300)), inv, (-400, 300))
+        # two lines of print under the bars: short dashes along u, in two bands of v
+        dash = node("ShaderNodeTexWhiteNoise", (-1000, -200))
+        dash.noise_dimensions = "1D"
+        tree.links.new(math_("FLOOR", math_("MULTIPLY", u, 36.0, (-1400, -200)), None, (-1200, -200)), dash.inputs["W"])
+        word = math_("GREATER_THAN", dash.outputs["Value"], 0.3, (-800, -200))
+        line = math_("MULTIPLY", math_("GREATER_THAN", math_("FRACT", math_("MULTIPLY", v, 8.0, (-1400, -400)), None,
+                                                                 (-1200, -400)), 0.55, (-1000, -400)),
+                     math_("LESS_THAN", v, 0.3, (-1000, -500)), (-800, -400))
+        text = math_("MULTIPLY", math_("MULTIPLY", word, line, (-600, -300)), inu, (-400, -300))
+        ink = math_("MAXIMUM", bars, math_("MULTIPLY", text, math_("GREATER_THAN", v, 0.08, (-600, -500)),
+                                           (-400, -500)), (-200, 0))
+        col = mix(c[0], c[1], ink, (0, 0))
+    elif pattern == "roundel":
+        d = node("ShaderNodeVectorMath", (-1400, 0), operation="DISTANCE")
+        tree.links.new(tc.outputs["UV"], d.inputs[0])
+        d.inputs[1].default_value = (0.5, 0.5, 0.0)
+        r = math_("MULTIPLY", next(o for o in d.outputs if o.name == "Value"), 2.0, (-1200, 0))
+        col = mix(c[0], c[1], math_("GREATER_THAN", r, 0.36, (-1000, 100)), (-800, 0))
+        col = mix(col, c[2] if len(c) > 2 else c[0], math_("GREATER_THAN", r, 0.68, (-1000, -100)), (-600, 0))
+    else:
+        rgb = node("ShaderNodeRGB", (-800, 0))
+        rgb.outputs[0].default_value = list(c[0]) + [1.0]
+        col = rgb.outputs[0]
+    rough = 0.45
+    if age > 0:
+        ob = node("ShaderNodeTexCoord", (-800, -800))
+        mp = node("ShaderNodeMapping", (-600, -800))
+        tree.links.new(ob.outputs["Object"], mp.inputs["Vector"])
+        mp.inputs["Location"].default_value = (seed * 3.7, seed * 1.3, seed * 2.9)
+        nz = node("ShaderNodeTexNoise", (-400, -800))
+        tree.links.new(mp.outputs["Vector"], nz.inputs["Vector"])
+        nz.inputs["Scale"].default_value = 60.0
+        nz.inputs["Detail"].default_value = 6.0
+        # bleach: paler and grayer with age
+        hs = node("ShaderNodeHueSaturation", (200, 0))
+        tree.links.new(col, hs.inputs["Color"])
+        hs.inputs["Saturation"].default_value = 1.0 - 0.6 * age
+        hs.inputs["Value"].default_value = 1.0 + 0.25 * age
+        col = hs.outputs["Color"]
+        # peel: patches where the label is gone and the paint under it shows
+        peel = math_("GREATER_THAN", nz.outputs["Fac"], 0.68 - 0.18 * age, (-200, -800))
+        col = mix(col, under, peel, (400, 0))
+        # dirt: a broad noise multiplied in
+        dz = node("ShaderNodeTexNoise", (-400, -1100))
+        tree.links.new(mp.outputs["Vector"], dz.inputs["Vector"])
+        dz.inputs["Scale"].default_value = 12.0
+        dirt = math_("SUBTRACT", 1.0, math_("MULTIPLY", dz.outputs["Fac"], 0.45 * age, (-200, -1100)), (0, -1100),
+                     clamp=True)
+        mx = node("ShaderNodeMix", (600, 0))
+        mx.data_type = "RGBA"
+        mx.blend_type = "MULTIPLY"
+        ins = {sk.identifier: sk for sk in mx.inputs}
+        ins["Factor_Float"].default_value = 1.0
+        tree.links.new(col, ins["A_Color"])
+        tree.links.new(dirt, ins["B_Color"])
+        col = next(sk for sk in mx.outputs if sk.identifier == "Result_Color")
+        rough = 0.45 + 0.35 * age
+    tree.links.new(col, bsdf.inputs["Base Color"])
+    bsdf.inputs["Roughness"].default_value = rough
+    return mat, len(nodes)
+
+
+def op_build_decal(params):
+    """A floating high-poly decal for a bake - hazard stripes, a barcode label, a roundel or stencil text - placed on a
+    surface point at a small offset, with an aging amount; the cheapest way to get labels into a baked texture set.
+
+    params:
+      location [x, y, z]     where it goes (world); with object, snapped to the nearest point of that mesh's surface
+      object (str)           the high-poly surface it sits on: the decal is shrink-wrapped onto it (any curvature) and its
+                             normal read there unless normal is given
+      normal, up [x, y, z]   which way it faces (default the surface's normal; required without object) and its up
+                             (default world Z, world Y when the normal is near vertical)
+      size [w, h] | w        metres (a number is square); stencil text is fitted inside it
+      pattern                hazard | barcode | roundel | stencil;  text (stencil, required)
+      colors [[r,g,b], ...]  hazard: stripe, gap; barcode: label, ink; roundel: centre, middle ring, outer ring;
+                             stencil: paint (linear 0-1)
+      stripes (int)          hazard stripes across the width (default 6)
+      age (0-1)              bleached paler, peeled to underColor (default a mid gray) in patches, dirt multiplied in,
+                             rougher
+      offset (m)             above the surface (default 0.001); the bake's extrusion must reach past it
+      resolution (int)       grid cells across the short side (default 16) - dense enough to follow a curve
+      name, seed, collection (default "MifDecals")
+    Answers bakeSources: the decal to add to bake_texture_set's source with the high poly - and it is never joined to
+    the low, kept in its own collection.
+    """
+    reject_unknown(params, _DECAL_KEYS, "build_decal")
+    tail = "NOTHING was created."
+    pattern = str(take(params, "pattern", required=True, kind=str)).lower()
+    if pattern not in _DECAL_PATTERNS:
+        raise MifOpError("pattern is one of %s, got %r. %s" % (", ".join(_DECAL_PATTERNS), params.get("pattern"), tail))
+    text = take(params, "text", kind=str)
+    if pattern == "stencil" and not (text and text.strip()):
+        raise MifOpError("pattern stencil needs text - the letters are the decal. %s" % tail)
+    if pattern != "stencil" and text is not None:
+        raise MifOpError("text is for pattern stencil. %s" % tail)
+    size = params.get("size", 0.1)
+    if isinstance(size, (int, float)) and not isinstance(size, bool):
+        size = [size, size]
+    if not isinstance(size, (list, tuple)) or len(size) != 2:
+        raise MifOpError("size is [w, h] in metres or one number, got %r. %s" % (params.get("size"), tail))
+    w, h = finite_floats(list(size), "size")
+    if not (1e-4 <= w <= 100 and 1e-4 <= h <= 100):
+        raise MifOpError("size runs 0.0001 to 100 m, got %r. %s" % (size, tail))
+    age = take_float(params, "age", default=0.0)
+    if not 0.0 <= age <= 1.0:
+        raise MifOpError("age runs 0-1, got %g. %s" % (age, tail))
+    offset = take_float(params, "offset", default=0.001)
+    if not 0.0 <= offset <= 1.0:
+        raise MifOpError("offset runs 0 to 1 m, got %g. %s" % (offset, tail))
+    res = take_int(params, "resolution", default=16)
+    if not 1 <= res <= 256:
+        raise MifOpError("resolution runs 1-256, got %d. %s" % (res, tail))
+    stripes = take_int(params, "stripes", default=6)
+    if not 1 <= stripes <= 200:
+        raise MifOpError("stripes runs 1-200, got %d. %s" % (stripes, tail))
+    seed = take_float(params, "seed", default=0.0)
+    defaults = _DECAL_COLORS[pattern]
+    raw_cols = params.get("colors")
+    if raw_cols is None:
+        cols = [list(c) for c in defaults]
+    else:
+        if not isinstance(raw_cols, list) or not raw_cols or len(raw_cols) > len(defaults):
+            raise MifOpError("colors for %s is a list of up to %d [r, g, b], got %r. %s"
+                             % (pattern, len(defaults), raw_cols, tail))
+        cols = []
+        for k, c in enumerate(raw_cols):
+            if not isinstance(c, (list, tuple)) or len(c) not in (3, 4):
+                raise MifOpError("colors[%d] is [r, g, b] (linear 0-1), got %r. %s" % (k, c, tail))
+            cols.append(finite_floats(list(c)[:3], "colors"))
+        cols += [list(c) for c in defaults[len(cols):]]
+    under = params.get("underColor", [0.32, 0.32, 0.3])
+    if not isinstance(under, (list, tuple)) or len(under) not in (3, 4):
+        raise MifOpError("underColor is [r, g, b], got %r. %s" % (under, tail))
+    under = finite_floats(list(under)[:3], "underColor")
+    loc = _decal_vec(params, "location", tail, required=True)
+    nrm = _decal_vec(params, "normal", tail)
+    up = _decal_vec(params, "up", tail)
+    surf = None
+    obj_name = take(params, "object", kind=str)
+    from mathutils import Matrix, Vector                             # noqa: PLC0415
+    if obj_name is not None:
+        surf = get_object(obj_name, want_mesh=True)
+        inv = surf.matrix_world.inverted()
+        ok, hit, hn, _i = surf.closest_point_on_mesh(inv @ Vector(loc))
+        if not ok:
+            raise MifOpError("found no surface point on '%s' near %r. %s" % (surf.name, loc, tail))
+        loc = list(surf.matrix_world @ hit)
+        if nrm is None:
+            nrm = list((surf.matrix_world.to_3x3().inverted().transposed() @ hn).normalized())
+    if nrm is None:
+        raise MifOpError("normal is required without object - which way the decal faces. %s" % tail)
+    n = Vector(nrm)
+    if n.length < 1e-9:
+        raise MifOpError("normal is zero. %s" % tail)
+    n.normalize()
+    u = Vector(up) if up is not None else (Vector((0, 0, 1)) if abs(n.z) < 0.95 else Vector((0, 1, 0)))
+    u = u - n * u.dot(n)
+    if u.length < 1e-6:
+        raise MifOpError("up %r is parallel to the normal. %s" % (up, tail))
+    u.normalize()
+    r = u.cross(n)
+    rot = Matrix((r, u, n)).transposed().to_4x4()
+    name = take(params, "name", default="Decal_%s" % pattern.capitalize(), kind=str)
+    coll_name = take(params, "collection", default="MifDecals", kind=str)
+
+    vs, fs = _decal_mesh(pattern, w, h, res, (text or "").strip(), None)
+    if not fs:
+        raise MifOpError("the stencil text %r made no faces - the font has no filled glyph for it. %s" % (text, tail))
+    xs, ys = [v[0] for v in vs], [v[1] for v in vs]
+    x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+    me = bpy.data.meshes.new(name)
+    me.from_pydata(vs, [], fs)
+    me.update()
+    uvl = me.uv_layers.new(name="UVMap")
+    for poly in me.polygons:
+        for li in poly.loop_indices:
+            vx, vy, _vz = vs[me.loops[li].vertex_index]
+            uvl.data[li].uv = ((vx - x0) / max(x1 - x0, 1e-9), (vy - y0) / max(y1 - y0, 1e-9))
+    obj = bpy.data.objects.new(name, me)
+    coll = bpy.data.collections.get(coll_name)
+    if coll is None:
+        coll = bpy.data.collections.new(coll_name)
+        bpy.context.scene.collection.children.link(coll)
+    coll.objects.link(obj)
+    obj.matrix_world = Matrix.Translation(Vector(loc) + n * offset) @ rot
+    wrapped = False
+    if surf is not None:
+        # WRAPPED BY HAND, NOT BY A SHRINKWRAP MODIFIER: the modifier's offset follows the surface's interpolated
+        # normals, and on a smooth-shaded cube that tilted a 0.8 m decal by 0.25 mm across its width (measured on 5.0.1).
+        # Each vertex goes to its nearest surface point and out along that face's own normal by offset.
+        mw, imw = obj.matrix_world, obj.matrix_world.inverted()
+        smw, sinv = surf.matrix_world, surf.matrix_world.inverted()
+        nrm_m = smw.to_3x3().inverted().transposed()
+        for vtx in obj.data.vertices:
+            ok, hit, hn, _i = surf.closest_point_on_mesh(sinv @ (mw @ vtx.co))
+            if ok:
+                vtx.co = imw @ (smw @ hit + (nrm_m @ hn).normalized() * offset)
+        obj.data.update()
+        wrapped = True
+    aspect = (x1 - x0) / max(y1 - y0, 1e-9)
+    mat, nnodes = _decal_material(name, pattern, cols, age, under, seed, aspect, stripes)
+    obj.data.materials.append(mat)
+    obj["mif_decal"] = surf.name if surf is not None else ""
+    dists = []
+    if surf is not None:
+        inv = surf.matrix_world.inverted()
+        for vtx in list(obj.data.vertices)[:: max(1, len(obj.data.vertices) // 200)]:
+            wpt = obj.matrix_world @ vtx.co
+            ok, hit, _hn, _i = surf.closest_point_on_mesh(inv @ wpt)
+            if ok:
+                dists.append((surf.matrix_world @ hit - wpt).length)
+    return {"ok": True, "object": obj.name, "material": mat.name, "collection": coll.name, "pattern": pattern,
+            "size": [round(x1 - x0, 6), round(y1 - y0, 6)], "vertices": len(obj.data.vertices),
+            "faces": len(obj.data.polygons), "materialNodes": nnodes, "age": age, "colors": cols,
+            "location": [round(c, 6) for c in loc], "normal": [round(c, 6) for c in n], "up": [round(c, 6) for c in u],
+            "onSurface": surf.name if surf is not None else None, "shrinkwrapped": wrapped,
+            "offset": offset, "offsetMeasured": ({"min": round(min(dists), 6), "max": round(max(dists), 6)}
+                                                 if dists else None),
+            "bakeSources": [obj.name] + ([surf.name] if surf is not None else []),
+            "note": ("bake it into the low with bake_texture_set object=<low> source=%s (the high poly and the decal; "
+                     "extrusion past the %.3g m offset). The decal is opaque - its shape is its geometry - and it is "
+                     "never joined to the low; leave it out of the export, or delete it after the bake."
+                     % ([obj.name] + ([surf.name] if surf is not None else ["<high>"]), offset))}
+
+
 OPS = {
     "reload_image": op_reload_image,
     "transfer_face_materials": op_transfer_face_materials,
@@ -5622,4 +7060,5 @@ OPS = {
     "add_procedural_texture": op_add_procedural_texture,
     "set_color_ramp": op_set_color_ramp,
     "import_pbr_texture_set": op_import_pbr_texture_set,
+    "build_decal": op_build_decal,
 }

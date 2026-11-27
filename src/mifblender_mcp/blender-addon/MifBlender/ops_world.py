@@ -186,13 +186,35 @@ def _background_node(world):
     return bg
 
 
+def bundled_world_hdris():
+    """{name: path} for the .exr worlds this Blender ships in datafiles/studiolights/world, read off the install."""
+    try:
+        base = bpy.utils.system_resource("DATAFILES", path="studiolights/world")
+    except (TypeError, ValueError):                     # an older signature
+        base = os.path.join(bpy.utils.resource_path("LOCAL"), "datafiles", "studiolights", "world")
+    if not base or not os.path.isdir(base):
+        return {}
+    return {os.path.splitext(n)[0].lower(): os.path.normpath(os.path.join(base, n)) for n in sorted(os.listdir(base))
+            if n.lower().endswith((".exr", ".hdr"))}
+
+
+def bundled_world_hdri(word):
+    """The bundled world file for a bare name ('studio', 'Forest.exr'), or None when `word` is not one - a path is not."""
+    word = str(word).strip()
+    if not word or "/" in word or "\\" in word:
+        return None
+    return bundled_world_hdris().get(os.path.splitext(word)[0].lower())
+
+
 def op_set_world(params):
     """Set the world background, and report what it holds afterwards.
 
     params:
       color / backgroundColor [r,g,b]   flat background colour
       strength (float)                  emission multiplier - see the header, 1.0 is bright
-      hdri / hdriPath (str)             an image file to use as the environment instead
+      hdri / hdriPath (str)             an image file to use as the environment instead, or the name of one of
+                                        Blender's bundled studio-light worlds (studio, city, forest, night, sunrise,
+                                        sunset, interior, courtyard - read off this install), resolved inside it
       rotation (float)                  radians, Z rotation of the HDRI
       mistUse / mistStart / mistDepth   the scene mist pass
       useAsLight (bool)                 whether the world contributes to lighting at all
@@ -203,6 +225,10 @@ def op_set_world(params):
     # and turns use_nodes on. So set_world({hdri, color}) used to build a World datablock, enable
     # its node tree, and then refuse with "NOTHING was changed" - leaving a world in a file that had
     # none. The conflict needs nothing but params, so there was never a reason for it to be below.
+    if params.get("hdri") is True and isinstance(params.get("hdriPath"), str):
+        # hdri:true beside hdriPath (found 2026-11-18) was refused as two names for one key: it says "use an HDRI", and
+        # hdriPath says which.
+        params = {k: v for k, v in params.items() if k != "hdri"}
     hdri = take(params, "hdri", "hdriPath", default=None, kind=str)
     col = params.get("color", params.get("backgroundColor"))
     if hdri and col is not None:
@@ -212,11 +238,15 @@ def op_set_world(params):
 
     # The file check moves up for the same reason: it needs a path and the filesystem, nothing from
     # the world, and it was refusing "NOTHING was changed" with a freshly built World in the file.
-    hdri_path = bpy.path.abspath(str(hdri)) if hdri else None
+    # A BUNDLED NAME IS RESOLVED INSIDE THE RUNNING INSTALL (FOUND 2026-11-18): hdri was a path only, so hdri:"studio"
+    # was refused "no such HDRI file" and Blender's own studiolights/world files needed the install's path.
+    bundled = bundled_world_hdri(hdri) if hdri else None
+    hdri_path = bundled if bundled else (bpy.path.abspath(str(hdri)) if hdri else None)
     if hdri_path is not None and not os.path.isfile(hdri_path):
-        raise MifOpError("no such HDRI file: %s. Blender would create a broken image "
-                         "datablock and render black rather than failing. NOTHING was changed."
-                         % hdri_path)
+        names = sorted(bundled_world_hdris())
+        raise MifOpError("no such HDRI file: %s, and %r is not one of this Blender's bundled studio-light worlds (%s). "
+                         "Blender would create a broken image datablock and render black rather than failing. NOTHING "
+                         "was changed." % (hdri_path, hdri, ", ".join(names) or "none found"))
 
     # And the colour's SHAPE AND VALUES, for the third time the same argument: it is a check on the
     # argument, it needs no world, and below _ensure_world it was refusing with one already created.
@@ -338,6 +368,7 @@ def op_set_world(params):
             "color": rnd(list(bg.inputs["Color"].default_value)[:3]),
             "strength": round(float(bg.inputs["Strength"].default_value), 6),
             "hdri": used_hdri,
+            "hdriBundled": os.path.splitext(os.path.basename(bundled))[0] if bundled else None,
             # PRESENT vs DRIVING, and they are not the same question. The flat-colour branch
             # above removes the LINK into Background.Color and leaves the TEX_ENVIRONMENT node
             # in the tree, so the old single `hasEnvironmentTexture` stayed true forever once an

@@ -30,8 +30,19 @@ def read_png(path):
         return read_png_bytes(fh.read(), path)
 
 
-def read_png_bytes(data, path="the PNG"):
-    """read_png on bytes already in memory (mif_terrain.elevation decodes downloaded tiles with it); path names it in a refusal."""
+def read_png_bytes(data, path="the PNG", max_size=None):
+    """read_png on bytes already in memory (mif_terrain.elevation decodes downloaded tiles with it); path names it in a refusal.
+
+    A MALFORMED FILE IS A REFUSAL (FOUND 2026-11-22): zlib, index and struct errors escaped as raw exceptions, and a
+    downloaded tile's width and height were trusted before the size check. max_size (w, h) is checked on IHDR, before
+    anything is decompressed, and the decompression is bounded by what that size needs."""
+    try:
+        return _read_png(data, path, max_size)
+    except (zlib.error, IndexError, struct.error, ValueError, OverflowError) as exc:
+        raise Refusal("%s is not a readable PNG (%s: %s)." % (path, type(exc).__name__, exc))
+
+
+def _read_png(data, path, max_size):
     if data[:8] != b"\x89PNG\r\n\x1a\n":
         raise Refusal("%s is not a PNG (its signature is wrong)." % path)
     pos, idat, plte, trns = 8, [], None, None
@@ -58,10 +69,15 @@ def read_png_bytes(data, path="the PNG"):
     if depth not in (8, 16) or ctype not in (0, 2, 3, 4, 6) or (ctype == 3 and depth != 8):
         raise Refusal("%s is %d-bit colour type %d; this reader takes 8 or 16-bit grey, RGB, RGBA, grey+alpha and 8-bit "
                       "palette PNGs." % (path, depth, ctype))
+    if max_size and (w > max_size[0] or h > max_size[1] or not w or not h):
+        raise Refusal("%s is %d x %d, not at most %d x %d." % (path, w, h, max_size[0], max_size[1]))
     chans = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[ctype]
     bpp = chans * depth // 8
     stride = w * bpp
-    raw = zlib.decompress(b"".join(idat))
+    need = h * (stride + 1)
+    raw = zlib.decompressobj().decompress(b"".join(idat), need)
+    if len(raw) < need:
+        raise Refusal("%s holds %d bytes of image data where %d x %d needs %d." % (path, len(raw), w, h, need))
     rows, prev, off = [], bytearray(stride), 0
     for _y in range(h):
         ft = raw[off]
@@ -263,7 +279,7 @@ def write_gif(path, frames, width, height, delay_cs, loop=True):
 
 # ----------------------------------------------------------------------------------------------------------------- run
 def run(files=None, folder=None, pattern="*.png", out=None, fps=15.0, max_width=480, every=1, max_frames=150,
-        loop=True):
+        loop=True, check_out=None):
     started = time.time()
     try:
         if (files is None) == (folder is None):
@@ -292,6 +308,10 @@ def run(files=None, folder=None, pattern="*.png", out=None, fps=15.0, max_width=
             raise Refusal("out must be a path ending .gif, got %r." % (out,))
         if os.path.abspath(out) in {os.path.abspath(p) for p in paths}:
             raise Refusal("out is one of the frames.")
+        # WHERE IT MAY BE WRITTEN is the caller's rule (the server's write roots, 2026-11-22): its refusal comes back as it is
+        refused = check_out(out) if check_out else None
+        if refused:
+            return refused
         picked = paths[::int(every)]
         dropped_by_cap = max(0, len(picked) - int(max_frames))
         picked = picked[:int(max_frames)]

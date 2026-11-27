@@ -1,4 +1,4 @@
-"""artifact_inventory: a read-only report over the artifact registry and any folder the caller names. Design: docs/35_ARTIFACTS.md.
+"""artifact_inventory: a read-only report over the artifact registry and any folder the caller names. Design: the internal notes.
 
 IT CHANGES NOTHING. No file, no registry line, no preference, no undo step, and no reply to any report asks for a move: the
 archive plan is text to review, and no op applies it. Deleting is out of scope here; delete a file by hand, or through a tool

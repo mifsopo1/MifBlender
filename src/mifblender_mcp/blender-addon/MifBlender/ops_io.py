@@ -46,7 +46,7 @@ from .ops_common import (MifOpError, check_output_path, check_writable_dir, file
 
 _EXPORT_KEYS = {"file", "filepath", "path", "objects", "object", "name", "selectedOnly",
                 "applyModifiers", "frameStart", "frameEnd", "overwrite", "replaceExisting",
-                "animation", "includeLights", "includeCameras", "exporterOptions", "bvh"}
+                "animation", "includeLights", "includeCameras", "exporterOptions", "bvh", "includeHidden"}
 
 # THIS OP'S OWN SWITCH for an exporter option, where it has one - what notCarried names as `option` (decided
 # 2026-09-28: the glTF exporter's defaults stay, lights and cameras off, because in a hand-off file they clutter an
@@ -55,7 +55,7 @@ _OP_OPTION = {"export_lights": "includeLights", "export_cameras": "includeCamera
 _MCP_OPTION = {"includeLights": "include_lights", "includeCameras": "include_cameras"}
 
 # WHAT EVERY OTHER FORMAT DOES WITH A LIGHT OR A CAMERA, for the refusal of includeLights / includeCameras outside
-# glTF - the same table as _carriage, in a sentence (measured on all five builds, docs/22 B255-B258).
+# glTF - the same table as _carriage, in a sentence.
 _INCLUDE_ELSEWHERE = {
     ("USD", "includeLights"): "the USD exporter writes lights without being asked (a spot light only from 4.2)",
     ("USD", "includeCameras"): "the USD exporter writes cameras without being asked",
@@ -131,7 +131,7 @@ _FRAME_KWARG = {".abc": ("start", "end"), ".usd": ("start", "end"), ".usda": ("s
 # carry. The defaults stay (decided the same day: in a hand-off file lights and cameras clutter an Unreal import), and
 # includeLights / includeCameras set the two options for a caller who wants them.
 #
-# MEASURED, NOT RECALLED - tools/probe_export_types.py re-runs it on every installed build, docs/22 B255-B258 hold the
+# MEASURED, NOT RECALLED - a dev test re-runs it on every installed build, the internal notes hold the
 # result - on 3.6.23, 4.2.17, 4.4.0, 5.0.1 and 5.2.1 (2026-09-28): one object of every type Blender
 # makes, each exported ALONE through the operator and selection keyword resolve_exporter picks, exporter defaults
 # otherwise, and read back by something other than the exporter - the .gltf JSON's nodes, OBJ's o/v/f lines, STL's
@@ -277,6 +277,50 @@ def _not_carried(ext, label, in_scope, included=()):
     return rows, unv, note
 
 
+# FORMATS THAT WRITE A MATERIAL (2026-11-25): what their exporters read of one is images and values, never a node chain
+_MATERIAL_FAMILIES = ("glTF", "USD", "mesh")
+
+
+def _hidden_state(obj):
+    return {"hide": bool(obj.hide_get()), "hideViewport": bool(obj.hide_viewport), "hideSelect": bool(obj.hide_select)}
+
+
+def _material_rows(ext, written):
+    """notCarried rows for the materials of the objects written: every Principled input driven by a node chain the file
+    cannot hold (uefn_check's own reading, ops_handoff._look_lost), and an emissive image under Emission Strength 0,
+    which a glTF writes as an emissiveTexture with no emissiveFactor (FOUND 2026-11-18: a visor that did not glow)."""
+    if _FAMILY.get(ext) not in _MATERIAL_FAMILIES or ext in (".stl", ".ply"):
+        return []
+    from .ops_handoff import _look_lost, _principled, _socket, _trace   # noqa: PLC0415 - one reading of a material
+    users = {}
+    for o in written:
+        for slot in getattr(o, "material_slots", ()):
+            if slot.material is not None:
+                users.setdefault(slot.material.name, set()).add(o.name)
+    rows = []
+    for name in sorted(users):
+        mat = bpy.data.materials[name]
+        if not mat.use_nodes or mat.node_tree is None:
+            continue
+        lost = list(_look_lost(mat))
+        p = _principled(mat)
+        if p is not None:
+            em = _trace(_socket(p, ("Emission Color", "Emission")))
+            st = _socket(p, ("Emission Strength",))
+            if em[0] == "image" and st is not None and not st.is_linked and float(st.default_value) <= 0.0:
+                lost.append({"input": "Emission Strength", "why": "an emissive image (%s) under Emission Strength 0 "
+                             "- the file carries the texture with no glow (set_material_properties emissiveStrength 1)"
+                             % em[1].name})
+        if lost:
+            rows.append({"type": "MATERIAL", "count": len(users[name]), "objects": sorted(users[name])[:50],
+                         "option": None, "exporterOption": None, "material": name,
+                         "inputs": [x["input"] for x in lost],
+                         "why": "; ".join("%s %s" % (x["input"], x["why"]) for x in lost[:6]),
+                         "wayOn": "bake it: bake_texture_set (or bake_texture per map) to images, wired straight to "
+                                  "their inputs, then export again"})
+    return rows
+
+
 def _op_exists(dotted):
     """Is bpy.ops.<a>.<b> actually REGISTERED on this build?
 
@@ -289,7 +333,7 @@ def _op_exists(dotted):
     always won. On 3.6.23, which has no wm.stl_export (it arrived at 4.2; wm.stl_import is already
     there), export_scene .stl called it anyway and failed "could not be found" instead of falling back to
     export_mesh.stl, and a disabled exporter raised that AttributeError rather than the sentence above.
-    get_rna_type() is the registry lookup: it raises for an operator that is not there (docs/22 B259).
+    get_rna_type() is the registry lookup: it raises for an operator that is not there.
     test_blender_refusals B121 now stubs bpy.ops the way Blender builds it, lazily.
     """
     mod, _, name = dotted.partition(".")
@@ -619,6 +663,10 @@ def op_export_scene(params):
     if names is not None and not isinstance(names, (list, tuple)):
         raise MifOpError("'objects' must be a list of names. NOTHING was written.")
 
+    include_hidden = take_bool(params, "includeHidden", default=False)
+    if params.get("includeHidden") is not None and not names:
+        raise MifOpError("includeHidden unhides the NAMED objects for the export - pass objects too. NOTHING was "
+                         "written.")
     targets = []
     if names:
         # RESOLVED BEFORE ANYTHING IS SELECTED, so a typo cannot leave the scene's selection
@@ -725,13 +773,43 @@ def op_export_scene(params):
     scene = bpy.context.scene
     frames_before = (scene.frame_start, scene.frame_end)
     started = time.time()
+    hidden_rows, unhidden = [], []
     try:
         if names:
-            for obj in bpy.context.view_layer.objects:
-                obj.select_set(False)
+            # A NAMED OBJECT THE EXPORTER CANNOT SEE (FOUND 2026-11-18): names go through use_selection, and an object
+            # hidden in the view layer (hide_set, hide_viewport, hide_select) cannot be selected - measured on 5.0.1,
+            # each wrote nothing of it, and the call answered ok with a 132-byte glTF. includeHidden unhides them for
+            # the write and puts each flag back after it; an object outside the view layer (an excluded collection)
+            # cannot be written either way.
+            layer = bpy.context.view_layer.objects
             for obj in targets:
+                if include_hidden and obj.name in layer:
+                    st = _hidden_state(obj)
+                    if any(st.values()):
+                        unhidden.append((obj, st))
+                        obj.hide_viewport = False
+                        obj.hide_set(False)
+                        obj.hide_select = False
+            for obj in layer:
+                obj.select_set(False)
+            blocked = {}
+            for obj in targets:
+                if obj.name not in layer:
+                    blocked.setdefault("not in the view layer (an excluded collection, or another scene)", []).append(
+                        obj.name)
+                    continue
                 obj.select_set(True)
-            bpy.context.view_layer.objects.active = targets[0]
+                if not obj.select_get():
+                    flags = ", ".join(k for k, v in _hidden_state(obj).items() if v) or "not selectable"
+                    blocked.setdefault("hidden in the view layer (%s) - it cannot be selected, and named objects "
+                                       "export as the selection" % flags, []).append(obj.name)
+            hidden_rows = [{"type": "HIDDEN", "count": len(v), "objects": sorted(v), "option": "includeHidden",
+                            "exporterOption": None, "why": why} for why, v in sorted(blocked.items())]
+            if sum(r["count"] for r in hidden_rows) == len(targets):
+                raise MifOpError("none of the named objects can be written: %s. includeHidden true unhides them for "
+                                 "the export and restores them after. NOTHING was written."
+                                 % "; ".join("%s: %s" % (", ".join(r["objects"]), r["why"]) for r in hidden_rows))
+            bpy.context.view_layer.objects.active = next(o for o in targets if o.name in layer and o.select_get())
         if ext in (".glb", ".gltf") and applied_range is not None:
             scene.frame_start, scene.frame_end = applied_range
         mod, _, opname = dotted.partition(".")
@@ -746,6 +824,10 @@ def op_export_scene(params):
     finally:
         scene.frame_start, scene.frame_end = frames_before
         selection_restore(snap)
+        for obj, st in unhidden:
+            obj.hide_viewport = st["hideViewport"]
+            obj.hide_set(st["hide"])
+            obj.hide_select = st["hideSelect"]
 
     # ok:true IS NOT A FILE. Existence alone passes on a leftover from an earlier run, so the mtime
     # has to have moved as well - the same rule render_animation applies per frame.
@@ -765,9 +847,30 @@ def op_export_scene(params):
 
     # NOR IS ok:true EVERYTHING THAT WAS THERE. See _carriage: a glTF of a light and a camera is a valid 132-byte file
     # with neither in it, and this used to answer that with a bare ok.
-    not_carried, not_verified, carried_note = _not_carried(ext, label, in_scope, included)
-    missing = sum(r["count"] for r in not_carried)
+    hidden_names = {n for r in hidden_rows for n in r["objects"]}
+    not_carried, not_verified, carried_note = _not_carried(ext, label, [o for o in in_scope
+                                                                        if o.name not in hidden_names], included)
+    missing = sum(r["count"] for r in not_carried) + sum(r["count"] for r in hidden_rows)
+    written_objs = [o for o in in_scope if o.name not in hidden_names]
+    mat_rows = _material_rows(ext, written_objs)
+    not_carried = hidden_rows + not_carried + mat_rows
+    extra = []
+    if hidden_rows:
+        extra.append("%d named object(s) hidden, left out: %s (includeHidden true writes them)"
+                     % (len(hidden_names), ", ".join(sorted(hidden_names))))
+    if mat_rows:
+        extra.append("%d material(s) whose look the file does not carry: %s - bake it (notCarried says which inputs)"
+                     % (len(mat_rows), ", ".join(r["material"] for r in mat_rows)))
+    if extra:
+        carried_note = "; ".join(([carried_note.rstrip(".")] if carried_note else []) + extra) + "."
     gltf = ext in (".glb", ".gltf")
+    meshes_in_file = None
+    if gltf:
+        try:
+            from .ops_handoff import _read_gltf                     # noqa: PLC0415 - the one glTF reader
+            meshes_in_file = len(_read_gltf(path)["meshes"])
+        except Exception:                                           # noqa: BLE001 - a count, never a failed export
+            meshes_in_file = None
     # AN SVG'S STROKES ARE COUNTED IN THE FILE: one <polyline> per stroke from the legacy exporter (3.6, 4.2), one <path>
     # from 5.0+. Zero means the exporter wrote the empty document it writes for nothing visible.
     svg_strokes = None
@@ -795,6 +898,9 @@ def op_export_scene(params):
         "objectsInScope": len(in_scope),
         "notCarried": not_carried,
         "notCarriedCount": missing,
+        "materialsNotCarried": len(mat_rows),
+        "meshesInFile": meshes_in_file,
+        "unhiddenForExport": sorted(o.name for o, _st in unhidden) or None,
         "notVerified": not_verified,
         "notCarriedNote": carried_note,
         # None, not [null, null], when no range was asked for: an absent range and a range that

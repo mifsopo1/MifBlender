@@ -1,10 +1,10 @@
 """The artifact registry: which files this add-on's ops wrote, kept so a later session can tell a tool's output from a file
-nobody can account for. Design: docs/35_ARTIFACTS.md.
+nobody can account for. Design: the internal notes.
 
 OPT-IN. Off by default (the "Record artifacts" preference, or MIF_BLENDER_ARTIFACTS=1 / 0). Off, nothing here touches the
 disk. On, one JSON object per line goes to artifacts.jsonl beside the call journal: per user, not beside a .blend.
 
-WHERE THE RECORD COMES FROM. tools/audit_output_paths.py holds every op that writes a caller's path to check_output_path, so
+WHERE THE RECORD COMES FROM. a dev test holds every op that writes a caller's path to check_output_path, so
 that one call names the path and this file adds no list of writers. check_output_path runs BEFORE the write, so a path only
 becomes a record when the op has ended ok and a file is there, written since the note. set_render_settings checks a path it
 only stores; that path has no new file behind it and is not recorded.
@@ -15,7 +15,7 @@ checked is a prefix, not a file), and anything the person or another program mad
 A RECORD NEVER FAILS AN OP. The file an op was asked for matters more than the note about it; a failed write counts in
 stats() and the report says so.
 
-NO bpy AT MODULE SCOPE, so tools/test_blender_artifacts.py can load this file on its own for the compaction rows.
+NO bpy AT MODULE SCOPE, so a dev test can load this file on its own for the compaction rows.
 """
 import io
 import json

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """MifBlender MCP server - the Blender tools of MifBridge, for any MCP client, with no Unreal Engine.
 
-GENERATED from MifBridge's tools/mcp-server/server.py by tools/build_blender_mcp.py: the same code, less every Unreal
+GENERATED from MifBridge's tools/mcp-server/server.py by a dev tool: the same code, less every Unreal
 tool and the Unreal transport. Do not edit it here; a change belongs in MifBridge's server.py.
 
 bl_* tools reach the MifBlender add-on over a loopback socket (length-prefixed JSON). find_tools, mif_call, mif_help,
@@ -30,6 +30,7 @@ import itertools
 import json
 
 import os
+import select
 import socket
 import struct
 
@@ -38,14 +39,27 @@ import sys
 import threading
 import time
 import zlib
-from typing import Any
+from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
+from pydantic import ConfigDict, with_config
+# typing_extensions, not typing: pydantic refuses typing.TypedDict on Python before 3.12, and the SDK runs on 3.10 up
+from typing_extensions import Required, TypedDict
+try:
+    from mcp.types import ToolAnnotations      # the readOnlyHint annotation (_READ_ONLY_TOOLS); older SDKs lack it
+except ImportError:  # pragma: no cover - an SDK without annotations marks nothing
+    ToolAnnotations = None
+
+import mif_childproc as _childproc   # every child: no window; heavy jobs: one at a time, under a memory ceiling
 
 try:
     from mcp.server.lowlevel.server import NotificationOptions   # see _SlimFastMCP.__init__
 except ImportError:  # an SDK that moved it: the server still runs, and says what it could not declare
     NotificationOptions = None
+
+# A TypedDict parameter whose op refuses an unknown key is declared _closed: pydantic's default DROPS an unknown key
+# before the call, so a misspelt optional key would vanish silently instead of reaching the op's own refusal.
+_closed = with_config(ConfigDict(extra="forbid"))
 
 
 def _locate_project_dir():
@@ -71,7 +85,15 @@ def _locate_project_dir():
 
 BASE = ""   # no Unreal Editor in the Blender-only server
 
-TOKEN = os.environ.get("MIF_BRIDGE_TOKEN", "dev")
+# THE EDITOR BRIDGES' TOKEN (FOUND 2026-11-22: it was "dev" whenever MIF_BRIDGE_TOKEN was unset, so any local process
+# reached exec_console). TOKEN is now only the token this server's environment names; unset, each call sends the token
+# file an editor makes on its first start (mif_credentials.py: MIF_BRIDGE_TOKEN_FILE, else ~/.mifbridge/bridge_token),
+# then "dev" for an editor built before that file, and the port keeps whichever it took. Each call first checks the
+# process holding the port runs as this user (mif_credentials.listener_check), so a token never goes to another
+# account's listener.
+import mif_credentials as _CRED  # noqa: E402 - beside this file, standard library only
+TOKEN = os.environ.get("MIF_BRIDGE_TOKEN")     # None when unset; a set value, even "", is sent as it is
+
 # Self-reported caller tag for the Activity panel (X-Mif-Agent header) - set MIF_AGENT before
 # launching this server so the panel can tell "claude", "gpt", "gemini", etc. apart when several
 # agents share one editor. Unset, the client's own handshake name is used instead - see _agent_tag.
@@ -117,8 +139,8 @@ except ValueError:
 # with run_python on. A GUI Blender now makes a random token per install and keeps it in a per-user file
 # (MifBlender/token_store.py: MIF_BLENDER_TOKEN_FILE, else ~/.mifbridge/blender_token - _bl_token_file resolves the same
 # path, and the two must stay in sync; the token suite's BT100 checks it). This server tries, in order: a token its
-# environment names (MIF_BLENDER_TOKEN, else MIF_BRIDGE_TOKEN - one secret for both backends - unless that is the old
-# default "dev"), the file's token, then "dev" (a headless Blender a script serves keeps it). A Blender refuses a wrong
+# environment names (MIF_BLENDER_TOKEN unless that is the old default "dev"; never MIF_BRIDGE_TOKEN, the editors' secret,
+# since 2026-11-22), the file's token, then "dev" (a Blender someone started with it). A Blender refuses a wrong
 # token before it runs anything (code bad_token), so the next one is sent at once and the one that worked is kept. A
 # config that still says MIF_BLENDER_TOKEN=dev or MIF_BRIDGE_TOKEN=dev therefore keeps working with no change, and a
 # configured secret that was refused while another token worked is said once in the reply (_BL_TOKEN_NOTE).
@@ -144,11 +166,13 @@ def _bl_file_token():
 
 
 def _bl_configured_token():
-    """(token, the variable it came from) when this server's environment names one that is not the old default."""
-    for var in ("MIF_BLENDER_TOKEN", "MIF_BRIDGE_TOKEN"):
-        val = os.environ.get(var)
-        if val is not None:
-            return (None, None) if val == _LEGACY_BLENDER_TOKEN else (val, var)
+    """(token, the variable it came from) when this server's environment names one that is not the old default.
+
+    MIF_BLENDER_TOKEN ONLY (FOUND 2026-11-22). MIF_BRIDGE_TOKEN, the Unreal and Unity editors' secret, used to be offered
+    to a Blender port as well, so whatever answered on that port collected the editors' secret too."""
+    val = os.environ.get("MIF_BLENDER_TOKEN")
+    if val is not None:
+        return (None, None) if val == _LEGACY_BLENDER_TOKEN else (val, "MIF_BLENDER_TOKEN")
     return None, None
 
 
@@ -192,7 +216,7 @@ def _bl_token_help(data, sent):
 # add-on preference allow_generative and each project's own mode (mif_project_mode) are the other two switches - see
 # _generative_refusal beside the tools. MIF_ALLOW_GENERATIVE, the opt-in of the non-generative default, is still read
 # when MIF_GENERATIVE is unset, so a config that set it keeps meaning what it said. A module global, not a constant, so
-# tools/test_generative_mode.py can switch it.
+# a dev test can switch it.
 _OFF_WORDS = ("0", "false", "no", "off", "non-generative")
 
 
@@ -249,7 +273,7 @@ DEBUG = False
 #
 # PARAMETER NAMES ARE NOT ANNOTATIONS. 51 tools take a parameter literally called type, default or
 # properties. Keys inside a "properties" (or "$defs") map are parameter names and are never touched;
-# only a schema's own annotation keys are. tools/test_mcp_footprint.py asserts every parameter and
+# only a schema's own annotation keys are. a dev test asserts every parameter and
 # every required list survives, and ratchets the total so this cannot quietly grow back.
 # ---------------------------------------------------------------------------
 import re as _re
@@ -284,7 +308,7 @@ def _slim_schema(node, names_map=False):
 
 # NOT EVERY PERIOD ENDS A SENTENCE, and _lead asks where one ends twice: for a long text's first sentence, and whether
 # a short text stops mid-sentence. AN ELLIPSIS DOES NOT END ONE: "at a /Game/... path." was led as "at a /Game/...", so
-# create_blueprint's served text and find_tools row never said what it made (docs/TOKEN_OPTIMIZATION.md 2.10). NOR DOES
+# create_blueprint's served text and find_tools row never said what it made. NOR DOES
 # AN ABBREVIATION, or Niagara's User. namespace. Measured 2026-09-27, five leads stopped at one - "Solve a limb of an
 # AnimSequence at every key so its tip (bone, e.g." (solve_anim_two_bone_ik, add_actor_bound_event,
 # set_niagara_static_switch), "Create a User." and "Set a User." (add_/set_niagara_user_parameter) - and six texts the
@@ -339,13 +363,30 @@ def _compact_blocks(blocks):
 # "anthropic/alwaysLoad" (code.claude.com/docs/en/mcp.md), so a session on core - the default since e4e86226 - could
 # not call even these without a lookup first. Benchmark round three measured it: every Blender run spent its first two
 # requests on ToolSearch -> find_tools -> mif_call to reach bl_run_python, and find_tools' answers were 52.6% of what
-# those runs carried (docs/TOKEN_OPTIMIZATION.md 2.6). These are what a default session reaches for first, so they come
+# those runs carried. These are what a default session reaches for first, so they come
 # up front: 1,195 characters, ~528 tokens a request (measured), against a lookup request of 5-8k. Everything else stays
 # deferred, and a client that loads every tool up front anyway ignores the key.
 # ue_run_python joined them after round four (2026-09-23): all five as-shipped U1 runs spent two
-# requests asking find_tools for an Unreal Python tool before any work (docs/TOKEN_OPTIMIZATION.md 2.7).
+# requests asking find_tools for an Unreal Python tool before any work.
 # After round five the two Python tools became one, run_python (2.9): one schema a request, not two.
 _ALWAYS_LOAD = ("find_tools", "mif_call", "run_python")
+
+
+# READ-ONLY HINTS (FOUND 2026-11-16 from the 5.9 extract: every native tool declares an access mode). tool_access.json
+# is generated by a dev tool from each backend's own table (the Unreal safety table, the add-on's
+# READ_ONLY_OPS, the Unity package's rows) and marks a tool only when everything it calls is a Read; list_tools sets
+# readOnlyHint on those, so a client can approve them without asking. Nothing else is marked: MCP reads an unmarked tool
+# as one that may change things, the safe side. A missing or damaged file marks nothing.
+def _read_only_tools():
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "tool_access.json"), encoding="utf-8") as fh:
+            rows = json.load(fh).get("readOnly")
+        return frozenset(rows) if isinstance(rows, dict) else frozenset()
+    except (OSError, ValueError, AttributeError):
+        return frozenset()
+
+
+_READ_ONLY_TOOLS = _read_only_tools()
 
 
 def _served_description(name: str, desc: str) -> str:
@@ -353,13 +394,48 @@ def _served_description(name: str, desc: str) -> str:
 
     AN ALWAYS-LOADED TOOL IS RE-READ ON EVERY REQUEST OF EVERY SESSION, and rule 1 of the instructions already says
     mif_help('<tool>') has each tool's traps, so " Full notes: mif_help('bl_run_python')." bought nothing there for
-    40 characters a request, on each of the two Python tools (round four, docs/TOKEN_OPTIMIZATION.md 2.8). A lead cut
+    40 characters a request, on each of the two Python tools. A lead cut
     mid-sentence keeps its pointer: a cut text always says where the rest is."""
     served = _lead(name, desc)
     lead, pointer, _ = served.partition(" Full notes: mif_help(")
     if pointer and name in _ALWAYS_LOAD and not lead.endswith("..."):
         return lead
     return served
+
+
+# SYNC TOOLS RUN OFF THE EVENT LOOP (FOUND 2026-11-22). mcp 1.25-1.30 calls a non-async tool inline
+# (func_metadata.call_fn_with_arg_validation), and nearly every tool here is sync, so during a 180 s Blender op or a long
+# ue_run_python the whole server stood still: bl_status, whose bounded lock wait exists to say "Blender is busy with op X
+# for 96 s", was not even started until the op returned, and cancellations and pings waited too. Each sync tool is now
+# wrapped once, at its first call, to run on a worker thread (asyncio.to_thread, which carries the request's context
+# variables). THEY STILL RUN ONE AT A TIME (_SYNC_TOOL_LOCK, taken on the worker thread): they always did, and the module
+# state a call writes (BLENDER_TOKEN, _RID_TIMED_OUT, the session's sockets) was written for that. The exceptions are
+# tools built to answer beside a call in flight: bl_status, whose lock wait is bounded (_lock_timeout).
+_SYNC_TOOL_LOCK = threading.Lock()
+_BESIDE_A_CALL = frozenset({"bl_status"})
+
+
+def _off_the_loop(tool):
+    """Make a sync FastMCP tool run on a worker thread, once. Never raises: a Tool without these fields stays inline."""
+    if getattr(tool, "is_async", True) or getattr(tool, "_mif_threaded", False):
+        return
+    fn = tool.fn
+    serial = tool.name not in _BESIDE_A_CALL
+
+    def call(**kw):
+        if not serial:
+            return fn(**kw)
+        with _SYNC_TOOL_LOCK:
+            return fn(**kw)
+
+    async def threaded(**kw):
+        return await asyncio.to_thread(call, **kw)
+    try:
+        object.__setattr__(tool, "fn", threaded)
+        object.__setattr__(tool, "is_async", True)
+        object.__setattr__(tool, "_mif_threaded", True)
+    except Exception:  # noqa: BLE001 - a frozen model: the tool runs inline, as before
+        pass
 
 
 class _SlimFastMCP(FastMCP):
@@ -371,7 +447,7 @@ class _SlimFastMCP(FastMCP):
         # NotificationOptions() defaults tools_changed to False (mcp 1.27.2) - so every client was told
         # at initialize that this server's tool list never changes, and then told that it had. A client
         # honouring the handshake may ignore the notification; one user's pack tools never
-        # appeared in Claude or Codex, however often he reloaded. tools/audit_mcp_capabilities.py reads
+        # appeared in Claude or Codex, however often he reloaded. a dev test reads
         # the handshake and fails while it says false.
         #
         # WRAPPED, NOT COPIED: create_initialization_options still builds everything else exactly as
@@ -398,6 +474,8 @@ class _SlimFastMCP(FastMCP):
                       "inputSchema": _slim_schema(t.inputSchema or {})}
             if t.name in _ALWAYS_LOAD:
                 update["meta"] = dict(t.meta or {}, **{"anthropic/alwaysLoad": True})
+            if t.name in _READ_ONLY_TOOLS and ToolAnnotations is not None:
+                update["annotations"] = ToolAnnotations(readOnlyHint=True)
             out.append(t.model_copy(update=update))
         return out
 
@@ -423,6 +501,8 @@ class _SlimFastMCP(FastMCP):
                 self._unknown_arg_check_warned = True
                 print("[mif] the unknown-argument check is OFF: this FastMCP no longer exposes _tool_manager._tools",
                       file=sys.stderr)
+        if tool is not None:
+            _off_the_loop(tool)
         schema = (tool.parameters or {}) if tool is not None else {}
         accepted = set((schema.get("properties") or {}).keys())
         # A DEPRECATED SPELLING IS RENAMED FIRST (_PARAM_ALIASES): it is a documented name, so it is not unknown
@@ -537,7 +617,7 @@ def _help_sentences(text: str, name: str = "") -> list:
 
 def _says_everything(notes: str, description: str, name: str = "") -> bool:
     """True when every sentence of `description` is somewhere in `notes` - i.e. serving the notes alone
-    loses nothing the tool itself declares. tools/test_mcp_footprint.py F108 asserts the consequence."""
+    loses nothing the tool itself declares. a dev test F108 asserts the consequence."""
     flat = " ".join((notes or "").split())
     return all(s in flat for s in _help_sentences(description, name))
 
@@ -549,7 +629,7 @@ def _log(*args):
 
 
 # --------------------------------------------------------------------------
-# VERSION HANDSHAKE (docs/00_ARCHITECTURE.md "Version handshake"). Until it, nothing said at connect time that this server
+# VERSION HANDSHAKE. Until it, nothing said at connect time that this server
 # and the editor's plugin - or Blender's add-on - speak the same surface: a plugin built before a tool failed that tool
 # its own way (a 404 here, an unrecognised key there, read as a typo), one call at a time. Now each side is read ONCE:
 #   - Unreal: every reply carries X-Mif-Protocol and X-Mif-Instance (the editor's pid). A reply from a pid this session has
@@ -563,7 +643,7 @@ def _log(*args):
 # disagree, one note says so on that reply (once per process and verdict): which side is older, what it costs, how to
 # update. self_audit and bl_status carry the full record as `handshake`. Nothing is added to a reply while they agree.
 # The protocol numbers move only for a change the surface diff cannot see (MIF_PROTOCOL_VERSION, MifBridgeHandlers.h;
-# PROTOCOL_VERSION, MifBlender/server.py); tools/test_handshake.py holds each pair equal.
+# PROTOCOL_VERSION, MifBlender/server.py); a dev test holds each pair equal.
 MIF_UE_PROTOCOL = 1
 MIF_BL_PROTOCOL = 1
 _SERVER_PATH = os.path.abspath(__file__)
@@ -599,7 +679,7 @@ _HS_LIST = 8                                     # names a note spells out befor
 _HS_TIMEOUT = 10.0                               # the handshake's own read: self_audit summaryOnly answers in milliseconds
 _HS_RETRY_SECONDS = 60.0
 _BL_CONNECTS = 0                                 # sockets _bl_connect has opened: a new one is a (re)connect
-# Endpoints another plugin registers through MifBridge's external registry (tools/parity_check.py UE_EXTERNAL_PREFIXES):
+# Endpoints another plugin registers through MifBridge's external registry:
 # absent when that plugin is not installed, whatever MifBridge's age, so they are left out of the comparison - and a
 # call to one where the plugin is not loaded is answered by _external_absent, which names the provider, rather than by
 # "rebuild MifBridge", which would send the reader to the wrong fix.
@@ -782,7 +862,7 @@ def _hs_blender_from_ping(data):
         return None
     ops = data.get("ops") if isinstance(data.get("ops"), list) else []
     # THE DISPATCHER'S OWN OPS ARE NOT IN THE OP TABLE the ping lists: batch is answered by the add-on's server._execute
-    # (parity_check.SPECIAL_DISPATCH, held equal by tools/test_handshake.py H111). Until 2026-10-11 every current add-on
+    #. Until 2026-10-11 every current add-on
     # was called OLDER, missing "batch", on the first Blender reply of every session (found live on 5.0.1).
     ops = list(ops) + [o for o in _HS_BL_DISPATCHED if o not in ops]
     diff = _hs_compare(_hs_my_surface()["blender"], ops, False)
@@ -891,9 +971,18 @@ def _listening_pid(port: int):
             return pid
     return None
 
+# REQUEST IDS: A TIMED-OUT WRITE MUST NOT RUN TWICE. Every endpoint runs on the editor's game thread, so a read timeout
+# cannot tell a call that never ran from one whose reply was late. Until 2026-10-09 every timeout said "busy: retry", and a
+# retried write the editor had already applied ran twice. Now every Unreal call carries X-Mif-Request-Id; the plugin keeps
+# each id with its result for _RID_KEEP_SECONDS (its MifRequestKeepSeconds), answers a repeat of the id with the first
+# result (replayed:true) or requestRunning, and request_status reads a record. After a timeout this wrapper remembers
+# (port, endpoint, body) -> id, so the identical call made again reuses the id: the repeat is a replay, never a second run.
+_RID_KEEP_SECONDS = 600.0
+_RID_SEQ = itertools.count(1)
+
 # Each endpoint's (bucket, writeGated, access), read once a session from self_audit's rows (_ue_buckets_after_call), keyed
 # by base url. A timeout says a call's outcome is unknown unless the endpoint is known not to write: its access is read or
-# observe (the plugin's safety table, docs/34_SAFETY_CLASSIFICATION.md). A plugin older than the access column is judged as
+# observe. A plugin older than the access column is judged as
 # before - readOnly bucket and off the write gate's list - though that bucket is about the undo stack and holds compile.
 _UE_BUCKETS = {}
 _UE_BUCKETS_FOR = {}          # base url -> the editor instance (X-Mif-Instance) its buckets were read from
@@ -942,6 +1031,46 @@ _BL_LOCK = threading.Lock()
 # has to take the lock to learn it. A torn read here is a slightly wrong number
 # in an error message, never a wrong answer.
 _BL_INFLIGHT = None
+
+# REQUEST IDS FOR BLENDER CALLS (FOUND 2026-11-22), the Unreal design above (_request_id_for) on the Blender socket. Every
+# frame carries `requestId` beside endpoint and token; the add-on keeps each id with its framed reply for _RID_KEEP_SECONDS
+# (MifBlender/reqids.py, bounded at 1024 records, 1 MiB per reply and 16 MiB in all), answers a repeat of the id with the
+# first reply (replayed:true), requestRunning or requestIdConflict without running anything, and request_status reads a
+# record. After a read timeout this wrapper remembers (port, op, params) -> id, so the identical call made again reuses
+# the id and replays instead of running twice; any answer clears it, so the next identical call is a new call. An add-on
+# older than this ignores the key, so the repeat runs (the timeout reply says so).
+_BL_RID_PREFIX = "mcpbl-"
+_BL_RID_TIMED_OUT = {}      # (port, op, canonical params) -> (request id, time.monotonic() of the timeout)
+_BL_RID_PORT = {}           # request id -> the Blender port it went to, so request_status asks that Blender
+
+
+def _bl_rid_key(op, body):
+    try:
+        return (BLENDER_PORT, op, json.dumps(body, sort_keys=True, default=str))
+    except (TypeError, ValueError):
+        return None
+
+
+def _bl_request_id_for(op, body):
+    """The requestId for this Blender call: the timed-out call's id when this is the identical call made again within the
+    add-on's keep window, else a fresh one. request_status itself carries none (reading a record makes none)."""
+    if op == "request_status":
+        return None, None
+    key = _bl_rid_key(op, body)
+    held = _BL_RID_TIMED_OUT.get(key) if key else None
+    if held and time.monotonic() - held[1] < _RID_KEEP_SECONDS:
+        return held[0], key
+    return "%s%d-%d-%s" % (_BL_RID_PREFIX, os.getpid(), next(_RID_SEQ), os.urandom(4).hex()), key
+
+
+def _bl_rid_timed_out(rid, key):
+    if not (rid and key):
+        return
+    _BL_RID_TIMED_OUT[key] = (rid, time.monotonic())
+    _BL_RID_PORT[rid] = key[0]
+    for table in (_BL_RID_TIMED_OUT, _BL_RID_PORT):
+        while len(table) > 256:                     # bounded: drop the oldest (dicts keep insertion order)
+            table.pop(next(iter(table)), None)
 
 
 # WHERE EACH MIFBLENDER LISTENS (2026-10-12). A MifBlender on its own port preference (:8802) was unreachable to this
@@ -1014,6 +1143,7 @@ def _bl_probe(port: int, timeout: float = 2.0) -> dict:
         frame = json.dumps({"endpoint": "ping", "token": tok, "params": {}}).encode("utf-8")
         try:
             with socket.create_connection((BLENDER_HOST, int(port)), timeout=timeout) as s:
+                _bl_identify(port)
                 s.settimeout(timeout)
                 s.sendall(struct.pack(_BL_HDR_FMT, len(frame)) + frame)
                 (length,) = struct.unpack(_BL_HDR_FMT, _bl_recv_exact(s, _BL_HDR_SIZE))
@@ -1074,6 +1204,20 @@ def _bl_close():
         _BL_SOCK = None
 
 
+def _bl_identify(port: int):
+    """Raise OSError, before any token goes out, when the Blender port's listener may not be sent one (FOUND
+    2026-11-22: a process that bound the port first was handed each configured token in turn on its bad_token replies).
+    A host that is not this machine needs MIF_BLENDER_ALLOW_REMOTE=1: a token sent there crosses the network in clear,
+    and the add-on itself binds 127.0.0.1 only. Called after the connect, so the process checked is the one reached."""
+    if BLENDER_HOST not in ("127.0.0.1", "localhost", "::1") and os.environ.get("MIF_BLENDER_ALLOW_REMOTE") != "1":
+        raise OSError("MIF_BLENDER_HOST is %s, not this machine; MifBlender listens on 127.0.0.1 only and its token "
+                      "would cross the network in clear. Set MIF_BLENDER_ALLOW_REMOTE=1 to send it there anyway"
+                      % BLENDER_HOST)
+    who = _CRED.listener_check(int(port), BLENDER_HOST)
+    if not who.get("ok"):
+        raise OSError(who.get("reason"))
+
+
 def _bl_connect():
     """Return the cached socket, or open one. Raises OSError on failure."""
     global _BL_SOCK, _BL_CONNECTS
@@ -1083,19 +1227,41 @@ def _bl_connect():
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(BLENDER_CONNECT_TIMEOUT)
     sock.connect((BLENDER_HOST, BLENDER_PORT))
+    try:
+        _bl_identify(BLENDER_PORT)
+    except OSError:
+        sock.close()
+        raise
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     _BL_SOCK = sock
     return sock
 
 
 def _bl_recv_exact(sock, count: int) -> bytes:
-    buf = b""
-    while len(buf) < count:
-        chunk = sock.recv(count - len(buf))
-        if not chunk:
+    """Read exactly count bytes, into one preallocated buffer (FOUND 2026-11-22: `buf += chunk` on bytes copied the
+    whole buffer per chunk - quadratic in the frame, about 32 GB moved for a 64 MiB reply in 64 KiB chunks)."""
+    buf = bytearray(count)
+    view = memoryview(buf)
+    got = 0
+    while got < count:
+        n = sock.recv_into(view[got:], count - got)
+        if not n:
             raise ConnectionError("Blender closed the connection mid-frame")
-        buf += chunk
-    return buf
+        got += n
+    return bytes(buf)
+
+
+def _bl_sock_stale(sock) -> bool:
+    """True when a kept-alive socket's peer has gone (FOUND 2026-11-22: the first call after a Blender restart failed
+    with a transport error, because only a failed SEND reconnected and a send into a socket whose peer closed often
+    succeeds - the error comes on the read, after the frame may count as sent). Looked at before anything is sent: a
+    readable socket between calls is either closed (a read would answer b"") or holds bytes no request asked for; both mean
+    this socket must not carry the next frame. Never raises; reads nothing."""
+    try:
+        readable, _, errored = select.select([sock], [], [sock], 0)
+    except (OSError, ValueError):
+        return True
+    return bool(readable or errored)
 
 
 def _bl_busy_error(op: str, waited: float) -> dict:
@@ -1146,7 +1312,7 @@ def _blender(op: str, /, _timeout: float = None, _lock_timeout: float = None, _j
     for argument 'op'" on EVERY call through MCP - since the tool was added on 2026-09-08, while the
     server instructions and every Blender pack prompt named it as the authority on an op's
     parameters. Its tests spoke to the add-on directly, so none of them went through this function.
-    A benchmark caught it: 5 agent calls, 5 failures (docs/TOKEN_OPTIMIZATION.md).
+    A benchmark caught it: 5 agent calls, 5 failures.
 
     _lock_timeout bounds the wait for the transport lock (NOT the read). Omit it
     and the call queues behind whatever is in flight, which is right for real
@@ -1172,6 +1338,9 @@ def _blender(op: str, /, _timeout: float = None, _lock_timeout: float = None, _j
         # to be long sends one under its own read timeout, so the add-on does not answer "timed out" while it works
         frame["jobTimeout"] = float(_job_timeout)
     read_timeout = BLENDER_TIMEOUT if _timeout is None else _timeout
+    rid, rid_key = _bl_request_id_for(op, body)
+    if rid:
+        frame["requestId"] = rid
     _log("bl->", op, body)
     # THE CALLER'S DEADLINE (1.4, FOUND 2026-11-07): the wall-clock second this call stops waiting for its reply. A
     # background Blender serves one connection at a time, so a request can sit in its accept backlog behind another
@@ -1215,6 +1384,10 @@ def _blender(op: str, /, _timeout: float = None, _lock_timeout: float = None, _j
             sock = None
             for attempt in (0, 1):
                 reused = _BL_SOCK is not None
+                if reused and _bl_sock_stale(_BL_SOCK):
+                    _log("bl--", op, "kept-alive socket closed by its peer, reconnecting before the send")
+                    _bl_close()
+                    reused = False
                 try:
                     sock = _bl_connect()
                 except OSError as exc:
@@ -1239,12 +1412,21 @@ def _blender(op: str, /, _timeout: float = None, _lock_timeout: float = None, _j
                 data = json.loads(_bl_recv_exact(sock, length).decode("utf-8"))
             except socket.timeout:
                 _bl_close()
-                return {"ok": False, "error": (
+                _bl_rid_timed_out(rid, rid_key)
+                out = {"ok": False, "outcomeUnknown": True, "retryable": False, "error": (
                     f"Blender read timeout after {read_timeout}s on '{op}'. NOT retried: the operation "
                     "may have run to completion. Blender's main thread is blocked - a modal operator, "
                     "an open file browser or a render will do it. Dismiss it and call bl_status. Raise "
                     "MIF_BLENDER_TIMEOUT for a genuinely long geometry op. If it had not started by now, it never "
                     "will: the add-on refuses a request that reaches it after this deadline.")}
+                if rid:
+                    out.update(requestId=rid, checkWith="mif_call('request_status', {'request_id': '%s'})" % rid)
+                    out["error"] += (
+                        " Do not send a changed call to make up for it: ask %s, or read the target. Repeating this "
+                        "exact call is safe - it carries the same request id, so Blender answers the first run's reply "
+                        "(replayed:true) or says it is still running, and nothing runs twice (a MifBlender older than "
+                        "request ids ignores the id: request_status there answers unknown op)." % out["checkWith"])
+                return out
             except (OSError, ValueError, UnicodeDecodeError) as exc:
                 _bl_close()
                 return {"ok": False, "error": (
@@ -1265,6 +1447,8 @@ def _blender(op: str, /, _timeout: float = None, _lock_timeout: float = None, _j
         _BL_INFLIGHT = None
         _BL_LOCK.release()
 
+    if rid_key:
+        _BL_RID_TIMED_OUT.pop(rid_key, None)    # answered (first reply, replay or refusal): the next identical call is new
     if not isinstance(data, dict):
         return {"ok": False, "error": f"Blender returned a non-object response for '{op}': {data!r:.300}"}
     _log("bl<-", op, data)
@@ -1285,7 +1469,7 @@ def _blender(op: str, /, _timeout: float = None, _lock_timeout: float = None, _j
 # add_tree_widget's blueprint_id reaches Unreal as blueprintId, bl_apply_transform's object_name reaches Blender as
 # object - but batch and bl_batch forwarded their ops verbatim, so an agent writing an op the way the tool list had just
 # taught it was refused: 13 failed batch calls in a benchmark's UMG and material runs, and bl_batch's apply_transform in the
-# bracket runs, each costing a whole request (docs/TOKEN_OPTIMIZATION.md). The map is READ OFF THE TOOL'S OWN CALL to
+# bracket runs, each costing a whole request. The map is READ OFF THE TOOL'S OWN CALL to
 # _post / _blender, never written by hand, so it cannot drift from what the tool itself sends. Only a name its tool
 # renames is changed: a backend name (the camelCase Unreal reads) passes untouched, and anything the backend does not
 # accept is still refused there, by name.
@@ -1393,14 +1577,14 @@ def _bl_tool_op(tool: str):
 # read-back can list the whole action (bl_set_keyframe reports every F-curve on it), so a benchmark's walk cycles sent
 # bl_batch replies of 67,686 to 253,721 characters - 11 of them in 5 of 6 runs. Claude Code refuses a tool result over
 # 25,000 tokens and shows the agent an error instead, so it saw NOTHING of those batches, failures included, and spent
-# requests reading the state back (docs/TOKEN_OPTIMIZATION.md). Over the line, each op that SUCCEEDED keeps its names,
+# requests reading the state back. Over the line, each op that SUCCEEDED keeps its names,
 # counts and flags (scalars, one level of nesting deep) and each op that failed keeps everything; under it, nothing
 # changes. ~10k tokens - Claude Code's own warning line - at the 2.265 characters a token measured for this JSON.
 _BATCH_SHOW_CHARS = 24000
 
 # A NOTE REPEATED ON EVERY OP IS SAID ONCE. Some ops attach an explanatory note to every result - set_keyframe's
 # valueNote, set_bone_pose's constrainedNote, transform_object's bakedNote - so a batch of ninety keyframes carried the
-# same sentence ninety times: 37,207 characters over the 105 benchmark runs on 11baf1c7 (docs/TOKEN_OPTIMIZATION.md
+# same sentence ninety times: 37,207 characters over the 105 benchmark runs on 11baf1c7 (the internal notes
 # 2.5). A note - a string field named *Note, 40 characters or more - that repeats word for word across the succeeded
 # ops of one op type moves to sharedNotes once, with the rows it came from. A failed op keeps everything, a note on one
 # op stays where it is, and only *Note fields move, so every value an op returned is still on its own row.
@@ -1443,7 +1627,7 @@ def _hoist_batch_notes(res):
 
 # ONLY THE FAILURES, WHEN ASKED. A bulk write the agent verifies with a read anyway - ninety keyframes checked with
 # bl_evaluate_at_frame - does not need every op's read-back, yet 11baf1c7's walk cycles carried them all: batch replies
-# were 40% of what the tool-search runs re-read (docs/TOKEN_OPTIMIZATION.md 2.5). results='errors' keeps each failed op
+# were 40% of what the tool-search runs re-read. results='errors' keeps each failed op
 # whole and each succeeded op as {index, op, ok}, and says how many read-backs it left out. The default keeps them all.
 _BATCH_RESULTS = (None, "", "all", "errors")
 
@@ -1681,19 +1865,19 @@ def _deprecation_note(tool: str, renamed: dict) -> str:
 # A BLIND CALL GUESSES A NAME IN A FEW PREDICTABLE WAYS, and round eight counted them. On the lean default an agent calls
 # held-back tools through mif_call without their schemas, and the as-shipped Blueprint-graph runs spent failed calls on
 # connect_pins(source_node=...) for src_node, add_variable_get(variable=) for var, mif_help(topic=) for tool and batch ops
-# spelled sourceNode/targetNode (docs/TOKEN_OPTIMIZATION.md 2.12). A guess is mapped only when exactly one accepted name
+# spelled sourceNode/targetNode. A guess is mapped only when exactly one accepted name
 # fits one of three rules, and every mapping is reported, so the agent learns the name; anything ambiguous is still
 # refused by name. create_mesh_boolean(path=) stays refused: path fits target_path, tool_path and output_path alike.
 _ALIAS_WORDS = (("destination", "dst"), ("source", "src"), ("target", "dst"),
                 ("Destination", "Dst"), ("Source", "Src"), ("Target", "Dst"))
 _ALIAS_SUFFIXES = ("_path", "_name", "_id", "Path", "Name", "Id")
 
-# DOCS FIRST, BESIDE THE MAPPING (docs/TOKEN_OPTIMIZATION.md 2.13). Guessed names come from agents not following the documentation (2026-09-27), and round eight agreed: every guessed name was a tool the
+# DOCS FIRST, BESIDE THE MAPPING. Guessed names come from agents not following the documentation (2026-09-27), and round eight agreed: every guessed name was a tool the
 # run had never looked up, every wrong type a tool whose find_tools row gave names without types. With MIF_DOCS_FIRST=1 no
 # guess is mapped (_arg_alias answers None; mif_call swaps no object/object_name), a call that does not fit is refused
 # unsent with the tool's call shape (_docs_refusal), find_tools rows type every parameter that is not a string, and
 # mif_call's description asks for the lookup first (_apply_docs_first). Off by default, so round nine can compare the two
-# on one build. A module global, not a constant, so tools/test_mcp_packs.py can switch it.
+# on one build. A module global, not a constant, so a dev test can switch it.
 _DOCS_FIRST = os.environ.get("MIF_DOCS_FIRST", "").strip().lower() in ("1", "true", "yes", "on")
 # mif_call's description in docs-first mode: whole under _DESC_BUDGET, so it is sent as it stands, never cut to a lead
 _DOCS_FIRST_MIF_CALL = ("Call any MifBridge tool by name, loaded or not (no refresh needed); args holds its own "
@@ -1705,12 +1889,15 @@ def _schema_type(prop) -> str:
     """One parameter's type from its JSON schema, in a word: its `type`, or its anyOf's non-null types joined by |."""
     if not isinstance(prop, dict):
         return "any"
+    if "$ref" in prop:       # a TypedDict parameter (pydantic puts it in $defs); this server declares no other $ref
+        return "object"
     kind = prop.get("type")
     if isinstance(kind, str):
         return kind
     if isinstance(kind, list):
         return "|".join(k for k in kind if k != "null") or "null"
-    kinds = [p.get("type") for p in prop.get("anyOf") or [] if isinstance(p, dict)]
+    kinds = [p.get("type") or ("object" if "$ref" in p else None) for p in prop.get("anyOf") or []
+             if isinstance(p, dict)]
     return "|".join(k for k in dict.fromkeys(kinds) if isinstance(k, str) and k != "null") or "any"
 
 
@@ -1783,7 +1970,7 @@ def _type_problems(tool_obj, args: dict) -> list:
 
 
 def _docs_refusal(name: str, error: str, **extra) -> dict:
-    """A docs-first refusal (docs/TOKEN_OPTIMIZATION.md 2.13): nothing was sent, and the tool's documentation comes with
+    """A docs-first refusal: nothing was sent, and the tool's documentation comes with
     it - its call shape and its lead sentence - so the next call is written from that, not from the next guess."""
     out = {"ok": False, "tool": name, "sent": False,
            "error": error + " Nothing was sent: write the call from callShape.",
@@ -1859,7 +2046,7 @@ def _arg_alias(key: str, accepted, single: bool = False):
     and destination to dst (source_node -> src_node, targetPin -> dstPin); (2) a unique prefix across a neutral seam -
     the guess spells out an abbreviation (variable -> var) or drops a _path/_name/_id suffix (property -> property_path),
     never a filter's (name is not name_contains); (3) with `single`, the tool's only parameter. Always None in docs-first
-    mode, which maps no guess (docs/TOKEN_OPTIMIZATION.md 2.13)."""
+    mode, which maps no guess."""
     if _DOCS_FIRST:
         return None
     accepted = set(accepted or ())
@@ -1886,7 +2073,7 @@ def _arg_alias(key: str, accepted, single: bool = False):
 
 
 def _preview_commit_refusal(preview_id, **request):
-    """THE COMMIT HALF OF A BULK PREVIEW (docs/15_SAFETY_GATE_AND_JOURNAL.md section 5). A preview_id commits exactly the
+    """THE COMMIT HALF OF A BULK PREVIEW. A preview_id commits exactly the
     request that was previewed, so it travels ALONE - the endpoint refuses anything sent beside it, and this refuses it
     first, naming it, rather than sending it or dropping it: a request parameter dropped here would commit the preview
     while the caller believed their change went with it. `request` is every other parameter the wrapper takes; a value
@@ -1965,7 +2152,7 @@ _FIND_INTENTS = (
     (("metahuman", "performance"), ("create", "make", "new", "start", "run", "pipeline", "process", "solve", "export",
                                     "skeleton", "retarget", "animation"), False,
      ("start_mocap_performance", "mocap_performance_status", "export_mocap_animation")),
-    # "plan my mod", "steps to make a game", "roadmap": the grounded plan (1.3, docs/30_ROADMAP.md), whose name says neither
+    # "plan my mod", "steps to make a game", "roadmap": the grounded plan, whose name says neither
     ((), ("roadmap",), False, ("mif_roadmap",)),
     (("mod",), ("plan", "step", "steps", "start", "how"), False, ("mif_roadmap",)),
     ((), ("plan", "step", "steps"), True, ("mif_roadmap",)),
@@ -2065,7 +2252,7 @@ def _find_partial(words, name, desc):
 def _find_summary(name, desc):
     """A find_tools row's summary: the tool's served lead - the sentence the tool list itself shows, whole - instead
     of its first 200 characters, which cut mid-word ("... THE ADDON'S DEFAU...") and averaged 178 characters to the
-    lead's 128 over the 716 rows a benchmark's agents were shown (docs/TOKEN_OPTIMIZATION.md). The mif_help pointer is
+    lead's 128 over the 716 rows a benchmark's agents were shown. The mif_help pointer is
     left off: every tool answers mif_help."""
     return _lead(name, " ".join((desc or "").split())).split(" Full notes: mif_help(")[0]
 
@@ -2078,7 +2265,7 @@ def _find_pack_hint(words):
     WHY: a search by the job's own words finds the tools whose descriptions repeat them, and those are rarely the ones
     that do the job. 8 of round nine's 10 Blueprint-graph runs opened with find_tools('blueprint graph node'): 18 rows,
     every one a reader or an analyser, none that makes a node - then a second and third search of 8-15k characters
-    (docs/TOKEN_OPTIMIZATION.md 2.15). The pack's description says how its work is done (gen_packs.py DESCRIPTIONS).
+   . The pack's description says how its work is done (gen_packs.py DESCRIPTIONS).
 
     A SEARCH TO MAKE A MODEL names the Blender pack that makes it, first and beyond the two (_find_makes_packs)."""
     words = [w for w in words if w]
@@ -2162,7 +2349,7 @@ def _find_makes_packs(words):
 _AVAIL_TTL = 20.0                 # seconds a backend's state is reused before find_tools looks again
 # ONLY A SERVING SERVER ASKS. A suite imports this file and calls find_tools hundreds of times with no editor of its own,
 # and whatever listens on the default ports is somebody else's: main() sets this before mcp.run(), and until then a
-# search says nothing about availability (tools/test_find_tools.py sets it for its AV rows, with every backend stubbed).
+# search says nothing about availability.
 _SERVING = False
 _AVAIL_STATE = {"at": None, "now": None}
 _TOOL_NEEDS = None                # {function: {"needs", "ownNeeds", "endpoints", "ops"}} from this file's own source
@@ -2295,9 +2482,11 @@ def _backends_now():
     return state
 
 
-def _state_engine_minor(state):
-    m = _re.match(r"5\.(\d+)", str((state.get("unreal") or {}).get("engineVersion") or ""))
-    return int(m.group(1)) if m else None
+def _state_engine_version(state):
+    """(major, minor) of the Unreal editor that answered, or None. UE 4 too (FOUND 2026-11-26): a 5.x-only match left a
+    4.27 editor's version unknown, so no 'needs UE 5.N+' tool was ever flagged there."""
+    m = _re.match(r"(\d+)\.(\d+)", str((state.get("unreal") or {}).get("engineVersion") or ""))
+    return (int(m.group(1)), int(m.group(2))) if m else None
 
 
 def _tool_unavailable(name, desc, state):
@@ -2314,8 +2503,8 @@ def _tool_unavailable(name, desc, state):
         return needs, optional, "; ".join("%s at %s" % ("no Unreal editor answers" if b == "unreal" else "Blender does not answer",
                                                               state[b]["at"]) for b in down)
     if "unreal" in needs:
-        have = _state_engine_minor(state)
-        if minor is not None and have is not None and have < minor:
+        have = _state_engine_version(state)
+        if minor is not None and have is not None and have < (5, minor):
             return needs, optional, "needs UE 5.%d+, the editor runs %s" % (minor, state["unreal"].get("engineVersion"))
         lack = sorted(set(endpoints) & set((_HS.get("unreal") or {}).get("missingEndpoints") or ()))
         if lack:
@@ -2367,7 +2556,8 @@ def find_tools(keyword: str, limit: int = 15) -> dict:
 #   find_tools("backend:unity material")   backend:unreal, backend:blender, backend:unity, plus the tools no backend owns; backend:any lifts the filter
 #   find_tools("unity set property")       the word unity means backend:unity
 # With neither: everything but Unity, unless this session asked for Unity. A session whose selection is Unity alone (MIF_TOOL_PACKS=unity) is scoped to Unity by default.
-_FIND_BACKENDS = {"unreal": "ue", "ue": "ue", "blender": "blender", "unity": "unity", "any": None}
+_FIND_BACKENDS = {"unreal": "ue", "ue": "ue", "blender": "blender", "unity": "unity", "roblox": "roblox", "any": None}
+_HELD_BACKENDS = ("unity", "roblox")     # held out of a search that does not name them, as Unity's always were
 _UNITY_SESSION = {"on": False, "only": False}
 
 
@@ -2382,26 +2572,29 @@ def _find_backend_scope(q):
                 of.setdefault(tn, "ue" if pid == "core" else p.get("backend"))
     named = _re.search(r"(?:^|\s)backend:(\S*)", q)
     if named and named.group(1) not in _FIND_BACKENDS:
-        return q, None, {"ok": False, "error": "backend:%s is not a backend. Use backend:unreal, backend:blender, backend:unity or backend:any." % named.group(1)}
+        return q, None, {"ok": False, "error": "backend:%s is not a backend. Use backend:unreal, backend:blender, backend:unity, backend:roblox or backend:any." % named.group(1)}
     if named:
         q, want = (q[:named.start()] + " " + q[named.end():]).strip(), named.group(1)
     elif "unity" in q.split() and any(b == "unity" for b in of.values()):
         rest = " ".join(w for w in q.split() if w != "unity")
         q, want = rest or q, "unity"
+    elif "roblox" in q.split() and any(b == "roblox" for b in of.values()):
+        rest = " ".join(w for w in q.split() if w != "roblox")
+        q, want = rest or q, "roblox"
     elif _UNITY_SESSION["only"]:
         want = "unity"
     else:
         want = "any" if _UNITY_SESSION["on"] else None
-    if want == "any" or not any(b == "unity" for b in of.values()) and want is None:
+    if want == "any" or not any(b in _HELD_BACKENDS for b in of.values()) and want is None:
         return q, None, None
     if want is None:
-        return q, (lambda name: of.get(name) != "unity"), None
+        return q, (lambda name: of.get(name) not in _HELD_BACKENDS), None
     code = _FIND_BACKENDS[want]
     neutral = set((packs.get("core") or {}).get("neutral") or [])
 
     def keep(name):
         b = of.get(name)
-        return name in neutral or b == code or (code != "unity" and (b == "any" or b is None))
+        return name in neutral or b == code or (code not in _HELD_BACKENDS and (b == "any" or b is None))
     return q, keep, None
 
 
@@ -2486,7 +2679,7 @@ def _find_tools(keyword, limit=15, probe=False):
                                                                                  for f in _find_forms(w))),
                                           rr[1]["name"]))
     # WHEN NO TOOL HAS EVERY WORD: THE TOOLS WITH MOST OF THEM IN THEIR NAMES, decided after round six
-    # (docs/TOKEN_OPTIMIZATION.md 2.10). A search naming a whole job - "create widget blueprint set text property
+    #. A search naming a whole job - "create widget blueprint set text property
     # compile save" - found nothing, and every as-shipped UMG run then listed all 36 widget tools, 10.9k characters
     # re-read on ~8 requests. The fallback removed on 2026-09-21 took any word anywhere and gave 38 tools for a
     # nonsense keyword; this one needs two query words or more as whole tokens of a tool's NAME, so a nonsense keyword
@@ -2528,7 +2721,7 @@ def _find_tools(keyword, limit=15, probe=False):
     # PAST THE FIRST _FIND_FULL_ROWS A ROW IS ITS NAME. A broad search at limit 40 was 14,737 characters, every row a
     # summary and its parameters, and it stayed in context for the rest of the run: Benchmark round ten's Python-off
     # arm asked limit 30 or more in most runs, and those answers were replayed as 1.5 million tokens over A3, A5, A8 and
-    # X1 (docs/TOKEN_OPTIMIZATION.md 2.18). The best-ranked rows keep everything; the rest are names to pick from,
+    # X1. The best-ranked rows keep everything; the rest are names to pick from,
     # with what a held-back one needs (loaded, pack) - mif_help('<tool>') or a narrower search gives the rest.
     for row in results[_FIND_FULL_ROWS:]:
         for key in ("summary", "params"):
@@ -2548,7 +2741,7 @@ def _find_tools(keyword, limit=15, probe=False):
         if why:
             row["unavailable"] = why
     if _DOCS_FIRST:
-        # the rows kept, typed where a type can be wrong (docs/TOKEN_OPTIMIZATION.md 2.13); only these, not every match
+        # the rows kept, typed where a type can be wrong; only these, not every match
         for row in results[:_FIND_FULL_ROWS]:
             row["params"] = _typed_params(_schema_of(row["name"])) or row.get("params") or []
     truncated = len(kept) > len(results)
@@ -2569,8 +2762,8 @@ def _find_tools(keyword, limit=15, probe=False):
         if loads != out["enable"]:
             out["enableLoads"] = loads
         # SAID ONCE, SHORTLY: this note rides on every find_tools reply with a held-back tool - ~330 characters each
-        # time until 2026-09-22 (docs/TOKEN_OPTIMIZATION.md).
-        # mif_call LEADS (docs/TOKEN_OPTIMIZATION.md 2.15): enabling a pack for a few of its tools costs every later
+        # time until 2026-09-22.
+        # mif_call LEADS: enabling a pack for a few of its tools costs every later
         # request the whole pack's names, and round nine's agents enabled `systems` and called through mif_call anyway.
         # mif_enable_pack as the mif_call that reaches it: on the lean default it is no tool of the client's (2.15).
         out["enableNote"] = ("%d not loaded: mif_call(tool, args) calls one, loading nothing, with its rules; "
@@ -2611,14 +2804,14 @@ def _audio(module):
         sys.path.insert(0, here)
     return importlib.import_module("mif_audio.%s" % module)
 
-# ONE ALWAYS-LOADED PYTHON TOOL FOR BOTH APPLICATIONS, decided after round five (docs/TOKEN_OPTIMIZATION.md
+# ONE ALWAYS-LOADED PYTHON TOOL FOR BOTH APPLICATIONS, decided after round five (the internal notes
 # 2.9): bl_run_python and ue_run_python each cost every request of every session a schema, and one tool with an app
-# switch costs one - 3,982 to 3,871 tokens a request, measured (tools/probe_first_request.py). It dispatches to those
+# switch costs one - 3,982 to 3,871 tokens a request, measured. It dispatches to those
 # two, which stay callable by name, so each application keeps its own gate: the add-on's preference for Blender,
 # exec_console's for Unreal.
 # KNOWN SLIPS IN AN AGENT'S OWN PYTHON, answered with the fix in the reply that failed - nothing rides on a request
 # that did not. Benchmark round six: Blender 5's Action has no fcurves (4 failed calls, most on the walk cycle), and
-# Unreal's Package has no is_dirty (3, as in round five). Both fixes read on the installs (docs/TOKEN_OPTIMIZATION.md
+# Unreal's Package has no is_dirty (3, as in round five). Both fixes read on the installs (the internal notes
 # 2.10): bpy_extras.anim_utils.action_get_channelbag_for_slot is in Blender 5.2's scripts; the dirty-package calls are
 # BlueprintCallable on UEditorLoadingAndSavingUtils (FileHelpers.h, 5.8).
 _PYTHON_ERROR_HINTS = (
@@ -2727,6 +2920,18 @@ def _py_record(app, code, file, reply):
         pass
 
 
+# THE CAPTURE AS A VIDEO (1.3, lane L15, 2026-10-15; spec "Play-in-editor record and replay: ..., and the capture as a video"). pie_record
+# captureEvery writes the PIE viewport as f<frame>.png beside the recording; this encodes them as an H.264 mp4 with ffmpeg, each
+# image held for the game time it covered (the recording's own frame times, through ffmpeg's concat demuxer), so a recording at a
+# varying frame rate plays back at its real speed. ffmpeg is the user's own install (PATH, or MIF_FFMPEG) - nothing is installed.
+def _ffmpeg_exe():
+    import shutil
+    env = os.environ.get("MIF_FFMPEG")
+    if env and os.path.isfile(env):
+        return env
+    return shutil.which("ffmpeg")
+
+
 class _MifToolError(Exception):
     """A composing tool's own refusal, raised so it cannot be ignored and caught
     at the tool boundary so it is never seen by the MCP client as a traceback.
@@ -2829,7 +3034,7 @@ def bl_status(echo: str = None, list_ops: bool = False, port: int = None, pid: i
                    _lock_timeout=BLENDER_PROBE_TIMEOUT)
     # THE OP LIST IS 3,300 OF THE REPLY'S ~4,200 CHARACTERS, and this is the call to make before any Blender work, so an
     # agent that did as told carried ~200 op names in every later request of the session (a benchmark, 2026-09-22,
-    # docs/TOKEN_OPTIMIZATION.md). The count stays; the names are one flag away, because the add-on's describe_op
+    # the internal notes). The count stays; the names are one flag away, because the add-on's describe_op
     # points at ping for the full list. The add-on's own ping, which the suites and mif_mesh_roundtrip read, is unchanged.
     if not list_ops and isinstance(res, dict) and isinstance(res.get("ops"), list):
         res = dict(res)
@@ -2883,7 +3088,7 @@ def bl_scene_info(detail: bool = False, limit: int = None, name_excludes: list =
 def bl_list_objects(object_type: str = "", pattern: str = None,
                     detail: bool = False, limit: int = None, name_excludes: list = None, near: dict = None,
                     collection: str = None, recursive: bool = None) -> dict:
-    "List the Blender scene's objects. object_type filters to one Blender type ('MESH', 'EMPTY', 'ARMATURE', ...); omit it for everything. pattern filters by NAME and is echoed back in filteredBy, so a caller can tell an empty result from a filter that matched nothing. collection filters; rows name their parent. detail returns more per object. near {point, radius, by ORIGIN|BOUNDS} keeps those within the radius, nearest first, with distance. Read-only."
+    "List the Blender file's objects. object_type filters to one Blender type ('MESH', 'EMPTY', 'ARMATURE', ...); omit it for all. pattern filters by NAME and is echoed back in filteredBy, so a caller can tell an empty result from a filter that matched nothing. collection filters; rows name their parent. detail returns more per object. near {point, radius, by ORIGIN|BOUNDS} keeps those within the radius, nearest first, with distance. Read-only."
     # pattern and detail were accepted by the addon and sent by nothing (ops_scene.py:66-67), so
     # listing a busy scene meant retrieving everything and filtering client-side. The addon reports
     # `filteredBy: {type, pattern}` precisely so a caller can tell "nothing matched" from "no filter
@@ -2898,10 +3103,18 @@ def bl_list_objects(object_type: str = "", pattern: str = None,
                     collection=collection, recursive=recursive)
 
 
+class _InfoFrame(TypedDict, total=False):      # ops_scene._info_frame: one of these; it reads no other key
+    object: str
+    armature: str
+    bone: str
+    quaternion: list[float]
+    euler: list[float]
+
+
 @mcp.tool()
-def bl_object_info(object_name: str) -> dict:
+def bl_object_info(object_name: str, objects: list[str] = None, frame: str | _InfoFrame = None) -> dict:
     "Measurements for one Blender object, under an 'object' key: boundsLocalMinBU/MaxBU/SizeBU and boundsLocalSizeUU (the local bbox, already converted - use this one, do NOT multiply dimensionsBU yourself, that folds in object scale),"
-    return _blender("object_info", object=object_name)
+    return _blender("object_info", object=object_name, objects=objects, frame=frame)
 
 
 @mcp.tool()
@@ -3045,6 +3258,611 @@ def bl_mesh_quality(object: str = None, uv_layer: str = None, texel_density_for=
 
 
 @mcp.tool()
+def bl_roblox_ugc_check(object: str, asset_type: str, layered: bool = None) -> dict:
+    "Check a Blender mesh against Roblox's own avatar-item rules for asset_type (Hat, JacketAccessory, LeftArm...) before upload. Read-only."
+    # mif_roblox/ugc_check.py does the work over the same ops a worker uses; the rules come from rbx_ugc_rules' store:
+    # triangles against the type's budget, closed, no ngons, UVs in 0-1, scale applied, one material, inside the type's
+    # attachment box (Blender metres are studs, Z up is Roblox Y), MeshPart bounds, and for layered clothing
+    # <object>_InnerCage and <object>_OuterCage present.
+    from mif_roblox import ugc_check as _U
+    def _ops(op, **kw):  # every op this check sends, named literally so parity_check can see each one
+        if op == "mesh_stats":
+            return _blender("mesh_stats", object=kw.get("object"))
+        if op == "mesh_quality":
+            return _blender("mesh_quality", object=kw.get("object"), gameReady=kw.get("gameReady"),
+                            conventions=kw.get("conventions"))
+        if op == "list_objects":
+            return _blender("list_objects")
+        return {"ok": False, "error": "bl_roblox_ugc_check does not send %s" % op}
+    return _U.check(_ops, object, asset_type, layered=layered)
+
+
+@mcp.tool()
+def bl_roblox_preflight(object: str) -> dict:
+    "Check a Blender mesh against Roblox's mesh limits before export and upload, each cited to Roblox's page. Read-only."
+    # mif_roblox/preflight.py: 20,000 triangles, watertight, no n-gons, at most 4 bone influences and none on the root,
+    # one material, one UV set in 0-1. Texture size is reported as a known limit, 4096 (measured by upload, RB1300), not
+    # checked: this reads the mesh, not its images.
+    from mif_roblox import preflight as _PF
+    def _ops(op, **kw):  # every op this check sends, named literally so parity_check can see each one
+        if op == "mesh_stats":
+            return _blender("mesh_stats", object=kw.get("object"))
+        if op == "mesh_quality":
+            return _blender("mesh_quality", object=kw.get("object"), gameReady=kw.get("gameReady"),
+                            conventions=kw.get("conventions"))
+        if op == "list_vertex_groups":
+            return _blender("list_vertex_groups", object=kw.get("object"), limit=kw.get("limit"))
+        return {"ok": False, "error": "bl_roblox_preflight does not send %s" % op}
+    return _PF.check(_ops, object)
+
+
+@mcp.tool()
+def bl_kit_preview(parts: Any, manifest: Any, output: str, cameras: list = None, prefix: str = "kit",
+                   resolution: list = None, markers: list = None, color_type: str = None, keep_scene: bool = False) -> dict:
+    "Render a Roblox kit placed on a grey-box part list offline, before anything is uploaded: each part a manifest rule matches gets its mesh's exported FBX at part.CFrame * yaw * offset (tiles per cell), the rest drawn as grey boxes. Reports matched, unmatched and unused rules, and the PNGs. Call mif_help(\"bl_kit_preview\") first."
+    # mif_roblox/kit.py does the placement arithmetic, the same rbx_kit_apply uses in Studio, and fbx_mesh.py reads each
+    # file's box on Roblox axes; the add-on's kit_preview op imports each file once, checks the import's box against
+    # that reading (scale and turn), places linked copies by the matrices sent, draws boxes, renders Workbench PNGs in a
+    # scene of its own and removes it. parts: [{name, cframe (12 numbers), size, path?}] or a JSON file of them (an
+    # rbx_query/rbx_get_props dump); manifest: kit.py's placement manifest, meshes with a file (relative to the
+    # manifest's folder). cameras: [{name, cframe | position + lookAt, fovDeg?}] on Roblox axes; default an aerial and a
+    # three-quarter view framing every part. markers: Lua patterns of part names drawn as orange boxes over their mesh
+    # (gameplay pads, text parts) so a placement through them shows.
+    import json as _json
+    from mif_roblox import kit as _K, fbx_mesh as _F
+    from mif_roblox import png as _PNG
+    if isinstance(parts, str):
+        try:
+            parts = _json.load(open(parts, encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "ran": False, "error": "parts file did not read: %s" % exc}
+    m, base, err = _K.read_manifest(manifest)
+    if err:
+        return {"ok": False, "ran": False, "error": err}
+    pl = _K.plan(parts, m)
+    if not pl.get("placements"):
+        return dict(pl, ok=False, ran=False)
+    marks = []
+    for pat in markers or []:
+        rx, merr = _K.lua_to_regex(pat)
+        if merr:
+            return {"ok": False, "ran": False, "error": "markers: %s" % merr}
+        marks.append(rx)
+    files, boxes, mesh_box = {}, [], {}
+    for pm in pl["placements"]:
+        mesh = m["meshes"][pm["mesh"]]
+        f = mesh.get("file")
+        if not f:
+            return {"ok": False, "ran": False, "error": "meshes.%s has no file to preview" % pm["mesh"]}
+        path = f if os.path.isabs(f) or not base else os.path.join(base, f)
+        if path not in mesh_box:
+            try:
+                sc = _F.load(path)
+            except (OSError, ValueError) as exc:
+                return {"ok": False, "ran": False, "error": "%s did not read: %s" % (path, exc)}
+            if not sc.rbx_axes():
+                return {"ok": False, "ran": False, "error": "%s has axis settings %s, not the ones the import was "
+                        "measured on (RB1156)" % (path, sc.axis_settings)}
+            size, center = _F.scene_rbx_box(sc)
+            mesh_box[path] = (size, center, 100.0 / sc.unit_scale_cm)
+        size, center, k = mesh_box[path]
+        row = files.setdefault(path, {"file": path, "studsPerUnit": k, "meshSize": size, "instances": [],
+                                      "color": _K.key_color(len(files))})
+        row["instances"].append({"name": pm["name"], "matrix": _K.blender_matrix(pm["cframe"], pm["size"], size, center, k)})
+    by_name = {p.get("path") or p.get("name"): p for p in parts if isinstance(p, dict)}
+    for u in pl.get("unmatched") or []:
+        p = by_name.get(u)
+        if p:
+            boxes.append({"name": "grey_" + str(p.get("name")), "matrix": _K.blender_matrix(p["cframe"], p["size"]),
+                          "color": [0.55, 0.55, 0.55]})
+    for p in parts:
+        if marks and any(rx.search(str(p.get("name"))) for rx in marks):
+            boxes.append({"name": "marker_" + str(p.get("name")), "matrix": _K.blender_matrix(p["cframe"], p["size"]),
+                          "color": [1.0, 0.45, 0.05]})
+    cams = []
+    for c in cameras or _K.default_cameras([{"cframe": p["cframe"], "size": p["size"]} for p in parts]):
+        cf = c.get("cframe") or (_K.look_at(c["position"], c["lookAt"]) if c.get("position") and c.get("lookAt") else None)
+        if not cf:
+            return {"ok": False, "ran": False, "error": "a camera is {name, cframe | position + lookAt, fovDeg?}"}
+        cams.append({"name": c.get("name") or "cam%d" % len(cams), "matrix": _K.blender_matrix(cf),
+                     "fovDeg": c.get("fovDeg", 50.0)})
+    r = _blender("kit_preview", files=list(files.values()), boxes=boxes, cameras=cams, output=output, prefix=prefix,
+                 resolution=resolution, keepScene=keep_scene, colorType=color_type)
+    out = {"ok": bool(r.get("ok")), "matched": pl["matched"], "unmatched": pl["unmatched"],
+           "rulesUnmatched": pl["rulesUnmatched"], "placements": len(pl["placements"]), "boxes": len(boxes),
+           "preview": r}
+    if r.get("ok"):
+        blank = []
+        for row in r.get("rendered") or []:
+            try:
+                w, h, rgba = _PNG.decode_rgba(open(row["file"], "rb").read())
+                row["frame"] = _PNG.frame_stats(w, h, rgba)
+                if row["frame"]["blank"]:
+                    blank.append(row["camera"])
+            except (OSError, ValueError) as exc:
+                blank.append("%s (%s)" % (row["camera"], exc))
+        if blank or not r.get("rendered"):
+            out.update(ok=False, error="blank or unreadable render(s): %s" % (", ".join(blank) or "none rendered"))
+    else:
+        out["error"] = r.get("error")
+    return out
+
+
+@mcp.tool()
+def bl_roblox_fit_check(manifest: Any, output: str = None, resolution: list = None) -> dict:
+    "Check rigid accessories and held tools on a measured stand-in R15 offline: each exported FBX placed from its manifest numbers alone (attachment + center, a tool on the raised hand's grip), stand-in points past each piece's inner surface counted, and with output each set rendered. Call mif_help(\"bl_roblox_fit_check\") first."
+    # mif_roblox/fit.py holds the R15 table measured in Studio (RB2160), places every piece as Studio would and counts the
+    # stand-in surface points beyond each piece's inner surface - pure Python, no Blender needed for
+    # the numbers. output renders the rest set (every accessory) and each tool held through the add-on's kit_preview
+    # op: the stand-in parts as boxes and a cylinder head, the pieces as their files.
+    import json as _json
+    from mif_roblox import fit as _FT, kit as _K
+    from mif_roblox import png as _PNG
+    if isinstance(manifest, str):
+        try:
+            base = os.path.dirname(os.path.abspath(manifest))
+            manifest = _json.load(open(manifest, encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "ran": False, "error": "manifest did not read: %s" % exc}
+    else:
+        base = None
+    pieces, err = _FT.read_manifest(manifest)
+    if err:
+        return {"ok": False, "ran": False, "error": err}
+    for p in pieces:
+        if base and not os.path.isabs(p["file"]):
+            p["file"] = os.path.join(base, p["file"])
+    placed, err = _FT.plan(pieces)
+    if err:
+        return {"ok": False, "ran": False, "error": err}
+    rows = [{k: p[k] for k in ("name", "file", "attachment", "pose", "center", "fileCentre", "centerMatchesFile",
+                                "handle", "placedBox", "fit")} for p in placed]
+    out = {"ok": True, "studio": _FT.STUDIO, "pieces": rows, "standIn": "RB2160",
+           "outside": {p["name"]: p["fit"].get("outside") for p in placed},
+           "centerMismatch": [p["name"] for p in placed if not p["centerMatchesFile"]]}
+    if not output:
+        return out
+    sets = [("rest", [p for p in placed if not p["tool"]])] + [("tool_" + p["name"], [p]) for p in placed if p["tool"]]
+    renders = []
+    for tag, group in sets:
+        if not group:
+            continue
+        pose = "tool" if tag.startswith("tool_") else "rest"
+        body = _FT.body(pose)
+        boxes = [{"name": "standin_" + part, "matrix": _K.blender_matrix(_K.cf_components(cf), _FT.PARTS[part][0]),
+                  "color": [0.62, 0.62, 0.66], "shape": "cylinder" if part in _FT.CYLINDER else "box"}
+                 for part, cf in body.items()]
+        files = {}
+        for i, p in enumerate(group):
+            row = files.setdefault(p["file"], {"file": p["file"], "studsPerUnit": p["studsPerUnit"], "meshSize": p["meshSize"],
+                                               "instances": [], "color": _K.key_color(i)})
+            row["instances"].append({"name": p["name"], "matrix": _K.blender_matrix(p["handle"], p["meshSize"], p["meshSize"],
+                                                                                    p["fileCentre"], p["studsPerUnit"])})
+        # the whole stand-in (2.3 studs over the root to 3.2 under) and a held blade reaching ~5 studs in front
+        cams = [{"name": n, "matrix": _K.blender_matrix(_K.look_at(eye, [0.0, -0.4, -0.8])), "fovDeg": 40.0}
+                for n, eye in (("front", [4.5, 1.5, -15.0]), ("side", [15.0, 0.5, -0.8]), ("back", [-4.5, 1.5, 13.5]))]
+        r = _blender("kit_preview", files=list(files.values()), boxes=boxes, cameras=cams, output=output, prefix="fit_" + tag,
+                     resolution=resolution, keepScene=False, colorType="OBJECT")
+        if not r.get("ok"):
+            out.update(ok=False, error="the %s render failed: %s" % (tag, r.get("error")))
+            break
+        for row in r.get("rendered") or []:
+            try:
+                w, h, rgba = _PNG.decode_rgba(open(row["file"], "rb").read())
+                row["blank"] = _PNG.frame_stats(w, h, rgba)["blank"]
+            except (OSError, ValueError) as exc:
+                row["blank"] = "unreadable: %s" % exc
+            renders.append(dict(row, set=tag))
+    out["rendered"] = renders
+    if any(r.get("blank") for r in renders):
+        out.update(ok=False, error="blank or unreadable render(s): %s" % [r["file"] for r in renders if r.get("blank")])
+    return out
+
+
+@mcp.tool()
+def bl_bone_hit_targets(armature: str, rows: list, chunks: list = None, distance: float = None,
+                        studs_per_unit: float = None, output: str = None, prefix: str = None, resolution: list = None,
+                        sphere_radius: float = None) -> dict:
+    "Sample hit targets on a skinned mesh along its bones: each row's ray, aimed at a point on its bone, returns the first hit in the game's frame, the chunk it hit and whether that chunk and face belong to the bone; output renders a check with a sphere at each point. Call mif_help(\"bl_bone_hit_targets\") first."
+    return _blender("bone_hit_targets", armature=armature, rows=rows, chunks=chunks, distance=distance,
+                    studsPerUnit=studs_per_unit, output=output, prefix=prefix, resolution=resolution,
+                    sphereRadius=sphere_radius,
+                    _timeout=600.0)
+
+
+@mcp.tool()
+def bl_roblox_kit_check(manifest: Any, output: str = None, resolution: list = None, color_type: str = None) -> dict:
+    "Check a Roblox part kit (sockets, slot boxes, triangle budgets, each file's box against the manifest) and, with output, render each combination assembled from the manifest alone. Call mif_help(\"bl_roblox_kit_check\") first."
+    # mif_roblox/domain_kit.rbx_kit_check does the checks offline from the manifest and the exported files and builds
+    # each combination's placements (part.CFrame = socket * roll * CFrame.new(center), sockets chained from the root);
+    # each combination is then rendered by the add-on's kit_preview op from the files alone (an aerial and a
+    # three-quarter view), the way a hand-written assembler caught a plate lying flat and a hidden texture.
+    from mif_roblox import domain_kit as _DK, kit as _K, fbx_mesh as _F
+    rep = _DK.rbx_kit_check(manifest)
+    if output is None or not rep.get("combinations"):
+        return rep
+    renders = {}
+    for cname, combo in sorted(rep["combinations"].items()):
+        files = {}
+        for pl in combo["placements"]:
+            path = pl.get("file")
+            if not path:
+                continue
+            sc = _F.load(path)
+            size, center = _F.scene_rbx_box(sc)
+            k = 100.0 / sc.unit_scale_cm
+            row = files.setdefault(path, {"file": path, "studsPerUnit": k, "meshSize": size, "instances": [],
+                                          "color": _K.key_color(len(files))})
+            row["instances"].append({"name": "%s_%s" % (pl["slot"], pl["part"]),
+                                     "matrix": _K.blender_matrix(pl["cframe"], pl["size"], size, center, k)})
+        cams = [{"name": c["name"], "matrix": _K.blender_matrix(c["cframe"]), "fovDeg": 50.0}
+                for c in _K.default_cameras([{"cframe": p["cframe"], "size": p["size"]} for p in combo["placements"]])]
+        renders[cname] = _blender("kit_preview", files=list(files.values()), cameras=cams, output=output,
+                                  prefix=cname, resolution=resolution, colorType=color_type)
+    rep["renders"] = renders
+    bad = [c for c, r in renders.items() if not r.get("ok")]
+    if bad:
+        rep.update(ok=False, error="the render of %s failed: %s" % (", ".join(bad), renders[bad[0]].get("error")))
+    return rep
+
+
+@mcp.tool()
+def bl_kit_audit(objects: list = None, object: str = None, tags: dict = None, tag_property: str = None,
+                 tag_attribute: str = None, tag_names: Any = None, allow: list = None, ground: Any = None,
+                 tile_length: float = None, tile_axis: str = None, report: str = None, tolerance: float = None,
+                 coplanar: bool = None, plane_tolerance_cm: float = None, min_area_cm2: float = None) -> dict:
+    "Audit a kit piece's own parts before upload: every pair sharing volume (objects_overlap) and every same-plane overlap (coplanar_overlaps) fails unless allow names its two tags with a reason; tile_length also audits a copy one tile on, so doubled ends fail. Call mif_help(\"bl_kit_audit\") first."
+    # The add-on's kit_audit op (ops_kit.py) runs both checks in one call, on the parts kept apart or on one mesh split by
+    # loose parts there, and removes everything it made. the internal notes L128 (the Roblox lint skips meshes) and L129 (tiles
+    # carry their end piece on one side only).
+    return _blender("kit_audit", objects=objects, object=object, tags=tags, tagProperty=tag_property,
+                    tagAttribute=tag_attribute, tagNames=tag_names, allow=allow, ground=ground, tileLength=tile_length,
+                    tileAxis=tile_axis, report=report, tolerance=tolerance, coplanar=coplanar,
+                    planeToleranceCm=plane_tolerance_cm, minAreaCm2=min_area_cm2, _timeout=600.0)
+
+
+@mcp.tool()
+def bl_export_mirrored_side(object: str, file: str, mirrored_file: str = None, name: str = None, normals: str = None,
+                            local_space: bool = None, collection: str = None) -> dict:
+    "Export a part and its mirrored other side for Roblox (no negative scale there): mirror across X, faces reversed, normals rebuilt, both exported with profile roblox, and both files' signed volumes compared - refused when they differ in sign. Call mif_help(\"bl_export_mirrored_side\") first."
+    # The add-on's mirror_side op makes <name>_L from <name>_R (or the reverse): local X negated, every face's winding
+    # reversed, custom split normals cleared, normals rebuilt (keep copies Weighted Normal modifiers, weighted adds one,
+    # smooth or flat set the shading). export_mesh then writes both with profile roblox, and mif_roblox/fbx_mesh.py reads
+    # the two files back: the sum of a.(b x c)/6 over each file's triangles. Equal and positive means the mirrored
+    # side's faces face out.
+    from mif_roblox import fbx_mesh as _F
+    mir = _blender("mirror_side", object=object, name=name, normals=normals, collection=collection)
+    if not mir.get("ok"):
+        return mir
+    other = mir.get("object")
+    if mirrored_file is None:
+        stem, ext = os.path.splitext(file)
+        mirrored_file = (stem[:-2] + other[-2:] if stem[-2:] in ("_R", "_L") else stem + "_mirrored") + ext
+    out = {"mirror": mir, "files": {}}
+    for obj, path in ((object, file), (other, mirrored_file)):
+        e = _blender("export_mesh", object=obj, file=path, profile="roblox", localSpace=local_space)
+        if not e.get("ok"):
+            return dict(out, ok=False, error="export of %s failed: %s" % (obj, e.get("error")))
+        try:
+            sc = _F.load(path)
+        except (OSError, ValueError) as exc:
+            return dict(out, ok=False, error="%s did not read back: %s" % (path, exc))
+        out["files"][obj] = {"file": path, "signedVolume": round(sum(m["signedVolume"] for m in sc.meshes), 9),
+                             "sizeStuds": _F.scene_rbx_box(sc)[0], "triangles": sum(m["triangles"] for m in sc.meshes)}
+    a, b = out["files"][object]["signedVolume"], out["files"][other]["signedVolume"]
+    out["volumes"] = {object: a, other: b}
+    if not (a > 0 and b > 0) or abs(a - b) > 1e-6 * max(abs(a), abs(b), 1e-9) * 1000:
+        out.update(ok=False, error="the two files' signed volumes are %g and %g: %s" % (
+            a, b, "one side is inside out" if (a > 0) != (b > 0) else
+            "both negative - the source itself faces in" if a < 0 and b < 0 else "they differ in size"))
+    else:
+        out["ok"] = True
+    return out
+
+
+@mcp.tool()
+def bl_uv_to_cell(object: str, cell: list, atlas: Any = None, faces: list = None, material_index: int = None,
+                  fill: float = None, jitter: float = None, wobble: float = None, seed: int = None, uv_map: str = None) -> dict:
+    "Pack a Blender mesh's face UVs into one cell of a Roblox kit's palette atlas, inside the cell's margin, each face offset a little so the grime varies; read back inside the cell. Call mif_help(\"bl_uv_to_cell\") first."
+    # atlas: the cell table rbx_palette_atlas wrote (path or dict) or {grid, pixels, marginPx}; default 16 cells, 1024
+    # px, 20 px margin. cell [col, row], row 0 at the image top. faces (indices) or material_index picks the faces.
+    from mif_roblox import kit as _K
+    spec, err = _K.atlas_spec(atlas)
+    if err:
+        return {"ok": False, "ran": False, "error": err}
+    return _blender("uv_to_cell", object=object, cell=cell, grid=spec["grid"], pixels=spec["pixels"],
+                    marginPx=spec["marginPx"], faces=faces, materialIndex=material_index, fill=fill, jitter=jitter,
+                    wobble=wobble, seed=seed, uvMap=uv_map)
+
+
+@mcp.tool()
+def bl_roblox_bone_clip(armature: str, rig: str, name: str = "Clip", fps: float = 15.0, frame_start: int = None,
+                        frame_end: int = None, module: str = None, confirm_overwrite: bool = False, scale: float = None,
+                        check_frames: int = 3, tolerance: float = 0.02, reset_pose: bool = False, source: str = None,
+                        hip: str = None, hip_ratio: float = None) -> dict:
+    "Bake a Blender action into per-bone world deltas for a skinned Bone rig in the connected Roblox Studio, write it as a ModuleScript that poses the Bones (Bone.Transform = rest^-1 * Dp^-1 * D * rest), and play a few frames on the rig, comparing each Bone's position with Blender's. Call mif_help(\"bl_roblox_bone_clip\") first."
+    # mif_roblox/bone_clip.py holds the math and the module. The rig's Bones are read in Studio (Name, WorldCFrame, the
+    # parent Bone from the tree); Blender is read with render_info, list_bones (rest head, tail, roll) and, per baked
+    # frame, set_frame_range then list_bones posed (matrixWorld). k and o of Roblox = k * Blender (-x, z, y) + o (the
+    # measured import mapping, RB1156, RB1472) are fitted from the rest heads to the Bones' rest positions; a residual
+    # over tolerance * the rig's size refuses (bones out of the meshes' space, RB1472). check_frames frames are posed on
+    # the rig through rbx_bones (every matched Bone's Transform), each Bone's TransformedWorldCFrame position compared
+    # with Blender's posed head brought over the same way, then every Transform put back to identity. Nothing uploads.
+    # source: the action is read from that armature, every frame carried onto armature by
+    # bone_clip.retarget (each bone's turn relative to its parent copied, armature's own bone offsets kept, the hip's
+    # move scaled by hip_ratio, default the two hips' rest heights above each skeleton's lowest point; hip names the
+    # bone, default the one whose head moves most against its parent), and the rest runs as for armature's own action:
+    # the check compares the rig with the retargeted heads. Answers retarget {hip, hipRatio, heights, restAxisDegrees}.
+    from mif_roblox import bone_clip as _BC
+    from mif_roblox import tools as _RT
+    from mif_roblox import domain_geo as _G
+    if not isinstance(armature, str) or not armature or not isinstance(rig, str) or not rig:
+        return {"ok": False, "ran": False, "error": "armature is the Blender armature's name, rig the Roblox model's path"}
+    if not (isinstance(fps, (int, float)) and 1 <= fps <= 120) or not (isinstance(check_frames, int) and 0 <= check_frames <= 20):
+        return {"ok": False, "ran": False, "error": "fps is 1-120, check_frames 0-20"}
+    if not (isinstance(tolerance, (int, float)) and 0 < tolerance < 0.5):
+        return {"ok": False, "ran": False, "error": "tolerance is a fraction of the rig's size, 0-0.5"}
+    V = _RT.V
+    root = V.split_path(rig)
+    bones_rbx, page = {}, 0
+    while True:
+        q = _RT._rbx("query", root=root, page=page, pageSize=500)
+        if not q.get("ok"):
+            return dict(q, ok=False, step="studio bones")
+        for mm in q.get("matches") or []:
+            if mm.get("className") == "Bone":
+                bones_rbx[tuple(mm["path"])] = None
+        if not q.get("more"):
+            break
+        page += 1
+    if not bones_rbx:
+        return {"ok": False, "ran": False, "error": "no Bone under %s: nothing to pose" % rig}
+    paths = list(bones_rbx)
+    # A Bone's WorldCFrame carries its ancestors' Transforms (RB1701): the rests are read only from a rig at rest.
+    rows, route = _G._many([{"target": list(p)} for p in paths], props=["Transform"])
+    if rows is None:
+        return dict(route, ok=False, step="studio bones")
+    posed_now = [V.join_path(list(p)) for p, row in zip(paths, rows)
+                 if (lambda c: not c or max(abs(v) for v in c["position"]) > 1e-3 or
+                     max(abs(a - b) for a, b in zip(c["rotation"], [1, 0, 0, 0, 1, 0, 0, 0, 1])) > 1e-4)(
+                     _G._cf((row.get("values") or {}).get("Transform")))]
+    if posed_now and not reset_pose:
+        return {"ok": False, "ran": False, "refusedRule": "posed", "posedBones": posed_now[:20],
+                "error": "%d Bone(s) under %s hold a Transform, and a Bone's WorldCFrame carries its ancestors' (RB1701), "
+                         "so the rest frames cannot be read: reset_pose true sets every Transform to identity first"
+                         % (len(posed_now), rig)}
+    if posed_now:
+        _RT.rbx_bones(transforms={V.join_path(list(p)): {"position": [0, 0, 0], "rotation": [1, 0, 0, 0, 1, 0, 0, 0, 1]}
+                                  for p in paths})
+    rows, route = _G._many([{"target": list(p)} for p in paths], props=["Name", "WorldCFrame"])
+    if rows is None:
+        return dict(route, ok=False, step="studio bones")
+    studio = {}
+    for p, row in zip(paths, rows):
+        v = row.get("values") or {}
+        cf = _G._cf(v.get("WorldCFrame"))
+        if v.get("Name") and cf:
+            studio[v["Name"]] = {"path": V.join_path(list(p)), "rest": _BC.from12(cf["position"] + cf["rotation"]),
+                                 "parentPath": tuple(p[:-1])}
+    path_name = {tuple(V.split_path(b["path"])): n for n, b in studio.items()}
+    for n, b in studio.items():
+        b["parent"] = path_name.get(b["parentPath"])
+    ri = _blender("render_info")
+    if not ri.get("ok"):
+        return dict(ri, ok=False, step="render_info")
+    scene_fps = (ri.get("fps") or 24) / (ri.get("fpsBase") or 1.0)
+    fs = ri.get("frameStart") if frame_start is None else frame_start
+    fe = ri.get("frameEnd") if frame_end is None else frame_end
+    step = max(1, int(round(scene_fps / float(fps))))
+    frames = list(range(fs, fe + 1, step))
+    if not frames or len(frames) > 2000:
+        return {"ok": False, "ran": False, "error": "frames %s-%s at a step of %d give %d frames (1-2000)" % (fs, fe, step,
+                                                                                                         len(frames))}
+    lb = _blender("list_bones", object=armature, limit=10000)
+    if not lb.get("ok"):
+        return dict(lb, ok=False, step="list_bones")
+    rest_rows = {b["name"]: b for b in lb.get("bones") or []}
+    names = sorted(n for n in rest_rows if n in studio)
+    if not names:
+        return {"ok": False, "ran": False, "error": "no bone of %s has a Bone of the same name under %s" % (armature, rig),
+                "blender": sorted(rest_rows)[:50], "studio": sorted(studio)[:50]}
+    if source is not None and (not isinstance(source, str) or not source or source == armature):
+        return {"ok": False, "ran": False, "error": "source is another armature's name (the one holding the action)"}
+    if hip_ratio is not None and not (isinstance(hip_ratio, (int, float)) and not isinstance(hip_ratio, bool)
+                                      and 0 < hip_ratio <= 100):
+        return {"ok": False, "ran": False, "error": "hip_ratio is a number above 0 (target hip height / source's)"}
+    if source is None and (hip is not None or hip_ratio is not None):
+        return {"ok": False, "ran": False, "error": "hip and hip_ratio are for a retarget: give source"}
+    src_rows = None
+    if source is not None:
+        slb = _blender("list_bones", object=source, limit=10000)
+        if not slb.get("ok"):
+            return dict(slb, ok=False, step="list_bones source")
+        src_rows = {b["name"]: b for b in slb.get("bones") or []}
+        if not set(src_rows) & set(names):
+            return {"ok": False, "ran": False, "error": "no bone of %s has a bone of the same name in %s and a Bone "
+                                                        "under %s" % (source, armature, rig),
+                    "source": sorted(src_rows)[:50], "target": names[:50]}
+    started = ri.get("frameCurrent")
+    posed_by_frame = []
+    try:
+        for f in frames:
+            sf = _blender("set_frame_range", current=f)
+            if not sf.get("ok"):
+                return dict(sf, ok=False, step="set_frame_range", frame=f)
+            pb = _blender("list_bones", object=source or armature, posed=True, limit=10000)
+            if not pb.get("ok"):
+                return dict(pb, ok=False, step="list_bones posed", frame=f)
+            posed_by_frame.append({b["name"]: b.get("posed") or {} for b in pb.get("bones") or []
+                                   if src_rows is not None or b["name"] in names})
+    finally:
+        if isinstance(started, int):
+            _blender("set_frame_range", current=started)
+    retarget = None
+    if src_rows is not None:
+        # The source's frames in its own Blender world (rotation only, as rest_bl below), each bone's turn relative to
+        # its parent carried onto the target's rest (mif_roblox/bone_clip.py retarget); posed_by_frame then holds the
+        # TARGET's frames, so the bake and the check below run unchanged.
+        tb = _blender("list_bones", object=armature, posed=True, limit=10000)
+        if not tb.get("ok"):
+            return dict(tb, ok=False, step="list_bones posed target")
+        tposed = {b["name"]: b.get("posed") or {} for b in tb.get("bones") or []}
+        sfirst = next(iter(posed_by_frame[0].values()), None) if posed_by_frame else None
+        if not sfirst or not tposed.get(names[0]):
+            return {"ok": False, "ran": False, "error": "the source or target armature answered no posed bone"}
+        s_aw = _BC.mul(_BC.rigid(sfirst["matrixWorld"]), _BC.inv(_BC.rigid(sfirst["matrixArmature"])))
+        t_aw = _BC.mul(_BC.rigid(tposed[names[0]]["matrixWorld"]), _BC.inv(_BC.rigid(tposed[names[0]]["matrixArmature"])))
+        frames_rest = {}
+        for tag, rows, aw in (("source", src_rows, s_aw), ("target", rest_rows, t_aw)):
+            rest, tails = {}, {}
+            for n, r in rows.items():
+                rm = _BC.rest_matrix(r["headArmatureSpaceBU"], r["tailArmatureSpaceBU"], r.get("roll"), aw)
+                if rm is None:
+                    return {"ok": False, "ran": False, "error": "%s bone %s has no length" % (tag, n)}
+                rest[n] = rm
+                tails[n] = _BC.mul(aw, ([[1, 0, 0], [0, 1, 0], [0, 0, 1]], r["tailArmatureSpaceBU"]))[1]
+            frames_rest[tag] = (rest, tails, {n: r.get("parent") for n, r in rows.items()})
+        src_posed = [{n: _BC.mul(s_aw, _BC.rigid(p["matrixArmature"])) for n, p in fr.items() if p.get("matrixArmature")}
+                     for fr in posed_by_frame]
+        sr, st, sp = frames_rest["source"]
+        tr_, tt, tp = frames_rest["target"]
+        got, retarget = _BC.retarget(sr, sp, src_posed, tr_, tp, src_tails=st, tgt_tails=tt, hip=hip, ratio=hip_ratio)
+        if got is None:
+            return {"ok": False, "ran": False, "step": "retarget", "error": retarget}
+        def _m4(f):
+            return [f[0][i] + [f[1][i]] for i in range(3)] + [[0, 0, 0, 1]]
+        posed_by_frame = [{n: {"matrixWorld": _m4(fr[n]), "headWorld": fr[n][1]} for n in names} for fr in got]
+        arm_world = t_aw
+    else:
+        first = posed_by_frame[0][names[0]]
+        arm_world = _BC.mul(_BC.rigid(first["matrixWorld"]), _BC.inv(_BC.rigid(first["matrixArmature"])))
+    rest_bl = {}
+    for n in names:
+        r = rest_rows[n]
+        rm = _BC.rest_matrix(r["headArmatureSpaceBU"], r["tailArmatureSpaceBU"], r.get("roll"), arm_world)
+        if rm is None:
+            return {"ok": False, "ran": False, "error": "bone %s has no length" % n}
+        rest_bl[n] = rm
+    k, o, res = _BC.fit([rest_bl[n][1] for n in names], [studio[n]["rest"][1] for n in names], scale)
+    pts = [studio[n]["rest"][1] for n in names]
+    extent = max(1e-6, max(max(p[i] for p in pts) - min(p[i] for p in pts) for i in range(3)))
+    worst = max(range(len(names)), key=lambda i: res[i])
+    fit = {"studsPerBlenderUnit": round(k, 6), "offset": [round(v, 4) for v in o], "worstBone": names[worst],
+           "worstResidual": round(res[worst], 4), "rigExtent": round(extent, 4)}
+    if res[worst] > tolerance * extent:
+        return {"ok": False, "ran": True, "fit": fit, "refusedRule": "bones-off-mesh",
+                "error": "bone %s sits %.4g studs from where Blender's rest pose puts it (tolerance %.4g): the rig's bones "
+                         "are not one scale and offset of Blender's - an import that shrank the meshes and not the bones "
+                         "(RB1472), or another rig" % (names[worst], res[worst], tolerance * extent)}
+    deltas = []
+    for posed in posed_by_frame:
+        row = []
+        for n in names:
+            pw = _BC.rigid(posed[n]["matrixWorld"])
+            row.append(_BC.to_rbx(_BC.mul(pw, _BC.inv(rest_bl[n])), k, o))
+        deltas.append(row)
+    clip_fps = scene_fps / step
+    text = _BC.pack(clip_fps, names, deltas)
+    _f, _b, back = _BC.unpack(text)
+    parents = {n: (studio[n]["parent"] if studio[n]["parent"] in names else None) for n in names}
+    out = {"ok": True, "bones": len(names), "frames": len(frames), "fps": round(clip_fps, 4), "textChars": len(text),
+           "fit": fit, "unmatchedBlender": sorted(set(rest_rows) - set(names))[:50],
+           "unmatchedStudio": sorted(set(studio) - set(names))[:50]}
+    if retarget:
+        out["retarget"] = dict(retarget, source=source)
+    if module:
+        src = _BC.luau_module(name, text, parents)
+        mparts = V.split_path(module)
+        ex = _RT._rbx("resolve", target=mparts)
+        if ex.get("ok") and not confirm_overwrite:
+            return dict(out, ok=False, refusedRule="exists", error="%s exists: confirm_overwrite true replaces it" % module)
+        if not ex.get("ok"):
+            mk = _RT.rbx_create("ModuleScript", V.join_path(mparts[:-1]), name=mparts[-1])
+            if not mk.get("ok"):
+                return dict(out, ok=False, step="module create", error=mk.get("error"))
+        w = _RT.rbx_script_write(module, src)
+        rb = _RT.rbx_script_read(module)
+        out["module"] = {"path": module, "chars": len(src), "verified": bool(w.get("ok") and rb.get("source") == src)}
+        if not out["module"]["verified"]:
+            return dict(out, ok=False, error="the module did not read back: %s" % (w.get("error") or rb.get("error")))
+    checks = []
+    picks = sorted({int(round(i * (len(frames) - 1) / max(1, check_frames - 1))) for i in range(check_frames)}) \
+        if check_frames else []
+    ident = {"position": [0, 0, 0], "rotation": [1, 0, 0, 0, 1, 0, 0, 0, 1]}
+    try:
+        for fi in picks:
+            D = dict(zip(names, back[fi]))
+            tr = {}
+            for n in names:
+                t = _BC.transform(studio[n]["rest"], D[n], D.get(parents[n]) if parents[n] else None)
+                tr[studio[n]["path"]] = {"position": t[1], "rotation": [t[0][i][j] for i in range(3) for j in range(3)]}
+            r = _RT.rbx_bones(transforms=tr)
+            errs = {}
+            for n in names:
+                got = (((r.get("bones") or {}).get(studio[n]["path"]) or {}).get("worldCFrame"))
+                gcf = _G._cf(got)
+                if not gcf:
+                    errs[n] = None
+                    continue
+                want = _BC.point_to_rbx(posed_by_frame[fi][n]["headWorld"], k, o)
+                errs[n] = round(max(abs(gcf["position"][i] - want[i]) for i in range(3)), 4)
+            bad = [n for n, e in errs.items() if e is None or e > tolerance * extent]
+            worst_n = max((n for n in errs if errs[n] is not None), key=lambda n: errs[n], default=None)
+            checks.append({"frame": frames[fi], "bonesSet": len(tr), "setOk": r.get("ok"), "worstBone": worst_n,
+                           "worstError": errs.get(worst_n), "over": bad[:10]})
+    finally:
+        if picks:
+            _RT.rbx_bones(transforms={studio[n]["path"]: ident for n in names})
+    out["playback"] = checks
+    bad = [c for c in checks if c["over"] or not c["setOk"]]
+    if bad:
+        out.update(ok=False, error="frame %s: bone positions off Blender's by up to %s studs (tolerance %.4g)" % (
+            bad[0]["frame"], bad[0]["worstError"], tolerance * extent))
+    return out
+
+
+@mcp.tool()
+def bl_roblox_action_samples(armature: str, rig: str, frames: list = None, frame_start: int = None, frame_end: int = None,
+                             step: int = 1, mapping: dict = None, scale: float = None, max_pivot_offset: float = None,
+                             send: bool = False, name: str = None, tolerance: float = 0.01, loop: bool = False) -> dict:
+    "Sample a Blender armature's action in Roblox joint space for a rig in the connected Studio; send writes it with rbx_anim_from_blender."
+    # mif_roblox/domain_anim_blender.py does the work over the ops below (render_info, list_bones, set_frame_range):
+    # each bone's offset to its joint from the rest poses, scale and offset fitted from bone heads to joint pivots (the
+    # residual per bone reported), each frame's pose read through the depsgraph, the scene frame put back and checked.
+    from mif_roblox import domain_anim_blender as _AB
+    def _ops(op, **kw):  # every op this tool sends, named literally so parity_check can see each one
+        if op == "render_info":
+            return _blender("render_info")
+        if op == "list_bones":
+            return _blender("list_bones", object=kw.get("object"), limit=kw.get("limit"), posed=kw.get("posed"))
+        if op == "set_frame_range":
+            return _blender("set_frame_range", current=kw.get("current"))
+        return {"ok": False, "error": "bl_roblox_action_samples does not send %s" % op}
+    out = _AB.action_samples(_ops, armature, rig, frames=frames, frame_start=frame_start, frame_end=frame_end, step=step,
+                             mapping=mapping, scale=scale, max_pivot_offset=max_pivot_offset)
+    if send and out.get("ok"):
+        out["sent"] = _AB.send(out, rig, name=name or "MifBlenderAction", tolerance=tolerance, loop=loop)
+        out["ok"] = bool(out["sent"].get("ok"))
+    return out
+
+
+@mcp.tool()
+def mif_preview_in_roblox(object: str, name: str = None, parent: str = "Workspace.MifScratch", position: list = None) -> dict:
+    "Show a Blender mesh in the connected Roblox Studio without uploading: triangles, UVs and normals, verified by count and size."
+    # mif_roblox/preview.py: MifBlender read_mesh_data (WORLD, UVs) -> fan triangulation, Roblox axes, V flipped, flat
+    # normals -> rbx_mesh_preview (plugin 0.13.0 for UVs and normals); compares Studio's face count and MeshSize with Blender.
+    from mif_roblox import preview as _P
+    from mif_roblox import tools as _RT
+    def _ops(op, **kw):  # the one op the preview sends, named literally so parity_check can see it
+        if op == "read_mesh_data":
+            return _blender("read_mesh_data", object=kw.get("object"), file=kw.get("file"), space=kw.get("space"),
+                            uvs=kw.get("uvs"), looseEdges=kw.get("looseEdges"))
+        return {"ok": False, "error": "mif_preview_in_roblox does not send %s" % op}
+    return _P.preview(_ops, _RT.rbx_mesh_preview, object, name=name, parent=parent,
+                      position=position)
+
+
+@mcp.tool()
 def bl_recipe_game_ready(object: str, apply_transform: bool = None, unwrap: bool = None,
                          force_unwrap: bool = None, uv_method: str = None, full: bool = None, kind: str = None,
                          pivot: str = None, lightmap: bool = None, collision: str = None, per_part: bool = None,
@@ -3075,13 +3893,17 @@ def bl_build_tree(name: str = None, preset: str = None, seed: int = None, height
                   leaf_shape: str = None, leaf_size: float = None, leaf_count: int = None,
                   leaf_color: list = None, leaf_color2: list = None, bark_color: list = None,
                   collision: bool = None, location: list = None, rotation: list = None,
-                  collection: str = None, leaf_clusters: bool = None, leaves_per_cluster: int = None) -> dict:
-    "Build a tree in Blender with real geometry leaves - one object with a bark slot and a leaf slot, its pivot at the trunk's base, the same tree for the same seed. Call mif_help(\"bl_build_tree\") first."
+                  collection: str = None, leaf_clusters: bool = None, leaves_per_cluster: int = None,
+                  output: str = None, texture_folder: str = None, texture_size: int = None,
+                  lods: list[float] = None, triangle_budget: int = None, stump: bool | dict = None) -> dict:
+    "Build a tree in Blender with real geometry leaves - one object with a bark slot and a leaf slot, its pivot at the trunk's base, the same tree for the same seed. stump builds a stump instead: flare, buttress roots and a cut, one closed mesh. Call mif_help(\"bl_build_tree\") first."
     return _blender("build_tree", name=name, preset=preset, seed=seed, height=height, trunkRadius=trunk_radius,
                     levels=levels, crownShape=crown_shape, leafShape=leaf_shape, leafSize=leaf_size,
                     leafCount=leaf_count, leafColor=leaf_color, leafColor2=leaf_color2, barkColor=bark_color,
                     collision=collision, location=location, rotation=rotation, collection=collection,
-                    leafClusters=leaf_clusters, leavesPerCluster=leaves_per_cluster)
+                    leafClusters=leaf_clusters, leavesPerCluster=leaves_per_cluster, output=output,
+                    textureFolder=texture_folder, textureSize=texture_size, lods=lods, triangleBudget=triangle_budget,
+                    stump=stump, _timeout=600.0)
 
 @mcp.tool()
 def bl_build_kit_piece(kind: str = None, opening: str = None, module: float = None, length: float = None,
@@ -3093,27 +3915,82 @@ def bl_build_kit_piece(kind: str = None, opening: str = None, module: float = No
                        grid_cm: float = None, collision: bool = None, name: str = None, location: list = None,
                        rotation: list = None, collection: str = None, slat_pitch: float = None,
                        hood_radius: float = None, hardware: bool = None, louver: bool = None,
-                       min_thickness_cm: float = None) -> dict:
-    "Build a modular kit piece in Blender - a wall (with a door or window opening), a floor, a pillar, or a roll-up shutter or door leaf for a wall's opening - on a module grid, with bevels, trim, a lightmap UV layer and UCX_ hulls. Call mif_help(\"bl_build_kit_piece\") first."
+                       min_thickness_cm: float = None, corner: str = None) -> dict:
+    "Build a modular kit piece in Blender - a wall (with a door or window opening), a floor, a pillar, a wall corner (kind corner; corner outer or inner), or a roll-up shutter or door leaf for a wall's opening - on a module grid, with bevels, trim, a lightmap UV layer and UCX_ hulls. Call mif_help(\"bl_build_kit_piece\") first."
     return _blender("build_kit_piece", kind=kind, opening=opening, module=module, length=length, height=height,
                     width=width, thickness=thickness, openingWidth=opening_width, openingHeight=opening_height,
                     sillHeight=sill_height, openingOffset=opening_offset, pivot=pivot, bevel=bevel,
                     bevelSegments=bevel_segments, trim=trim, uvTileCm=uv_tile_cm, color=color, material=material,
                     trimColor=trim_color, trimMaterial=trim_material, gridCm=grid_cm, collision=collision,
                     name=name, location=location, rotation=rotation, collection=collection, slatPitch=slat_pitch,
-                    hoodRadius=hood_radius, hardware=hardware, louver=louver, minThicknessCm=min_thickness_cm)
+                    hoodRadius=hood_radius, hardware=hardware, louver=louver, minThicknessCm=min_thickness_cm,
+                    corner=corner)
+
+
+@mcp.tool()
+def bl_build_stairs(name: str = None, module: float = None, rise: float = None, run: float = None, width: float = None,
+                    steps: int = None, side: str = None, nosing: float = None, tread_thickness: float = None,
+                    bevel: float = None, bevel_segments: int = None, uv_tile_cm: float = None, grid_cm: float = None,
+                    color: list[float] = None, material: str = None, trim_color: list[float] = None, trim_material: str = None,
+                    collision: bool = None, location: list[float] = None, rotation: list[float] = None,
+                    collection: str = None) -> dict:
+    "Build a straight stair flight in Blender as a kit piece - rise, run and width in modules and a step count, a solid side or two stringers, treads with a nosing, a lightmap UV layer and a UCX_ ramp hull - its defaults set from the engine character's step height. Call mif_help(\"bl_build_stairs\") first."
+    return _blender("build_stairs", name=name, module=module, rise=rise, run=run, width=width, steps=steps, side=side,
+                    nosing=nosing, treadThickness=tread_thickness, bevel=bevel, bevelSegments=bevel_segments,
+                    uvTileCm=uv_tile_cm, gridCm=grid_cm, color=color, material=material, trimColor=trim_color,
+                    trimMaterial=trim_material, collision=collision, location=location, rotation=rotation,
+                    collection=collection)
+
+
+@mcp.tool()
+def bl_build_railing(name: str = None, points: list[list[float]] = None, height: float = None,
+                     post_spacing: float = None, post_size: float = None, profile: str = None, rail_profile: str = None,
+                     rail_size: float = None, bottom_rail: bool = None, bottom_clearance: float = None,
+                     infill: str = None, baluster_size: float = None, baluster_gap: float = None, sides: int = None,
+                     bevel: float = None, bevel_segments: int = None, uv_tile_cm: float = None,
+                     color: list[float] = None, material: str = None, trim_color: list[float] = None,
+                     trim_material: str = None, collision: bool = None, location: list[float] = None,
+                     rotation: list[float] = None, collection: str = None) -> dict:
+    "Build a railing in Blender as a kit piece - posts, a top and a bottom rail and balusters along a path or a stair's pitch, round or square, a lightmap UV layer and a UCX_ hull per bay - its sizes set from the building codes. Call mif_help(\"bl_build_railing\") first."
+    return _blender("build_railing", name=name, points=points, height=height, postSpacing=post_spacing,
+                    postSize=post_size, profile=profile, railProfile=rail_profile, railSize=rail_size,
+                    bottomRail=bottom_rail, bottomClearance=bottom_clearance, infill=infill, balusterSize=baluster_size,
+                    balusterGap=baluster_gap, sides=sides, bevel=bevel, bevelSegments=bevel_segments,
+                    uvTileCm=uv_tile_cm, color=color, material=material, trimColor=trim_color,
+                    trimMaterial=trim_material, collision=collision, location=location, rotation=rotation,
+                    collection=collection)
+
+
+@mcp.tool()
+def bl_build_sign(name: str = None, width: float = None, height: float = None, thickness: float = None,
+                  face: str = None, face_depth: float = None, border: float = None, two_sided: bool = None,
+                  mount: str = None, mount_height: float = None, standoff: float = None, post_size: float = None,
+                  arm_length: float = None, profile: str = None, sides: int = None, bevel: float = None,
+                  bevel_segments: int = None, uv_tile_cm: float = None, color: list[float] = None, material: str = None,
+                  trim_color: list[float] = None, trim_material: str = None, collision: bool = None,
+                  location: list[float] = None, rotation: list[float] = None, collection: str = None) -> dict:
+    "Build a sign in Blender as a kit piece - a plate with an inset or raised face in its own slot, on a wall, standoffs, a post or a projecting arm, a lightmap UV layer and UCX_ hulls - hung where the signage standards put it. Call mif_help(\"bl_build_sign\") first."
+    return _blender("build_sign", name=name, width=width, height=height, thickness=thickness, face=face,
+                    faceDepth=face_depth, border=border, twoSided=two_sided, mount=mount, mountHeight=mount_height,
+                    standoff=standoff, postSize=post_size, armLength=arm_length, profile=profile, sides=sides,
+                    bevel=bevel, bevelSegments=bevel_segments, uvTileCm=uv_tile_cm, color=color, material=material,
+                    trimColor=trim_color, trimMaterial=trim_material, collision=collision, location=location,
+                    rotation=rotation, collection=collection)
 
 @mcp.tool()
 def bl_set_vertex_color_by_rule(object: str, rule: str, name: str = None, channel: str = None, range: list = None,
                                 invert: bool = None, combine: str = None, seed: int = None, element: str = None,
                                 distance: float = None, rays: int = None, space: str = None,
                                 make_active: bool = None, dirt: dict = None, group=None,
-                                adjust: dict = None, weight_combine: str = None) -> dict:
-    "Write a 0-1 mask into a Blender mesh's color attribute by a rule - up (faces that look up), height, cavity or random per part - a material's moss, dirt or variation mask. Also rules dirt, fromWeight and adjust. Call mif_help(\"bl_set_vertex_color_by_rule\") first."
+                                adjust: dict = None, weight_combine: str = None, noise: dict = None,
+                                facing: dict = None, distance_to: dict = None, attribute_type: str = None,
+                                from_material: dict = None) -> dict:
+    "Write a 0-1 mask into a Blender mesh's color attribute by a rule - up (faces that look up), height, cavity or random per part - a material's moss, dirt or variation mask. Also rules dirt, fromWeight, adjust, noise, facing, distanceTo and fromMaterial (a soft border mask), and a FLOAT target. Call mif_help(\"bl_set_vertex_color_by_rule\") first."
     return _blender("set_vertex_color_by_rule", object=object, rule=rule, name=name, channel=channel, range=range,
                     invert=invert, combine=combine, seed=seed, element=element, distance=distance, rays=rays,
                     space=space, makeActive=make_active, dirt=dirt, group=group, adjust=adjust,
-                    weightCombine=weight_combine)
+                    weightCombine=weight_combine, noise=noise, facing=facing, distanceTo=distance_to,
+                    attributeType=attribute_type, fromMaterial=from_material)
 
 @mcp.tool()
 def bl_build_lod_chain(object: str, ratios: list = None, file: str = None, overwrite: bool = None) -> dict:
@@ -3128,14 +4005,15 @@ def bl_build_road(points: list = None, curve: str = None, name: str = None, clos
                   shoulder: str | dict = None, curbs: bool | dict = None, barriers: str | bool | dict = None,
                   markings: bool | dict = None, sections: list = None, jumps: list = None,
                   chunk_length: float = None, lods: bool = None, uv_tile: float = None, materials: dict = None,
-                  collision: bool = None, collection: str = None, file: str = None, overwrite: bool = None) -> dict:
+                  collision: bool = None, collection: str = None, file: str = None, overwrite: bool = None,
+                  dressing: bool | dict = None, decals: bool | dict = None) -> dict:
     "Build a race road in Blender along points or a curve: clothoid-eased corners, rounded crests, banking from radius and speed, crown, curbs, shoulders, barriers, markings and jumps, as LOD'd chunks with UCX_ hulls and an optional FBX. Call mif_help(\"bl_build_road\") first."
     return _blender("build_road", points=points, curve=curve, name=name, closed=closed, width=width,
                     designSpeed=design_speed, sideFriction=side_friction, maxBank=max_bank, bankRate=bank_rate,
                     crown=crown, smoothing=smoothing, shoulder=shoulder, curbs=curbs, barriers=barriers,
                     markings=markings, sections=sections, jumps=jumps, chunkLength=chunk_length, lods=lods,
                     uvTile=uv_tile, materials=materials, collision=collision, collection=collection, file=file,
-                    overwrite=overwrite)
+                    overwrite=overwrite, dressing=dressing, decals=decals)
 
 
 @mcp.tool()
@@ -3150,11 +4028,17 @@ def bl_road_report(road: str = None, points: list = None, curve: str = None, clo
 def bl_build_rock(name: str = None, kind: str = None, seed: int = None, size: list = None, triangles: int = None,
                   sink: float = None, weathering: float = None, strata: bool = None, stone_color: list = None,
                   stone_color2: list = None, moss: float = None, collision: bool = None, location: list = None,
-                  rotation: list = None, collection: str = None) -> dict:
-    "Build a rock in Blender - a boulder, a slab or a cliff face - as one mesh with its own stone material, sized in centimeters, its pivot at the bottom center, the same rock for the same seed. Call mif_help(\"bl_build_rock\") first."
+                  rotation: list = None, collection: str = None, noise_amplitude: float = None,
+                  noise_frequency: float = None, output: str = None, triangle_budget: int = None,
+                  bake: bool = None, texture_folder: str = None, texture_size: int = None,
+                  lods: list[float] = None) -> dict:
+    "Build a rock in Blender - a boulder, a slab or a cliff face - as one mesh with its own stone material, sized in centimeters, its pivot at the bottom center, the same rock for the same seed. noise_amplitude (cm) and noise_frequency (waves per meter) set its surface's low undulation, smoother or lumpier at one size; the reply reads both back. Call mif_help(\"bl_build_rock\") first."
     return _blender("build_rock", name=name, kind=kind, seed=seed, size=size, triangles=triangles, sink=sink,
                     weathering=weathering, strata=strata, stoneColor=stone_color, stoneColor2=stone_color2,
-                    moss=moss, collision=collision, location=location, rotation=rotation, collection=collection)
+                    moss=moss, collision=collision, location=location, rotation=rotation, collection=collection,
+                    noiseAmplitude=noise_amplitude, noiseFrequency=noise_frequency, output=output,
+                    triangleBudget=triangle_budget, bake=bake, textureFolder=texture_folder,
+                    textureSize=texture_size, lods=lods, _timeout=600.0, _job_timeout=570.0)
 
 
 @mcp.tool()
@@ -3162,12 +4046,15 @@ def bl_build_plant(name: str = None, kind: str = None, seed: int = None, height:
                    count: int = None, bare: float = None, weeds: float = None, weed_mix: list = None,
                    flowers: float = None, length: float = None, ends: str = None, shag: float = None,
                    leaf_length: float = None, leaf_color: list = None, leaf_color2: list = None,
-                   location: list = None, rotation: list = None, collection: str = None) -> dict:
+                   location: list = None, rotation: list = None, collection: str = None, output: str = None,
+                   texture_folder: str = None, texture_size: int = None, slices: int = None,
+                   lods: list[float] = None) -> dict:
     "Build ground cover in Blender - a grass tuft, a fern, a broadleaf plant, a bush, a tile of lawn or a piece of clipped hedge - as one mesh of real geometry blades and leaves, sized in centimeters, its pivot at the base, the same plant for the same seed. Call mif_help(\"bl_build_plant\") first."
     return _blender("build_plant", name=name, kind=kind, seed=seed, height=height, width=width, count=count,
                     bare=bare, weeds=weeds, weedMix=weed_mix, flowers=flowers, length=length, ends=ends, shag=shag,
                     leafLength=leaf_length, leafColor=leaf_color, leafColor2=leaf_color2, location=location,
-                    rotation=rotation, collection=collection)
+                    rotation=rotation, collection=collection, output=output, textureFolder=texture_folder,
+                    textureSize=texture_size, slices=slices, lods=lods, _timeout=600.0)
 
 
 @mcp.tool()
@@ -3180,11 +4067,11 @@ def bl_uv_unwrap(object_name: str = None, method: str = "SMART", uv_layer: str =
                  texel_density: float = None, texture_size: int = None, box_space: str = None,
                  fill_holes: bool = None, active_face: int = None, keep_bounds: bool = None,
                  preview_id: str = None, preview_ttl_seconds: int = None, seam_rules: list = None,
-                 pack_fill: float = None) -> dict:
-    "Generate a UV layer on a Blender mesh - and THIS IS ALSO HOW YOU MAKE A SECOND UV CHANNEL FOR AN UNREAL LIGHTMAP: method='LIGHTMAP' with uv_layer='Lightmap' creates the channel, packs non-overlapping islands into 0-1, leaves the base UVs untouched and leaves active_render on the base colour layer. Verified on Blender 3.6, 4.2, 4.4 and 5.0. THE DEFAULT FAILURE OF A SECOND CHANNEL IS WRITING INTO THE FIRST ONE - uv_layers.new() does not make the new layer active on any Blender, and every UV operator writes to the ACTIVE layer, so a lightmap pass silently repacks the base colour UVs while the layer you asked for stays empty, and it is found at bake time. This op sets active correctly AND PROVES IT: otherLayersUnchanged and layersClobbered are measured by fingerprinting every other layer before and after, not asserted - activeLayer only reports what was intended and cannot disagree with itself. activeRenderLayer says which layer the renderer samples for textures, which is not the same as the active one. THREE METHODS: SMART (cuts its own seams, for a prop that has none), LIGHTMAP (the above), ANGLE (respects seams you marked - warns if the mesh has none, because it then flattens as one unusable island). With dry_run=True it previews each change with its value before and returns a preview_id; preview_id alone commits it, refused if anything changed since. With seam_rules it marks seams by rule before an ANGLE, CONFORMAL or MINIMUM_STRETCH unwrap (refused with the methods that cut their own or ignore seams): {rule: head, bone (default the one named head), armature (default the mesh's Armature modifier or parent), back (default [0,1,0])} rings the head where its skin weights meet the neck's - under the chin, round the nape - and runs a seam up the back of the skull to the crown; {rule: garment, prefer: inner | back | [x,y,z], preferWeight, midPlane {point, normal}, splitAtMidPlane} cuts every piece open from loop to loop along its preferred side (inner: the inside of a sleeve or leg) until it is one disc, gives a closed piece one slit, and with splitAtMidPlane halves it at the mid-plane first. With pack_fill (0-1) it packs to a fill target: every island scaled to one texel density, then packed at smaller margins until the layout uses that share of the tile, keeping the fullest; packFill gives target, achieved, met and every attempt. Every unwrap's layout gives fill, islands and texel density (pixels per metre at 1024) with the spread between islands - on a test character's head the automatic unwrap was 70 islands at 56% fill, and the head and garment rules 4 islands at 75%."
+                 pack_fill: float = None, hidden_faces: dict = None) -> dict:
+    "Generate a UV layer on a Blender mesh - and THIS IS ALSO HOW YOU MAKE A SECOND UV CHANNEL FOR AN UNREAL LIGHTMAP: method='LIGHTMAP' with uv_layer='Lightmap' creates the channel, packs non-overlapping islands into 0-1, leaves the base UVs untouched and leaves active_render on the base colour layer. Verified on Blender 3.6, 4.2, 4.4 and 5.0. THE DEFAULT FAILURE OF A SECOND CHANNEL IS WRITING INTO THE FIRST ONE - uv_layers.new() does not make the new layer active on any Blender, and every UV operator writes to the ACTIVE layer, so a lightmap pass silently repacks the base colour UVs while the layer you asked for stays empty, and it is found at bake time. This op sets active correctly AND PROVES IT: otherLayersUnchanged and layersClobbered are measured by fingerprinting every other layer before and after, not asserted - activeLayer only reports what was intended and cannot disagree with itself. activeRenderLayer says which layer the renderer samples for textures, which is not the same as the active one. THREE METHODS: SMART (cuts its own seams, for a prop that has none), LIGHTMAP (the above), ANGLE (respects seams you marked - warns if the mesh has none, because it then flattens as one unusable island). With dry_run=True it previews each change with its value before and returns a preview_id; preview_id alone commits it, refused if anything changed since. With seam_rules it marks seams by rule before an ANGLE, CONFORMAL or MINIMUM_STRETCH unwrap (refused with the methods that cut their own or ignore seams): {rule: head, bone (default the one named head), armature (default the mesh's Armature modifier or parent), back (default [0,1,0])} rings the head where its skin weights meet the neck's - under the chin, round the nape - and runs a seam up the back of the skull to the crown; {rule: garment, prefer: inner | back | [x,y,z], preferWeight, midPlane {point, normal}, splitAtMidPlane} cuts every piece open from loop to loop along its preferred side (inner: the inside of a sleeve or leg) until it is one disc, gives a closed piece one slit, and with splitAtMidPlane halves it at the mid-plane first. With pack_fill (0-1) it packs to a fill target: every island scaled to one texel density, then packed at smaller margins until the layout uses that share of the tile, keeping the fullest; packFill gives target, achieved, met and every attempt. Every unwrap's layout gives fill, islands and texel density (pixels per metre at 1024) with the spread between islands - on a test character's head the automatic unwrap was 70 islands at 56% fill, and the head and garment rules 4 islands at 75%. With hidden_faces {visibility, downFacing, volumes, occluders, uvScale (default 0.03)} the faces nobody sees - every ray from them hits geometry, facing down at the base, or facing into a named interior box - are shrunk after the unwrap and before the pack, so what shows takes the map; hiddenFaces names them and gives the visible faces' texel density packed without and with the shrink (a closed 20 x 16 m test cottage: 15.6 to 25.0 px/m at 1024)."
     if preview_id:
         return (_preview_commit_refusal(preview_id, object_name=object_name, uv_layer=uv_layer, seam_rules=seam_rules,
-                                        pack_fill=pack_fill,
+                                        pack_fill=pack_fill, hidden_faces=hidden_faces,
                                         angle_limit_deg=angle_limit_deg, replace=replace, dry_run=dry_run,
                                         mark_seams=mark_seams, clear_seams=clear_seams, uv_pack=uv_pack,
                                         pack_margin=pack_margin, uv_transform=uv_transform,
@@ -3207,7 +4094,7 @@ def bl_uv_unwrap(object_name: str = None, method: str = "SMART", uv_layer: str =
                     # projects in - OBJECT, or WORLD with the location added.
                     metersPerTile=meters_per_tile, texelDensity=texel_density, textureSize=texture_size,
                     boxSpace=box_space, fillHoles=fill_holes, activeFace=active_face, keepBounds=keep_bounds,
-                    seamRules=seam_rules, packFill=pack_fill)
+                    seamRules=seam_rules, packFill=pack_fill, hiddenFaces=hidden_faces)
 
 
 @mcp.tool()
@@ -3360,11 +4247,11 @@ def bl_vertex_groups_from_bones(object: str, groups: dict, replace: bool = None)
 @mcp.tool()
 def bl_delete_mesh_elements(object: str, elements: str = None, indices: list = None, vertex_group: str = None,
                             min_weight: float = None, loose_islands_under: int = None, occluded_by: dict = None,
-                            disagree_with: dict = None) -> dict:
+                            disagree_with: dict = None, inside_of: dict = None) -> dict:
     "Delete part of a Blender mesh: elements VERTS, EDGES, FACES or ONLY_FACES, chosen by ONE of indices (from bl_select_faces or bl_vertex_info), vertex_group with min_weight (default 0.5), or loose_islands_under N (every face-connected island with fewer faces), occluded_by {meshes, reach, margin} or disagree_with {reference, maxDistance, minDot}. Counts before and after; a selector that matches nothing is refused."
     return _blender("delete_mesh_elements", object=object, elements=elements, indices=indices,
                     vertexGroup=vertex_group, minWeight=min_weight, looseIslandsUnder=loose_islands_under,
-                    occludedBy=occluded_by, disagreeWith=disagree_with)
+                    occludedBy=occluded_by, disagreeWith=disagree_with, insideOf=inside_of)
 
 
 @mcp.tool()
@@ -3510,10 +4397,49 @@ def bl_derive_image_map(image: str, kind: str, name: str = None, strength: float
 
 @mcp.tool()
 def bl_image_stats(image: str = None, file: str = None, normal: bool = None, tiling: bool = None, pixels: list = None,
-                   uvs: list = None, tile: int = None, role: str = None, base_color: str = None) -> dict:
+                   uvs: list = None, tile: int = None, role: str = None, base_color: str = None, object: str = None,
+                   uv_layer: str = None, mask: str = None) -> dict:
     "Describe a Blender image's pixels - per channel min, max, mean, stddev, NaN and Inf counts, share at 0 and 1, alpha coverage; a normal-map check, a tiling check and samples at pixels or UVs. Catches a black bake, an inverted normal or a NaN EXR. See mif_help."
     return _blender("image_stats", image=image, file=file, normal=normal, tiling=tiling, pixels=pixels, uvs=uvs,
-                    tile=tile, role=role, baseColor=base_color)
+                    tile=tile, role=role, baseColor=base_color, object=object, uvLayer=uv_layer, mask=mask)
+
+
+@_closed
+class _ComposeLayer(TypedDict, total=False):   # ops_image._CM_LAYER_KEYS, read by _cm_layer_plan
+    type: Required[str]
+    blend: str
+    amount: float
+    color: list[float]
+    roughness: float
+    metallic: float
+    scale: float
+    octaves: int
+    power: float
+    levels: list[float]
+    invert: bool
+    image: str
+    axis: str
+    gain: float
+    seed: float
+
+
+@_closed
+class _ComposeMaps(TypedDict, total=False):    # ops_image._CM_MAPS: a file path each
+    baseColor: str
+    roughness: str
+    metallic: str
+    ao: str
+    curvature: str
+    position: str
+
+
+@mcp.tool()
+def bl_compose_maps(layers: list[_ComposeLayer], object: str = None, folder: str = None, pattern: str = None,
+                    maps: _ComposeMaps = None,
+                    out_folder: str = None, overwrite: bool = None, seed: float = None) -> dict:
+    "Composite layers onto a baked Blender texture set - cavity from AO, edges from curvature, height, UV-space noise, any image mask - into base color, roughness and metallic, written under the bake's own names and measured at three scales. See mif_help."
+    return _blender("compose_maps", layers=layers, object=object, folder=folder, pattern=pattern, maps=maps,
+                    outFolder=out_folder, overwrite=overwrite, seed=seed)
 
 
 @mcp.tool()
@@ -3577,10 +4503,12 @@ def bl_list_node_groups(type: str = None, limit: int = None, name_excludes: list
 
 
 @mcp.tool()
-def bl_describe_op(op: str) -> dict:
+def bl_describe_op(op: str = None, node_type: str = None) -> dict:
     "What a Blender addon op accepts, and the RECORDED REASON for keys it deliberately does not take - the discovery half of the notes work. reject_unknown has been able to answer a wrongly-guessed key since 2026-09-07 (bl_add_modifier says apply is absent because adding and applying are separate on purpose, and points at bl_apply_modifier), but only to a caller who had already been refused. The UE side serves the same table through describe_endpoint and can be read BEFORE the call; this is the addon's equivalent. It reads the accept-list and the notes dict out of the RUNNING SOURCE with ast rather than from a generated table, so unlike the UE side it cannot drift from the guard it describes - accept-lists that are module-level constants are resolved by asking the imported module, which is exact. An op with no reject_unknown guard comes back with acceptedKeys null and a reason, never as an empty list, because reporting no keys for an op that simply has no guard is the same class of quiet lie the notes exist to prevent. `refusals` lists the op's VALUE RULES as written in its source - every refusal message, placeholders like %s left unfilled - so ranges, allowed words and required combinations can be read before the call instead of met one refusal at a time; helpers in the same module are followed one level (refusalsFromHelpers), and a message built at runtime is counted in refusalsUnreadable rather than dropped. op takes the add-on op name (add_modifier) or the tool name (bl_add_modifier), the two spellings bl_batch takes; the reply's op is the add-on name."
     # THE TOOL NAME IS THE OP IT POSTS (2026-11-09): bl_batch and the tool list say bl_add_modifier, and describing
     # the op about to be batched was refused "unknown op". Read off the tool's own _blender call, as bl_batch does.
+    if node_type:           # a node type's own enum properties and their items (wave_type, data_type, blend_type)
+        return _blender("describe_op", nodeType=node_type, op=op)
     posted = _bl_tool_op(op) if isinstance(op, str) and op.strip().startswith("bl_") else None
     if posted:
         reply = _blender("describe_op", op=posted)
@@ -3595,14 +4523,14 @@ def bl_describe_op(op: str) -> dict:
 @mcp.tool()
 def bl_add_modifier(object_name: str = None, type: str = None, modifier: str = None,
                     settings: dict = None, index: int = None, copy_from: dict = None, to: list = None,
-                    hollow: bool = None) -> dict:
+                    hollow: bool = None, memory_budget_gb: float = None) -> dict:
     "Add a modifier to a Blender object's stack - the write half of bl_list_modifiers. The response's facesFold is true when this modifier made faces fold over themselves (triangleOverlapAfter above 1.02: a render-only defect every count misses, typically a bevel wider than half a thin wall after a boolean - put a TRIANGULATE modifier before it). A mesh takes every type; a curve or text takes 28 (ARRAY, BEVEL, SOLIDIFY, SCREW, SUBSURF, WELD, SIMPLE_DEFORM, CAST and more, not the ones that need mesh data); a lattice only deforming ones; a Grease Pencil object the GREASE_PENCIL_* types and LINEART (GP_* on Blender 3.6 and 4.2). A type the object cannot take is refused naming its type. `settings` takes the curated camelCase names or any writable RNA property of the modifier by its identifier (foam_layer_name, limit_method, use_axis) - the path bl_set_modifier uses - and a setting that refuses removes the new modifier again. A SOLIDIFY that would make a second inward shell inside a closed mesh is refused, naming bl_transform_selection's SHRINK_FATTEN to grow it; hollow true keeps the cavity, for a wall to cut through or a shell to print."
     if copy_from is not None or to is not None:
         # COPY MODE takes no object, type, modifier or settings of its own; the add-on refuses any it is sent
         return _blender("add_modifier", copyFrom=copy_from, to=to, index=index, object=object_name, type=type,
                         modifier=modifier, settings=settings, hollow=hollow)
     return _blender("add_modifier", object=object_name, type=type, modifier=modifier,
-                    settings=settings, index=index, hollow=hollow)
+                    settings=settings, index=index, hollow=hollow, memoryBudgetGB=memory_budget_gb)
 
 
 @mcp.tool()
@@ -3636,8 +4564,8 @@ def bl_remove_modifier(object_name: str, modifier: str) -> dict:
 
 
 @mcp.tool()
-def bl_set_uv_layer(object: str, layer: str, active: bool = None, rename: str = None,
-                    remove: bool = None) -> dict:
+def bl_set_uv_layer(object: str, layer: str = None, active: bool = None, rename: str = None,
+                    remove: bool | str = None) -> dict:
     "Choose the ACTIVE UV layer on a Blender mesh, rename one, or remove one. THE ACTIVE LAYER IS THE ONE EVERYTHING WRITES TO - every UV operator and every bake - and bl_uv_info reported it while the only way to CHANGE it was bl_uv_unwrap, which sets it as a side effect of unwrapping. So selecting a layer meant re-unwrapping it and destroying the UVs it held. REMOVING A LAYER SHIFTS EVERY LATER LAYER'S INDEX: measured on 3.6.23 and 5.0.1, with UVMap, A, B, C, removing A moves B from 2 to 1 and C from 3 to 2. Unreal's lightmap coordinate is an INDEX, not a name, so removing an earlier layer silently repoints what the engine reads on a mesh it has already imported - the layers that moved are named in indicesShifted. Removing the LAST layer is refused: it leaves the mesh unwrappable, and texturing and lightmap baking both fail until it is unwrapped again. A mesh is limited to 8 UV layers, which is why removing junk ones matters at all."
     return _blender("set_uv_layer", object=object, layer=layer, active=active,
                     rename=rename, remove=remove)
@@ -3677,10 +4605,11 @@ def bl_slide_edges(object: str, edges: list, factor: float, clamp: bool = None) 
 @mcp.tool()
 def bl_inset_faces(object: str, faces: list, thickness: float, depth: float = None, individual: bool = None,
                    boundary: bool = None, even: bool = None, outset: bool = None, relative_offset: bool = None,
-                   space: str = None) -> dict:
+                   space: str = None, allow_folds: bool = None) -> dict:
     "Inset Blender mesh faces: a ring thickness wide inside the region (or each face with individual), the inner face moved depth along the normal. Returns the inner and ring face indices."
     return _blender("inset_faces", object=object, faces=faces, thickness=thickness, depth=depth, individual=individual,
-                    boundary=boundary, even=even, outset=outset, relativeOffset=relative_offset, space=space)
+                    boundary=boundary, even=even, outset=outset, relativeOffset=relative_offset, space=space,
+                    allowFolds=allow_folds)
 
 
 @mcp.tool()
@@ -3768,11 +4697,102 @@ def bl_build_vehicle_body(bottom: list, belt: list, half_width: list, roof: list
 def bl_build_lathe(profile: list, name: str = None, segments: int = None, axis: str = None, caps: bool = None,
                    smooth: bool = None, uv_scale: float = None, material: str = None, location: list = None,
                    rotation: list = None, scale: list = None, collection: str = None,
-                   take_over_name: bool = None, lightmap: bool = None) -> dict:
-    "Revolve a profile [[r, h], ...] round an axis into a Blender solid of revolution (a can, a bottle, a post) whose every face points out, checked by signed volume. r 0 is a pole; caps close open ends."
+                   take_over_name: bool = None, lightmap: bool = None, direction: list = None, bone: dict = None,
+                   closed_profile: bool = None, thickness: float = None) -> dict:
+    "Revolve a profile [[r, h], ...] round an axis into a Blender solid of revolution (a can, a bottle, a post) whose every face points out, checked by signed volume. r 0 is a pole; caps close open ends. Any axis: direction [x,y,z] or bone {armature, bone}; closed_profile welds a looped profile; thickness walls an open one."
     return _blender("build_lathe", profile=profile, name=name, segments=segments, axis=axis, caps=caps, smooth=smooth,
                     uvScale=uv_scale, material=material, location=location, rotation=rotation, scale=scale,
-                    collection=collection, takeOverName=take_over_name, lightmap=lightmap)
+                    collection=collection, takeOverName=take_over_name, lightmap=lightmap, direction=direction,
+                    bone=bone, closedProfile=closed_profile, thickness=thickness)
+
+
+@_closed
+class _PlateLip(TypedDict, total=False):       # op_split_plates lip: height required, width default 2 x overlap
+    height: Required[float]
+    width: float
+
+
+@mcp.tool()
+def bl_split_plates(object: str, axis: str | list[float] = None, count: int = None, cuts: list[float] = None,
+                    overlap: float = None, lip: _PlateLip = None, leading: str = None, name: str = None,
+                    keep_source: bool = None) -> dict:
+    "Split a closed Blender part along its length into overlapping plates - shingled armour lames, segmented panels - each cut capped so every piece is closed, named <name>_01, _02... in order. count or cuts, overlap between neighbours, lip {height, width} pushes each leading edge out. Call mif_help(\"bl_split_plates\") first."
+    return _blender("split_plates", object=object, axis=axis, count=count, cuts=cuts, overlap=overlap, lip=lip,
+                    leading=leading, name=name, keepSource=keep_source)
+
+
+@_closed
+class _BendAxis(TypedDict):                    # op_conform_sheet BEND: {point, direction}, world, both required
+    point: list[float]
+    direction: list[float]
+
+
+@_closed
+class _SheetPin(TypedDict, total=False):       # ops_garment._sheet_pin: group OR near, radius, falloff
+    group: str
+    near: list[float]
+    radius: float
+    falloff: float
+
+
+@mcp.tool()
+def bl_conform_sheet(object: str, mode: str = None, axis: _BendAxis = None, radius: float = None, body: str = None,
+                     offset: float = None, pin: _SheetPin = None, name: str = None) -> dict:
+    "Bend a flat Blender panel round an axis (mode BEND) or wrap it onto a body at an offset (mode WRAP), keeping its UVs and thickness - a wing membrane, a wrapped plate - with a falloff from a pinned edge. Call mif_help(\"bl_conform_sheet\") first."
+    return _blender("conform_sheet", object=object, mode=mode, axis=axis, radius=radius, body=body, offset=offset,
+                    pin=pin, name=name)
+
+
+@_closed
+class _SdfChain(TypedDict, total=False):       # ops_create._sdf_elements: points, radii OR radius, smoothPath
+    points: Required[list[list[float]]]
+    radii: list[float]
+    radius: float
+    smoothPath: bool
+
+
+@_closed
+class _SdfSphere(TypedDict):
+    center: list[float]
+    radius: float
+
+
+@_closed
+class _SdfBox(TypedDict, total=False):
+    center: Required[list[float]]
+    size: Required[list[float]]
+    round: float
+
+
+@mcp.tool()
+def bl_sdf_union(chains: list[_SdfChain] = None, spheres: list[_SdfSphere] = None, boxes: list[_SdfBox] = None,
+                 smooth: float = None, voxel_size: float = None, max_voxels: int = None, name: str = None,
+                 location: list[float] = None, collection: str = None) -> dict:
+    "Fuse capsule chains (points with a radius each), spheres and boxes with a smooth minimum into ONE closed Blender mesh - roots filleted into a trunk, limbs into a body - meshed from the field, not from joined shells. Call mif_help(\"bl_sdf_union\") first."
+    return _blender("sdf_union", chains=chains, spheres=spheres, boxes=boxes, smooth=smooth, voxelSize=voxel_size,
+                    maxVoxels=max_voxels, name=name, location=location, collection=collection)
+
+
+@_closed
+class _CellSpacing(TypedDict):          # ops_garment._cell_spacing: all three, nothing else
+    group: str
+    inside: float
+    outside: float
+
+
+@_closed
+class _CellTilt(TypedDict, total=False):  # op_cell_pattern: direction required, amount default 0
+    direction: Required[list[float]]
+    amount: float
+
+
+@mcp.tool()
+def bl_cell_pattern(object: str, spacing: float | _CellSpacing, groove_depth: float, groove_width: float = None,
+                    bevel: float = None, tilt: _CellTilt = None, seed: int = None, attribute: str = None, value_attribute: str = None,
+                    name: str = None) -> dict:
+    "Write crisp cells or scales onto a dense Blender mesh: seeds spread at spacing (or by vertex group), a groove on every cell border, a bevel up to a flat top, a shingle tilt, and a per-cell id and value the material can read. Call mif_help(\"bl_cell_pattern\") first."
+    return _blender("cell_pattern", object=object, spacing=spacing, grooveDepth=groove_depth, grooveWidth=groove_width,
+                    bevel=bevel, tilt=tilt, seed=seed, attribute=attribute, valueAttribute=value_attribute, name=name)
 
 
 @mcp.tool()
@@ -3863,12 +4883,13 @@ def bl_refine_hands(object: str, armature: str = None, normal_map: str = None, r
 def bl_build_body(armature: str = None, bones: dict = None, preset: str = None, height: float = None,
                   torso: list = None, arms: list = None, legs: list = None, finger_curl: float = None,
                   subdivisions: int = None, game_ready=None, create_armature: bool = None, bind: bool = None,
-                  material: str = None, name: str = None, collection: str = None, take_over_name: bool = None) -> dict:
+                  material: str = None, name: str = None, collection: str = None, take_over_name: bool = None,
+                  memory_budget_gb: float = None) -> dict:
     "A Blender body with clean joins on a skeleton (armature) or a preset (adult, slim, heavy, child): a quad cage lofted from width and depth tables, limbs joined through quad holes, hands and feet, fitted and subdivided."
     return _blender("build_body", armature=armature, bones=bones, preset=preset, height=height, torso=torso, arms=arms,
                     legs=legs, fingerCurl=finger_curl, subdivisions=subdivisions, gameReady=game_ready,
                     createArmature=create_armature, bind=bind, material=material, name=name, collection=collection,
-                    takeOverName=take_over_name)
+                    takeOverName=take_over_name, memoryBudgetGB=memory_budget_gb)
 
 
 @mcp.tool()
@@ -4127,14 +5148,15 @@ def bl_remesh_mesh(object: str, mode: str, target_faces: int = None, target_rati
                    preserve_boundary: bool = None, preserve_attributes: bool = None, smooth_normals: bool = None,
                    seed: int = None, voxel_size: float = None, adaptivity: float = None, fix_poles: bool = None,
                    preserve_volume: bool = None, preserve_vertex_colors: bool = None, preserve_face_sets: bool = None,
-                   preserve_mask: bool = None) -> dict:
+                   preserve_mask: bool = None, cap_holes: bool = None, allow_new_holes: bool = None) -> dict:
     "Remesh a closed Blender mesh in place: mode QUADRIFLOW to a face count, ratio or edge length (symmetry welded), or VOXEL with fix poles, preserve volume and the keep flags. Faces, quads and poles before and after."
     return _blender("remesh_mesh", object=object, mode=mode, targetFaces=target_faces, targetRatio=target_ratio,
                     targetEdgeLength=target_edge_length, symmetry=symmetry, preserveSharp=preserve_sharp,
                     preserveBoundary=preserve_boundary, preserveAttributes=preserve_attributes,
                     smoothNormals=smooth_normals, seed=seed, voxelSize=voxel_size, adaptivity=adaptivity,
                     fixPoles=fix_poles, preserveVolume=preserve_volume, preserveVertexColors=preserve_vertex_colors,
-                    preserveFaceSets=preserve_face_sets, preserveMask=preserve_mask)
+                    preserveFaceSets=preserve_face_sets, preserveMask=preserve_mask, capHoles=cap_holes,
+                    allowNewHoles=allow_new_holes)
 
 
 @mcp.tool()
@@ -4309,11 +5331,13 @@ def bl_transfer_by_uv(object: str, source: str, uv_map: str = None, source_uv_ma
 def bl_loft_garment(body: str, rings: list, armature: str = None, segments: int = None, ease: float = None,
                     offset: float = None, edge_length: float = None, evaluated: bool = None, name: str = None,
                     collection: str = None, garment: str = None, ease_table: dict = None, axis=None,
-                    center: list = None, limb: dict = None) -> dict:
-    "Loft a Blender garment tube round a body through rings at its bones or, without a rig, along axis (X, Y, Z or a vector) with center or along limb {from, to}. Bone rings [{bone, at, ease, offset}]: each the body's own cross-section square to the bone, eased out; rows at edge_length, UVs down the tube. Axis rings [{height}], limb rings [{at}]; each ring centred on the body's own section there."
+                    center: list = None, limb: dict = None, max_width_ratio: float = None,
+                    limb_clip: float = None) -> dict:
+    "Loft a Blender garment tube round a body through rings at its bones or, without a rig, along axis (X, Y, Z or a vector) with center or along limb {from, to}. Bone rings [{bone, at, ease, offset}]: each the body's own cross-section square to the bone, eased out; rows at edge_length, UVs down the tube. Axis rings [{height}], limb rings [{at}]; each ring centred on the body's own section there. A ring far wider than its limb is refused (max_width_ratio) or clipped (limb_clip); rings[k].rim {roll, flare, thickness} finishes an end."
     return _blender("loft_garment", body=body, armature=armature, rings=rings, segments=segments, ease=ease,
                     offset=offset, edgeLength=edge_length, evaluated=evaluated, name=name, collection=collection,
-                    garment=garment, easeTable=ease_table, axis=axis, center=center, limb=limb)
+                    garment=garment, easeTable=ease_table, axis=axis, center=center, limb=limb,
+                    maxWidthRatio=max_width_ratio, limbClip=limb_clip)
 
 
 @mcp.tool()
@@ -4398,7 +5422,7 @@ def bl_attach_sleeve(object: str, body: str, rings: list, armature: str = None, 
 
 @mcp.tool()
 def bl_displace_by_rule(object: str, rules: list, name: str = None) -> dict:
-    "A Blender high poly's detail by rule: SEAM grooves and STITCH dashes along a world polyline or the mesh's BOUNDARY, UV_SEAMS or SHARP edges, each vertex moved along its normal - the detail a high-to-low bake carries."
+    "A Blender high poly's detail by rule: SEAM grooves and STITCH dashes along a world polyline or the mesh's BOUNDARY, UV_SEAMS or SHARP edges, each vertex moved along its normal - the detail a high-to-low bake carries. BARK cracks along a flow and WOOD_END_GRAIN rings a cut face."
     return _blender("displace_by_rule", object=object, rules=rules, name=name)
 
 @mcp.tool()
@@ -4487,14 +5511,25 @@ def bl_set_skin_vertices(object: str, vertices: list = None, all: bool = None, g
 
 
 @mcp.tool()
+def bl_unwrap_organic(object: str, preset: str, axis: str | list[float] = None, hide: list[float] = None,
+                      views: int = None, rays: bool = None, tips: int = None, method: str = None, uv_layer: str = None, margin: float = None,
+                      compare: bool = None) -> dict:
+    "Unwrap a Blender creature, tube or lathe with seams placed where it is least seen - one tree of cuts joining its ends or limb tips - then a minimum-stretch unwrap, measured against SMART on the same mesh (fill, islands, stretch). Call mif_help(\"bl_unwrap_organic\") first."
+    return _blender("unwrap_organic", object=object, preset=preset, axis=axis, hide=hide, views=views, rays=rays,
+                    tips=tips, method=method, uvLayer=uv_layer, margin=margin, compare=compare)
+
+
+@mcp.tool()
 def bl_uv_pack(object: str, uv_layer: str = None, margin: float = None, rotate: bool = None,
                equalize_by_area: bool = None, texture_size=None, merge_overlap: bool = None,
                target_texel_density: float = None, unit: str = None, region: list = None,
-               margin_method: str = None) -> dict:
-    "Pack a Blender mesh's existing UV islands into the 0-1 tile WITHOUT re-unwrapping - optionally equalising them by area first, so every island gets one texel density. Reports the density spread before and after (1.0 = equal), the layout's area and bounds. texture_size packs for that texture: on [w, h] V is stretched by w / h so texels stay square and rotation is refused (the pack treats the tile as square). target_texel_density (needs texture_size, unit PX_PER_CM default) scales the layout to that density instead of the largest that fits. merge_overlap keeps overlapping islands stacked."
+               margin_method: str = None, margin_px: float = None, stack_identical: bool = None,
+               hidden_faces: dict = None) -> dict:
+    "Pack a Blender mesh's existing UV islands into the 0-1 tile WITHOUT re-unwrapping - optionally equalising them by area first, so every island gets one texel density. Reports the density spread before and after (1.0 = equal), the layout's area and bounds. texture_size packs for that texture: on [w, h] V is stretched by w / h so texels stay square and rotation is refused (the pack treats the tile as square). target_texel_density (needs texture_size, unit PX_PER_CM default) scales the layout to that density instead of the largest that fits. merge_overlap keeps overlapping islands stacked. stack_identical packs identical parts onto one place; margin_px is the margin in pixels of texture_size."
     return _blender("uv_pack", object=object, uvLayer=uv_layer, margin=margin, rotate=rotate,
                     equalizeByArea=equalize_by_area, textureSize=texture_size, mergeOverlap=merge_overlap,
-                    targetTexelDensity=target_texel_density, unit=unit, region=region, marginMethod=margin_method)
+                    targetTexelDensity=target_texel_density, unit=unit, region=region, marginMethod=margin_method,
+                    marginPx=margin_px, stackIdentical=stack_identical, hiddenFaces=hidden_faces)
 
 
 @mcp.tool()
@@ -4687,7 +5722,8 @@ def bl_create_primitive(kind: str, name: str = "", size: float = None, radius: f
                         y_subdivisions: int = None, radius1: float = None, radius2: float = None,
                         major_radius: float = None, minor_radius: float = None,
                         align: str = None, fill_type: str = None,
-                        major_segments: int = None, minor_segments: int = None, collection: str = None) -> dict:
+                        major_segments: int = None, minor_segments: int = None, collection: str = None,
+                        align_z: list = None, align_up: list = None) -> dict:
     "Create a Blender primitive mesh - kind cube (size = full edge), sphere, icosphere, cylinder, cone, torus, plane, grid, circle or monkey; align WORLD/VIEW/CURSOR; fill_type NGON/TRIFAN/NOTHING. A sphere (alias uvsphere) takes radius. A CONE takes radius1/radius2 and a TORUS takes major_radius/minor_radius - neither accepts size or radius, and passing the wrong one is refused rather than reinterpreted. align is WORLD/VIEW/CURSOR; fill_type (NGON/TRIFAN/NOTHING) applies to a circle, a cylinder and a cone, whose ends are fans by default, and is refused by name elsewhere. rotation is radians."
     # radius1/radius2 and majorRadius/minorRadius were accepted by the addon and sent by nothing, so
     # a cone or a torus could only be created at its DEFAULT dimensions over MCP. The op's own
@@ -4709,7 +5745,7 @@ def bl_create_primitive(kind: str, name: str = "", size: float = None, radius: f
                     radius1=radius1, radius2=radius2,
                     majorRadius=major_radius, minorRadius=minor_radius,
                     align=align, fillType=fill_type, majorSegments=major_segments, minorSegments=minor_segments,
-                    collection=collection)
+                    collection=collection, alignZ=align_z, alignUp=align_up)
 
 
 @mcp.tool()
@@ -4719,7 +5755,7 @@ def bl_create_light(type: str = "POINT", name: str = "", location: list = None,
                     shape: str = None, spot_angle: float = None, spot_blend: float = None,
                     angle: float = None, shadow: bool = None, diffuse_factor: float = None,
                     specular_factor: float = None, temperature: float = None,
-                    use_temperature: bool = None, collection: str = None) -> dict:
+                    use_temperature: bool = None, collection: str = None, look_at: list = None) -> dict:
     "Create a Blender light: type POINT, SUN, SPOT or AREA; energy in watts (a SUN's is irradiance), color [r,g,b], rotation in RADIANS. Type-specific settings are REFUSED on the wrong type rather than ignored - spot_angle on a POINT light is an error, not a no-op. rotation and spot_angle/angle are RADIANS. The response reports what the light IS, read back off the datablock. COLOUR TEMPERATURE IN KELVIN: temperature is how lighting is actually specified - 3200 tungsten, 6500 daylight - rather than as linear RGB, and it MULTIPLIES the colour rather than replacing it, so colour becomes a tint. Refused by name on a Blender without bpy.types.Light.use_temperature rather than silently ignored."
     # EVERY accepted key is sent. param_reach asks exactly this question of the Blender half, and a
     # capability the addon accepts but no tool forwards is one an MCP caller cannot reach at all -
@@ -4729,7 +5765,7 @@ def bl_create_light(type: str = "POINT", name: str = "", location: list = None,
                     size=size, sizeY=size_y, shape=shape, spotAngle=spot_angle,
                     spotBlend=spot_blend, angle=angle, shadow=shadow,
                     diffuseFactor=diffuse_factor, specularFactor=specular_factor,
-                    temperature=temperature, useTemperature=use_temperature, collection=collection)
+                    temperature=temperature, useTemperature=use_temperature, collection=collection, lookAt=look_at)
 
 
 @mcp.tool()
@@ -4977,11 +6013,11 @@ def bl_bake_to_keyframes(object: str, frame_start: int = None, frame_end: int = 
 @mcp.tool()
 def bl_set_bone_pose(object: str, bone: str, location: list = None, rotation: list = None,
                      quaternion: list = None, scale: list = None, rotation_mode: str = None, mirror: dict = None,
-                     turn: dict = None, ik: dict = None) -> dict:
+                     turn: dict = None, ik: dict = None, aim: dict = None) -> dict:
     "Pose one bone of a Blender armature: location [x,y,z] in the bone's own space, rotation [x,y,z] euler radians or quaternion [w,x,y,z], scale [x,y,z], with rotation_mode applied first. Character animation had zero coverage here - bones could be listed and renamed and nothing else - and this was unreachable through bl_set_keyframe until the same day, because its dotted-path walk stripped subscripts so pose.bones[\"x\"].location resolved to the bone COLLECTION. rotation (euler) and quaternion are refused against the bone's actual rotation_mode rather than silently ignored, and refused together. THE READ-BACK IS EVALUATED through the depsgraph: a bone with an IK chain, a Copy Rotation or a Limit does not end up where you put it, and pose_bone.matrix is the raw value. The response reports `written` and `evaluated*` separately - if they differ, that is the constraint working, not a fault. Call mif_help(\"bl_set_bone_pose\") first. rotation_mode (QUATERNION, XYZ ... AXIS_ANGLE) is applied BEFORE the values: a new bone is QUATERNION and ignores a euler, so pass rotation_mode XYZ with rotation in one call. Changing the mode keeps the bone's current pose (measured on 3.6-5.2); rotationModeBefore reports what it was."
     return _blender("set_bone_pose", object=object, bone=bone, location=location,
                     rotation=rotation, quaternion=quaternion, scale=scale, rotationMode=rotation_mode, mirror=mirror,
-                    turn=turn, ik=ik)
+                    turn=turn, ik=ik, aim=aim)
 
 
 @mcp.tool()
@@ -5240,14 +6276,15 @@ def bl_match_world_transform(object: str, bone: str = None, target: str = None, 
 
 
 @mcp.tool()
-def bl_set_object_visibility(object: str, hide_viewport: bool = None, hide_render: bool = None,
+def bl_set_object_visibility(object: str = None, hide_viewport: bool = None, hide_render: bool = None,
                              visible_camera: bool = None, visible_diffuse: bool = None,
                              visible_glossy: bool = None, visible_transmission: bool = None,
                              visible_volume_scatter: bool = None, visible_shadow: bool = None,
                              holdout: bool = None, shadow_catcher: bool = None,
                              hidden_in_view_layer: bool = None, display_as: str = None, show_wire: bool = None,
                              show_in_front: bool = None, show_bounds: bool = None, bounds_type: str = None,
-                             hide_select: bool = None) -> dict:
+                             hide_select: bool = None, objects: list[str] = None, pattern: str = None,
+                             collection: str = None) -> dict:
     "Control what a Blender object is visible TO - the viewport, the render, and each ray type separately. visible_glossy=false is how you stop a softbox appearing as a white rectangle in every reflection, which is the single most common adjustment in product and archviz lighting and was unreachable here. It also answers 'why is my object missing from the render', because hide_render and visible_camera are exactly where that answer lives - the response reports appearsInRender directly. Works on EVERY object type, because ray visibility is an object property and a mesh acting as a reflector needs it as much as a lamp does. Ray visibility moved off the Cycles addon onto the object in Blender 3.0, so both spellings are tried; a flag this build does not expose is REFUSED by name rather than silently ignored, and every flag is resolved before any is written. Call mif_help(\"bl_set_object_visibility\") first."
     return _blender("set_object_visibility", object=object, hideViewport=hide_viewport,
                     hideRender=hide_render, visibleCamera=visible_camera,
@@ -5256,7 +6293,8 @@ def bl_set_object_visibility(object: str, hide_viewport: bool = None, hide_rende
                     visibleVolumeScatter=visible_volume_scatter, visibleShadow=visible_shadow,
                     holdout=holdout, shadowCatcher=shadow_catcher, hiddenInViewLayer=hidden_in_view_layer,
                     displayAs=display_as, showWire=show_wire, showInFront=show_in_front, showBounds=show_bounds,
-                    boundsType=bounds_type, hideSelect=hide_select)
+                    boundsType=bounds_type, hideSelect=hide_select, objects=objects, pattern=pattern,
+                    collection=collection)
 
 
 @mcp.tool()
@@ -5313,9 +6351,9 @@ def bl_list_cameras(name_contains: str = None, limit: int = None, name_excludes:
 
 
 @mcp.tool()
-def bl_aim_object(object: str, target: str = None, look_at: list = None) -> dict:
+def bl_aim_object(object: str, target: str = None, look_at: list = None, direction: list = None) -> dict:
     "Point a Blender object's local -Z axis - the way a light or camera faces - at an object (target) or a point (look_at [x,y,z]). Nothing could aim anything after creation - bl_create_camera took look_at at birth and that was the only user of the aiming maths, so a spot light could not be aimed at all. Pass exactly one of target (an object, aimed at its world origin) or look_at (a point). THE POSTCONDITION IS MEASURED, not assumed: it reports the ANGLE between the object's world-space local -Z and the direction to the target after the write, and refuses above ~1e-3 rad. That matters because the aiming derivation was once wrong by exactly pi - aiming 166 degrees off while returning a perfectly plausible euler - and reading back the euler you just wrote is a proxy that cannot catch it."
-    return _blender("aim_object", object=object, target=target, lookAt=look_at)
+    return _blender("aim_object", object=object, target=target, lookAt=look_at, direction=direction)
 
 
 @mcp.tool()
@@ -5332,16 +6370,33 @@ def bl_file_info() -> dict:
 
 @mcp.tool()
 def bl_save_file(filepath: str, overwrite: bool = None, repoint_session: bool = None,
-                 compress: bool = None) -> dict:
+                 compress: bool = None,
+                 keep_unused: bool | list[Literal[                 # ops_file._PURGEABLE
+                     "actions", "images", "materials", "meshes", "node_groups", "textures", "armatures", "cameras",
+                     "lights", "worlds", "curves", "collections", "objects", "fonts", "speakers", "sounds"]] = None
+                 ) -> dict:
     "Write the Blender session to a .blend on disk. Until this existed NOTHING the addon authored survived the process - every light, camera, keyframe, world and node group died when Blender closed, and the only artefacts were a mesh FBX, a baked texture and one rendered frame. SAVE-A-COPY BY DEFAULT: the session keeps its own filepath, so a later save still goes where it did before; pass repoint_session to make this the working file. An existing file is REFUSED unless overwrite is passed. The response reports purgedOrphans - what the save destroyed - which is data loss caused by the successful operation and invisible otherwise. Call mif_help(\"bl_save_file\") first."
     return _blender("save_file", filepath=filepath, overwrite=overwrite,
-                    repointSession=repoint_session, compress=compress)
+                    repointSession=repoint_session, compress=compress, keepUnused=keep_unused)
 
 
 @mcp.tool()
-def bl_open_file(filepath: str, discard_unsaved: bool = None) -> dict:
-    "Open a .blend, DISCARDING everything currently in memory. There is no undo across a file load, so an open over a DIRTY session is refused unless discard_unsaved is passed - this is the one Blender op here that can lose work which was never on disk. Save first with bl_save_file if you want it. The response re-reads the session path and refuses to claim success if the session did not actually become the file you asked for. Call mif_help(\"bl_open_file\") first."
-    return _blender("open_file", filepath=filepath, discardUnsaved=discard_unsaved)
+def bl_open_for_review(filepath: str, blender: str = None, workspace: str = None, object: str = None,
+                       action: str = None, frame: int = None, frame_range: list = None, capture: str = None,
+                       timeout: float = None, factory_startup: bool = None, clip_end_radii: float = None,
+                       clip_ratio: float = None, min_visible_percent: float = None, settle: float = None) -> dict:
+    "Open a .blend in a new GUI Blender for a person to review: every 3D view's clip from the scene's size, the view framed, an action and frame set, and the window captured and checked before it is called ready; returns the PID and capture. Call mif_help(\"bl_open_for_review\") first."
+    t = 120.0 if timeout is None else float(timeout)
+    return _blender("open_for_review", filepath=filepath, blender=blender, workspace=workspace, object=object,
+                    action=action, frame=frame, frameRange=frame_range, capture=capture, timeout=timeout,
+                    factoryStartup=factory_startup, clipEndRadii=clip_end_radii, clipRatio=clip_ratio,
+                    minVisiblePercent=min_visible_percent, settle=settle, _timeout=t + 60.0)
+
+
+@mcp.tool()
+def bl_open_file(filepath: str, discard_unsaved: bool = None, run_scripts: bool = None) -> dict:
+    "Open a .blend, DISCARDING everything currently in memory. There is no undo across a file load, so an open over a DIRTY session is refused unless discard_unsaved is passed - this is the one Blender op here that can lose work which was never on disk. Save first with bl_save_file if you want it. The file's own scripts and Python drivers stay off unless run_scripts is true, which needs Allow run_python; the reply's scriptsRun says which. The response re-reads the session path and refuses to claim success if the session did not actually become the file you asked for. Call mif_help(\"bl_open_file\") first."
+    return _blender("open_file", filepath=filepath, discardUnsaved=discard_unsaved, runScripts=run_scripts)
 
 
 @mcp.tool()
@@ -5351,7 +6406,8 @@ def bl_set_light(object: str, type: str = None, energy: float = None, color: lis
                  angle: float = None, shadow: bool = None, diffuse_factor: float = None,
                  specular_factor: float = None, location: list = None,
                  rotation: list = None, temperature: float = None,
-                 use_temperature: bool = None, energy_scale: float = None, stops: float = None) -> dict:
+                 use_temperature: bool = None, energy_scale: float = None, stops: float = None,
+                 look_at: list = None) -> dict:
     "Change a Blender light that already exists - energy, colour, cone, area size, shadow, or its TYPE. Until this existed a light could be created and never adjusted, which is most of lighting work. Type-specific settings are validated against the type the light will BE after the call, so retyping to SPOT and setting spot_angle together is legal while spot_angle on a POINT light is refused. Every refusal fires before any write. The response carries before, after and changedFields, so you can see what actually moved - including a property Blender DISCARDS on a retype. rotation and spot_angle/angle are RADIANS. Call mif_help(\"bl_set_light\") first. COLOUR TEMPERATURE IN KELVIN: temperature is how lighting is actually specified - 3200 tungsten, 6500 daylight - rather than as linear RGB, and it MULTIPLIES the colour rather than replacing it, so colour becomes a tint. Refused by name on a Blender without bpy.types.Light.use_temperature rather than silently ignored."
     # EVERY accepted key is forwarded, and every optional one defaults to None so _blender drops it.
     # A concrete default here would be sent on every call, and set_light refuses a per-type key on
@@ -5362,7 +6418,7 @@ def bl_set_light(object: str, type: str = None, energy: float = None, color: lis
                     diffuseFactor=diffuse_factor, specularFactor=specular_factor,
                     location=location, rotation=rotation,
                     temperature=temperature, useTemperature=use_temperature, energyScale=energy_scale,
-                    stops=stops)
+                    stops=stops, lookAt=look_at)
 
 
 @mcp.tool()
@@ -5438,7 +6494,7 @@ def bl_set_render_settings(engine: str = None, resolution_x: int = None, resolut
                            eevee_raytracing: bool = None, eevee: dict = None, cycles: dict = None,
                            render: dict = None, ffmpeg: dict = None, image: dict = None,
                            cycles_curves: dict = None, texture_cache: str = None,
-                           texture_cache_memory: bool = None) -> dict:
+                           texture_cache_memory: bool = None, display: dict = None) -> dict:
     "Configure the Blender render: engine (EEVEE/CYCLES aliases resolve to whatever THIS build calls them), resolution, samples, output path and format. The sample count lives in a different property per engine and writing the wrong one is a silent no-op, so this routes it and says which property it used. Warns when there is no scene camera, since a render would then fail. COLOUR DEPTH: bl_render_info has always reported colorDepth and nothing could set it, so an 8-bit normal map or HDR pass was quantised, existed, and looked roughly right. Two things make it awkward and both are handled. The enum LIES - bl_rna.properties['color_depth'].enum_items reports 8, 10, 12, 16 and 32 for EVERY format including JPEG, measured on 3.6 and 5.0 - while Blender validates on ASSIGNMENT and raises naming the real set, so the attempt is the validation and its own message is passed through. And order matters: the format is applied FIRST, so file_format='OPEN_EXR' with color_depth=32 works in one call. If the depth is then refused, the format AND the depth are put back, because changing format clamps depth and restoring one without the other leaves half the state. eevee_raytracing turns EEVEE's SCENE raytracing on or off - eevee.use_raytracing from 4.2, use_ssr + use_ssr_refraction on 3.6 - which glass and water need to refract the scene rather than the world (measured: a glass ball's render moves ~25/255 when it is toggled); the material's refraction flags come from bl_set_material_settings. The response reports it before and after and names the property written. EEVEE AND CYCLES' OWN SETTINGS: eevee={identifier: value} and cycles={identifier: value} write any writable property of scene.eevee / scene.cycles by its RNA identifier, each checked against its own type (enums against their items, finite numbers, strict booleans) - e.g. eevee={'volumetric_tile_size': '2', 'volumetric_samples': 128} (EEVEE draws volumes on an 8-pixel grid by default, which turns smoke and fire into soft blobs) or cycles={'volume_step_rate': 0.5}. They are written last and inside the call's snapshot, so any refusal puts the whole call back; a setting this tool also names (samples, eevee_raytracing, use_denoising) is refused if given both ways. render={identifier: value} does the same for scene.render - motion blur (use_motion_blur, motion_blur_shutter) lives there from 4.2 - and refuses fps and the compositing switches, naming bl_set_frame_range / bl_set_compositing, which own them. bl_render_info(rna=True) reads them back. IMAGE AND NESTED SETTINGS: image={identifier: value} writes scene.render.image_settings - exr_codec, use_preview, color_management - and a dotted identifier reaches a nested settings struct in any group: image={'color_management': 'OVERRIDE', 'linear_colorspace_settings.name': 'ACEScg'}, eevee={'ray_tracing_options.resolution_scale': '1'} (4.2 and later); the format, depth and mode stay file_format, color_depth and color_mode."
     return _blender("set_render_settings", engine=engine, resolutionX=resolution_x,
                     resolutionY=resolution_y, percentage=percentage, samples=samples,
@@ -5446,7 +6502,7 @@ def bl_set_render_settings(engine: str = None, resolution_x: int = None, resolut
                     colorMode=color_mode, useDenoising=use_denoising, exposure=exposure, colorDepth=color_depth,
                     eeveeRaytracing=eevee_raytracing, eevee=eevee, cycles=cycles, render=render, ffmpeg=ffmpeg,
                     image=image, cyclesCurves=cycles_curves, textureCache=texture_cache,
-                    textureCacheMemory=texture_cache_memory)
+                    textureCacheMemory=texture_cache_memory, display=display)
 
 
 @mcp.tool()
@@ -5467,8 +6523,10 @@ def bl_render_still(file_path: str = None, frame: float = None, samples: int = N
                     write_still: bool = None, return_image: bool = None,
                     preview_max_px: int = None, preview_max_bytes: int = None,
                     allow_simulation: bool = None, compute_backend: str = None, region: list = None,
-                    region_px: list = None, crop: bool = None) -> dict:
-    "Render the current frame to a file. BLOCKS Blender's main thread for the whole render, so start small - a heavy frame exceeds the addon's job timeout and reads as a hung bridge. render() returns FINISHED whether or not a file appeared, so the file is stat'd afterwards and wroteFile/fileBytes are measurements rather than the operator's opinion. PASS return_image=True TO SEE THE RENDER: it comes back as an image block, scaled to preview_max_px on its longest edge (default 1024, at most 1568) and to preview_max_bytes of PNG (default 512 KB), smaller rather than refused; imageBlocks describes it and filePath stays the full file. With _image 'data' it comes back the old way, as `image`, a base64 PNG in the text at preview_max_px (default 128), omitted if its PNG exceeds preview_max_bytes (default 30000); imageOmittedReason then directs the caller to reduce preview_max_px or inspect file_path. renderedWidth/renderedHeight always describe the full artifact. A frame that would step a live simulation is refused unless allow_simulation. COMPUTE BACKEND (2026-10-05): compute_backend NONE (the CPU), OPTIX, CUDA, HIP, METAL or ONEAPI chooses Cycles' device for this in-process still - the choice that bl_render_animation's gpu option makes in its own process. It writes compute_device_type, a USER PREFERENCE and not a scene setting: it stays for every later Cycles render in this Blender session (and is kept if the preferences are saved), and the reply's computeBackend says so with preferenceWas / preferenceNow, the devices ticked and the scene's device. A backend that lists no device here is REFUSED with the backends that do, the preference put back and nothing rendered - measured headless on 5.2.2 with no GPU: compute_device_type takes CUDA though CUDA lists nothing, and Cycles then renders on the CPU in silence. Refused too on a scene that does not render with Cycles. Measured: NONE on the CPU on 4.2.23, 4.4.0, 5.0.1 and 5.2.2; a GPU backend's success path was not run (no GPU on that host)."
+                    region_px: list = None, crop: bool = None, mode: str = None, clay_color: list = None,
+                    wire_color: list = None, wire_px: float = None, silhouette: Any = None, preview: bool = None,
+                    solo_light: str = None, cast_check: Any = None) -> dict:
+    "Render the current frame to a file. BLOCKS Blender's main thread for the whole render, so start small - a heavy frame exceeds the addon's job timeout and reads as a hung bridge. render() returns FINISHED whether or not a file appeared, so the file is stat'd afterwards and wroteFile/fileBytes are measurements rather than the operator's opinion. PASS return_image=True TO SEE THE RENDER: it comes back as an image block, scaled to preview_max_px on its longest edge (default 1024, at most 1568) and to preview_max_bytes of PNG (default 512 KB), smaller rather than refused; imageBlocks describes it and filePath stays the full file. With _image 'data' it comes back the old way, as `image`, a base64 PNG in the text at preview_max_px (default 128), omitted if its PNG exceeds preview_max_bytes (default 30000); imageOmittedReason then directs the caller to reduce preview_max_px or inspect file_path. renderedWidth/renderedHeight always describe the full artifact. A frame that would step a live simulation is refused unless allow_simulation. COMPUTE BACKEND (2026-10-05): compute_backend CPU (or NONE, Blender's word for it), OPTIX, CUDA, HIP, METAL or ONEAPI chooses Cycles' device for this in-process still - the choice that bl_render_animation's gpu option makes in its own process. It writes compute_device_type, a USER PREFERENCE and not a scene setting: it stays for every later Cycles render in this Blender session (and is kept if the preferences are saved), and the reply's computeBackend says so with preferenceWas / preferenceNow, the devices ticked and the scene's device. A backend that lists no device here is REFUSED with the backends that do, the preference put back and nothing rendered - measured headless on 5.2.2 with no GPU: compute_device_type takes CUDA though CUDA lists nothing, and Cycles then renders on the CPU in silence. Refused too on a scene that does not render with Cycles. Measured: NONE on the CPU on 4.2.23, 4.4.0, 5.0.1 and 5.2.2; a GPU backend's success path was not run (no GPU on that host)."
     # THE ADD-ON'S OWN DEFAULTS (128 px, 30,000 bytes) ARE FOR BASE64 IN TEXT. A block is fitted here (_with_pictures), so the
     # add-on hands over a big preview rather than withholding one: 10 of the 25 previews asked for in a 22-run measurement
     # came back imageOmitted, and a model said so ("the preview was too large to come back to me").
@@ -5478,7 +6536,9 @@ def bl_render_still(file_path: str = None, frame: float = None, samples: int = N
                    writeStill=write_still, returnImage=return_image,
                    previewMaxPx=(min(preview_max_px or _IMAGE_DEFAULT_PX, _IMAGE_HARD_PX) if block else preview_max_px),
                    previewMaxBytes=(_IMAGE_WIRE_BYTES if block else preview_max_bytes), allowSimulation=allow_simulation,
-                   _timeout=600.0, computeBackend=compute_backend, region=region, regionPx=region_px, crop=crop)
+                   _timeout=600.0, computeBackend=compute_backend, region=region, regionPx=region_px, crop=crop,
+                   mode=mode, clayColor=clay_color, wireColor=wire_color, wirePx=wire_px, silhouette=silhouette,
+                   preview=preview, soloLight=solo_light, castCheck=cast_check)
     if block and isinstance(res, dict):
         res = dict(res, _imageLimits=[preview_max_px, preview_max_bytes])
     return res
@@ -5833,12 +6893,12 @@ def bl_create_mesh(vertices: list = None, faces: list = None, edges: list = None
                    materials: list = None, uvs: dict = None, vertex_groups: dict = None, smooth: bool | list = None,
                    name: str = None, location: list = None, rotation: list = None, scale: list = None,
                    collection: str = None, take_over_name: bool = None, replace_data: bool = None,
-                   file: str = None) -> dict:
+                   file: str = None, recalc_normals: bool = None) -> dict:
     "Build a Blender mesh object from vertex, face and loose-edge lists, with optional per-face material slots, UV layers, vertex groups and smooth flags; bad input is refused before anything exists. Call mif_help(\"bl_create_mesh\") first."
     return _blender("create_mesh", vertices=vertices, faces=faces, edges=edges, materialIndices=material_indices,
                     materials=materials, uvs=uvs, vertexGroups=vertex_groups, smooth=smooth, name=name,
                     location=location, rotation=rotation, scale=scale, collection=collection,
-                    takeOverName=take_over_name, replaceData=replace_data, file=file)
+                    takeOverName=take_over_name, replaceData=replace_data, file=file, recalcNormals=recalc_normals)
 
 
 @mcp.tool()
@@ -6045,9 +7105,9 @@ def bl_batch(ops: list = None, continue_on_error: bool = None, budget_seconds: f
     refusal = _batch_results_refusal(results)
     if refusal:
         return refusal
-    # THE CHANGE CAP (docs/15 section 6): a batch over the open file's cap answers a preview with a previewId, and
+    # THE CHANGE CAP: a batch over the open file's cap answers a preview with a previewId, and
     # preview_id alone commits exactly the ops it listed.
-    # THE BATCH PREVIEW (docs/15 section 5): dry_run plans every op and writes nothing; its preview_id commits them all.
+    # THE BATCH PREVIEW: dry_run plans every op and writes nothing; its preview_id commits them all.
     if preview_id:
         if ops is not None or dry_run or preview_ttl_seconds:
             return {"ok": False, "endpoint": "batch", "nothingWritten": True,
@@ -6068,7 +7128,7 @@ def _bl_batch_ops(ops):
     THE FLAT FORM IS ACCEPTED because the add-on read only `params` and IGNORED every other key of an entry, so
     {op: 'create_primitive', kind: 'cube'} - the shape Unreal's batch takes - ran create_primitive with NO parameters and
     was refused "'kind' is required" beside the kind it had been given. A benchmark's bracket and grid runs sent exactly
-    that nine times (docs/TOKEN_OPTIMIZATION.md). An entry carrying BOTH params and top-level keys is refused here
+    that nine times. An entry carrying BOTH params and top-level keys is refused here
     rather than guessed at: the add-on would drop the top-level ones in silence.
 
     AN OP NAMED BY ITS TOOL GOES AS THE OP THAT TOOL POSTS. No add-on op starts with bl_, so {op: 'bl_create_primitive'}
@@ -6650,20 +7710,20 @@ def bl_set_viewport_view(focus: list = None, distance: float = None, azimuth: fl
 
 @mcp.tool()
 def bl_transform_object(object: str, location: list = None, rotation: list = None,
-                        scale: list = None, relative: bool = False) -> dict:
+                        scale: list = None, relative: bool = False, pivot: Any = None) -> dict:
     "Move, rotate or scale a Blender object WITHOUT baking the transform into its mesh data: location [x,y,z], rotation [x,y,z] in RADIANS, scale [x,y,z]; relative=True adds to the current values."
     return _blender("transform_object", object=object, location=location, rotation=rotation,
-                    scale=scale, relative=relative)
+                    scale=scale, relative=relative, pivot=pivot)
 
 
 @mcp.tool()
 def bl_duplicate_object(objects: list | str, names: list = None, suffix: str = None, linked: bool = None,
                         collection: str = None, offset: list = None, rotation: list = None, scale: list = None,
-                        include_children: bool = None, hide: str = None) -> dict:
-    "Duplicate Blender objects under new names (names, or suffix): a full copy with its own mesh, or linked (the same mesh, as Alt+D); offset, rotation (radians) and scale; include_children; hide original or copy."
+                        include_children: bool = None, hide: str = None, visible: bool = None) -> dict:
+    "Duplicate Blender objects under new names (names, or suffix): a full copy with its own mesh, or linked (the same mesh, as Alt+D); offset, rotation (radians) and scale; include_children; hide original or copy; visible shows every copy."
     return _blender("duplicate_object", objects=objects, names=names, suffix=suffix, linked=linked,
                     collection=collection, offset=offset, rotation=rotation, scale=scale,
-                    includeChildren=include_children, hide=hide)
+                    includeChildren=include_children, hide=hide, visible=visible)
 
 
 @mcp.tool()
@@ -6678,7 +7738,7 @@ def bl_transform_objects(objects: list = None, pivot: list = None, rotation: lis
     list before writing. With dry_run=True it previews each change with its value before and returns a preview_id; preview_id alone commits it, refused if anything changed since.
     Mesh data is never baked.
     """
-    # THE BULK PREVIEW (docs/15 section 5) and THE CHANGE CAP (section 6): dry_run previews, and over the file's cap the
+    # THE BULK PREVIEW and THE CHANGE CAP (section 6): dry_run previews, and over the file's cap the
     # add-on answers the same preview unasked; preview_id alone commits it.
     if preview_id:
         return (_preview_commit_refusal(preview_id, objects=objects, pivot=pivot, rotation=rotation,
@@ -6702,16 +7762,22 @@ def bl_set_parent(object: str, parent: str = None, clear: bool = False, keep_tra
 
 
 @mcp.tool()
-def bl_join_objects(target: str, objects: list, rename_suffix: str = None, keep_sources: bool = None) -> dict:
-    "Join Blender mesh objects into one. DESTRUCTIVE AND ASYMMETRIC: the sources are DELETED and everything lands in target. Armatures join too: clashing bones are renamed first (rename_suffix, default .001) and REPORTED, and the skinned meshes follow. With keep_sources=True it joins copies and leaves every source, which the change cap counts as the one object it writes; a consuming join (the default) also counts each source it removes, so 29 parts at a cap of 25 is refused, naming keep_sources."
+def bl_join_objects(target: str = None, objects: list = None, rename_suffix: str = None, keep_sources: bool = None,
+                    preview_id: str = None, visible: bool = None) -> dict:
+    "Join Blender mesh objects into one. DESTRUCTIVE AND ASYMMETRIC: the sources are DELETED and everything lands in target. Armatures join too: clashing bones are renamed first (rename_suffix, default .001) and REPORTED, and the skinned meshes follow. With keep_sources=True it joins copies and leaves every source, which the change cap counts as the one object it writes; a consuming join (the default) also counts each source it removes, so 29 parts at a cap of 25 is refused, naming keep_sources. visible clears the joined mesh's hide_render."
+    if preview_id:          # the change cap's preview of an over-cap join: preview_id alone runs the stored request
+        return _blender("join_objects", previewId=preview_id)
     return _blender("join_objects", target=target, objects=objects, renameSuffix=rename_suffix,
-                    keepSources=keep_sources)
+                    keepSources=keep_sources, visible=visible)
 
 
 @mcp.tool()
-def bl_separate_mesh(object: str, mode: str = "loose", faces=None, vertex_group: str = None, min_weight: float = None,
-                     loop=None, duplicate: bool = None, new_name: str = None) -> dict:
+def bl_separate_mesh(object: str = None, mode: str = None, faces=None, vertex_group: str = None,
+                     min_weight: float = None, loop=None, duplicate: bool = None, new_name: str = None,
+                     preview_id: str = None) -> dict:
     "Split a Blender mesh into separate objects - mode 'loose' (each island), 'material' (one per material in use) or 'selection': faces (indices or a bl_select_faces reply), vertex_group or loop go to one new object; duplicate keeps the original whole."
+    if preview_id:          # the change cap's preview of an over-cap separate: preview_id alone runs the stored request
+        return _blender("separate_mesh", previewId=preview_id)
     return _blender("separate_mesh", object=object, mode=mode, faces=faces, vertexGroup=vertex_group,
                     minWeight=min_weight, loop=loop, duplicate=duplicate, newName=new_name)
 
@@ -6745,7 +7811,8 @@ def bl_bake_texture(object: str, type: str = "AO", width: int = 512, height: int
                     max_ray_distance: float = None, cage: str = None, green_channel: str = None,
                     blob_fix: bool | dict = None, pieces: list = None, explode: float = None,
                     multires: dict = None, include: list = None, target: str = None, color_attribute: str = None,
-                    id_by: str = None, height_range: float = None, thickness_distance: float = None) -> dict:
+                    id_by: str = None, height_range: float = None, thickness_distance: float = None,
+                    ao_against: str = None, image: str = None, check_islands: bool = None) -> dict:
     "Bake AO / NORMAL / DIFFUSE / COMBINED / ROUGHNESS / EMIT / GLOSSY / SHADOW / CURVATURE / METALLIC / ALPHA / MATERIAL_ID / HEIGHT / POSITION / THICKNESS into an image (or target COLOR_ATTRIBUTE) on a Blender mesh - how a high-poly detail becomes a texture an Unreal material can use. Judged by the IMAGE, not the operator: bpy.ops.object.bake returns FINISHED and writes NOTHING when there is no active image-texture node, so the result is checked with is_dirty plus a before/after pixel signature and a blank bake is reported as the failure it is. Needs a UV layer. Render engine, device, samples and selection are all restored afterwards. Pass filepath to write it to disk - without one the image is in memory only. See mif_help."
     # device is CPU or GPU for the Cycles bake (scene.cycles.device, ops_material.py:554). The
     # docstring already promised "Render engine, device, samples and selection are all restored
@@ -6758,7 +7825,7 @@ def bl_bake_texture(object: str, type: str = "AO", width: int = 512, height: int
                     source=source, extrusion=extrusion, maxRayDistance=max_ray_distance, cage=cage,
                     greenChannel=green_channel, blobFix=blob_fix, pieces=pieces, explode=explode, multires=multires,
                     include=include, target=target, colorAttribute=color_attribute, idBy=id_by,
-                    heightRange=height_range, thicknessDistance=thickness_distance)
+                    heightRange=height_range, thicknessDistance=thickness_distance, aoAgainst=ao_against, image=image, checkIslands=check_islands)
 
 
 @mcp.tool()
@@ -6804,7 +7871,8 @@ def bl_set_material_properties(material: str, base_color: list = None, metallic:
                                roughness: float = None, specular: float = None,
                                ior: float = None, alpha: float = None, emissive: list = None,
                                emissive_strength: float = None, transmission: float = None,
-                               sheen: float = None, clearcoat: float = None,
+                               sheen: float = None, clearcoat: float = None, coat_roughness: float = None,
+                               coat_ior: float = None, coat_tint: list = None,
                                anisotropic: float = None, rename: str = None, viewport_color: list = None,
                                viewport_metallic: float = None, viewport_roughness: float = None,
                                subsurface_weight: float = None, subsurface_scale: float = None,
@@ -6815,13 +7883,26 @@ def bl_set_material_properties(material: str, base_color: list = None, metallic:
     return _blender("set_material_properties", material=material, baseColor=base_color,
                     metallic=metallic, roughness=roughness, specular=specular, ior=ior,
                     alpha=alpha, emissive=emissive, emissiveStrength=emissive_strength,
-                    transmission=transmission, sheen=sheen, clearcoat=clearcoat,
+                    transmission=transmission, sheen=sheen, clearcoat=clearcoat, coatRoughness=coat_roughness,
+                    coatIor=coat_ior, coatTint=coat_tint,
                     anisotropic=anisotropic, rename=rename, viewportColor=viewport_color,
                     viewportMetallic=viewport_metallic, viewportRoughness=viewport_roughness,
                     subsurfaceWeight=subsurface_weight, subsurfaceScale=subsurface_scale,
                     subsurfaceRadius=subsurface_radius, subsurfaceIor=subsurface_ior,
                     subsurfaceAnisotropy=subsurface_anisotropy, subsurfaceMethod=subsurface_method,
                     weathering=weathering)
+
+
+@mcp.tool()
+def bl_build_decal(pattern: str, location: list[float], object: str = None, normal: list[float] = None,
+                   up: list[float] = None, size: float | list[float] = None, text: str = None,
+                   colors: list[list[float]] = None, stripes: int = None, age: float = None,
+                   under_color: list[float] = None, offset: float = None, resolution: int = None,
+                   name: str = None, seed: float = None, collection: str = None) -> dict:
+    "Build a floating high-poly decal to bake into a low poly - hazard stripes, a barcode label, a roundel or stencil text - shrink-wrapped onto a surface at a small offset, aged by age; bakeSources go into bl_bake_texture_set's source. See mif_help."
+    return _blender("build_decal", pattern=pattern, location=location, object=object, normal=normal, up=up, size=size,
+                    text=text, colors=colors, stripes=stripes, age=age, underColor=under_color, offset=offset,
+                    resolution=resolution, name=name, seed=seed, collection=collection)
 
 
 @mcp.tool()
@@ -6888,11 +7969,11 @@ def bl_set_material_texture(material: str, input: str = None, file: str = None, 
                             colorspace: str = None, uv_map: str = None, strength: float = None,
                             interpolation: str = None, extension: str = None,
                             replace: bool = True, scale=None, offset=None,
-                            rotation: float = None, to_node: str = None, to_socket: str = None,
+                            rotation=None, to_node: str = None, to_socket: str = None,
                             from_socket: str = None, node_name: str = None, link: bool = None,
                             invert: bool = None, alpha_mode: str = None, displacement_scale: float = None,
                             midlevel: float = None, normal_convention: str = None) -> dict:
-    "Put an IMAGE from disk into a Blender material - the write half of what bl_describe_material has always been able to read. Nothing else in the addon could do it: bpy.data.images.load appears once, in the world/HDRI path, so a material could be given numbers and never a map. `input` takes any bl_set_material_properties name plus 'normal' and 'displacement'. TWO TRAPS ARE HANDLED RATHER THAN LEFT TO THE CALLER. Colour space is chosen per input - sRGB for base_color and emissive, Non-Color for everything else - because Blender decodes from the IMAGE's setting, not from where it is plugged in, so a roughness map loaded as sRGB comes back through the transfer curve and every value the shader reads is wrong while looking plausible. And 'normal' is wired through a Normal Map node, because the Principled Normal socket takes a VECTOR and a tangent-space map is RGB; linking the image straight in is the usual mistake and reads as correct in every field of every response. A MISSING FILE IS REFUSED BEFORE ANYTHING IS CREATED: Blender would make the datablock anyway and render it MAGENTA, which is loud on screen and completely silent to anything reading a response. The link is verified off the socket afterwards, and the nodes are removed again if Blender rejected it. TILING is scale / offset (a number, or [u, v]) and rotation in DEGREES, through a Mapping node - per-texture and non-destructive, where the only alternative was bl_uv_unwrap's uv_transform, which scales the MESH's UVs and is therefore shared by every texture on the object and undone by the next unwrap. The addon has accepted these three since the day the Mapping support landed and no tool sent them, so the capability existed and was unreachable. For a pattern rather than a file, see bl_add_procedural_texture, which shares this vocabulary. A uvMap naming a UV layer the material's meshes lack is accepted and answered with uvMapNote: a UV Map node naming a missing layer renders a fixed fallback, not the active layer (measured on 3.6-5.2). ANY SOCKET OF THE TREE: to_node + to_socket instead of input wires the image into any node's input (a node name, or a node type such as colorRamp, mapRange, mix, math, invert or displacement to create one), link=false leaves the node free, node_name names the Image Texture node or reuses one to swap its image, invert=true puts an Invert node on the way, and from_socket takes Alpha."
+    "Put an IMAGE from disk into a Blender material - the write half of what bl_describe_material has always been able to read. Nothing else in the addon could do it: bpy.data.images.load appears once, in the world/HDRI path, so a material could be given numbers and never a map. `input` takes any bl_set_material_properties name plus 'normal' and 'displacement'. TWO TRAPS ARE HANDLED RATHER THAN LEFT TO THE CALLER. Colour space is chosen per input - sRGB for base_color and emissive, Non-Color for everything else - because Blender decodes from the IMAGE's setting, not from where it is plugged in, so a roughness map loaded as sRGB comes back through the transfer curve and every value the shader reads is wrong while looking plausible. And 'normal' is wired through a Normal Map node, because the Principled Normal socket takes a VECTOR and a tangent-space map is RGB; linking the image straight in is the usual mistake and reads as correct in every field of every response. A MISSING FILE IS REFUSED BEFORE ANYTHING IS CREATED: Blender would make the datablock anyway and render it MAGENTA, which is loud on screen and completely silent to anything reading a response. The link is verified off the socket afterwards, and the nodes are removed again if Blender rejected it. TILING is scale / offset (a number, or [u, v]) and rotation in DEGREES (a number about Z, or [x, y, z]), through a Mapping node - per-texture and non-destructive, where the only alternative was bl_uv_unwrap's uv_transform, which scales the MESH's UVs and is therefore shared by every texture on the object and undone by the next unwrap. The addon has accepted these three since the day the Mapping support landed and no tool sent them, so the capability existed and was unreachable. For a pattern rather than a file, see bl_add_procedural_texture, which shares this vocabulary. A uvMap naming a UV layer the material's meshes lack is accepted and answered with uvMapNote: a UV Map node naming a missing layer renders a fixed fallback, not the active layer (measured on 3.6-5.2). ANY SOCKET OF THE TREE: to_node + to_socket instead of input wires the image into any node's input (a node name, or a node type such as colorRamp, mapRange, mix, math, invert or displacement to create one), link=false leaves the node free, node_name names the Image Texture node or reuses one to swap its image, invert=true puts an Invert node on the way, and from_socket takes Alpha."
     return _blender("set_material_texture", material=material, input=input, file=file,
                     image=image, colorspace=colorspace, uvMap=uv_map, strength=strength,
                     interpolation=interpolation, extension=extension, replace=replace,
@@ -6903,10 +7984,10 @@ def bl_set_material_texture(material: str, input: str = None, file: str = None, 
 
 @mcp.tool()
 def bl_import_pbr_texture_set(material: str, folder: str, include: list = None, resolution: str = None,
-                              mapping: dict = None, udim: bool = None) -> dict:
+                              mapping: dict = None, udim: bool = None, ao_to: str = None) -> dict:
     "Wire a folder of PBR maps into one Blender material in one call, each found by its file name and set in the colour space it needs: base colour, normal, roughness, metallic, displacement, AO, opacity, emission, subsurface. Replies what was wired and every file skipped, with why."
     return _blender("import_pbr_texture_set", material=material, folder=folder, include=include, resolution=resolution,
-                    mapping=mapping, udim=udim)
+                    mapping=mapping, udim=udim, aoTo=ao_to)
 
 
 @mcp.tool()
@@ -6914,16 +7995,18 @@ def bl_add_procedural_texture(material: str, type: str, node_name: str = None,
                               input: str = None, to_node: str = None, to_socket: str = None,
                               from_socket: str = None, settings: dict = None,
                               properties: dict = None, space: str = None, uv_map: str = None,
-                              scale=None, offset=None, rotation: float = None,
+                              scale=None, offset=None, rotation=None,
                               color_ramp: list = None, relief: str = None,
                               strength: float = None, distance: float = None,
-                              replace: bool = True) -> dict:
-    "Build a PROCEDURAL pattern into a Blender material and wire it where it is read - type noise, voronoi, wave, gradient, magic, brick, checker, musgrave, whiteNoise or gabor - no texture files. It makes concrete that reads as concrete, worn steel, grain and rust. The write half this addon did not have: bl_create_material sets base colour, metallic and roughness, bl_set_material_texture loads an IMAGE off disk, and everything between was out of reach. type: noise | voronoi | wave | gradient | magic | brick | checker | musgrave | whiteNoise | gabor. MUSGRAVE IS VERSION-GATED and refused by name with the running version where it is absent - it is in 3.6's shader menu and none of 4.2's, 4.4's or 5.0's, having been folded into the Noise texture, and the refusal reads the replacement's real properties off its own RNA rather than quoting a changelog. `input` takes a Principled input by ANY version's spelling - baseColor or 'Base Color', emissive or 'Emission Color' or 'Emission' - because Blender renamed those sockets at 4.0 and a graph should not have to branch on bpy.app.version; `to_node`+`to_socket` targets any node instead, which is how two patterns get combined through a Mix or Math node. THREE TRAPS ARE HANDLED RATHER THAN LEFT TO THE CALLER. A Mapping node is only created when there is something to map and is NEVER left with its Vector unconnected, because an unconnected Mapping Vector is a CONSTANT ZERO and paints the whole surface one flat colour - that is not 'use the default coordinates', which is what an unconnected texture node does, and the two facts sit one node apart. Rotation is DEGREES here and radians on the socket. And a pattern driving a scalar input takes the texture's scalar output (Fac, or Distance on a Voronoi, which has no Fac at all) while one driving a colour takes Color, because Blender converts silently either way and the wrong choice renders plausibly. input:'normal' goes through a BUMP node, not a Normal Map node - the opposite of what bl_set_material_texture does with an image, and deliberately: a procedural pattern is a HEIGHT field, and a Normal Map node would read it as tangent-space RGB and light the surface wrongly while every field still read as correct. Pass relief:'normalMap' for a pattern that genuinely is tangent-space RGB. `color_ramp` inserts a ramp between the pattern and the destination, which is what turns grey mush into a material. EVERY NODE THIS MAKES IS REMOVED AGAIN IF ANY PART OF IT REFUSES, the link is MEASURED off the destination socket afterwards rather than assumed from the call, and a link it replaces is put back if Blender rejects the new one. The response carries a full readback of the texture node so the values can be checked in the same round trip. A bump with no distance gets 1.0 on every build (Blender 5.0 lowered the node default to 0.001, which renders almost no relief); reliefStrength and reliefDistance are read back, and distanceNote says when it filled one in. A uvMap naming a UV layer the material's meshes lack is accepted and answered with uvMapNote: a UV Map node naming a missing layer renders a fixed fallback, not the active layer (measured on 3.6-5.2). scale and offset take a number (X and Y), [u, v] or [x, y, z] - in Object or Generated space pass all three, or the pattern stretches along Z on any face that does not face Z (the reply's scaleNote says so)."
+                              replace: bool = True, layer: dict | str = None,
+                              projection: str = None) -> dict:
+    "Build a PROCEDURAL pattern into a Blender material and wire it where it is read - type noise, voronoi, wave, gradient, magic, brick, checker, musgrave, whiteNoise or gabor - no texture files. It makes concrete that reads as concrete, worn steel, grain and rust. The write half this addon did not have: bl_create_material sets base colour, metallic and roughness, bl_set_material_texture loads an IMAGE off disk, and everything between was out of reach. type: noise | voronoi | wave | gradient | magic | brick | checker | musgrave | whiteNoise | gabor. MUSGRAVE IS VERSION-GATED and refused by name with the running version where it is absent - it is in 3.6's shader menu and none of 4.2's, 4.4's or 5.0's, having been folded into the Noise texture, and the refusal reads the replacement's real properties off its own RNA rather than quoting a changelog. `input` takes a Principled input by ANY version's spelling - baseColor or 'Base Color', emissive or 'Emission Color' or 'Emission' - because Blender renamed those sockets at 4.0 and a graph should not have to branch on bpy.app.version; `to_node`+`to_socket` targets any node instead, which is how two patterns get combined through a Mix or Math node. THREE TRAPS ARE HANDLED RATHER THAN LEFT TO THE CALLER. A Mapping node is only created when there is something to map and is NEVER left with its Vector unconnected, because an unconnected Mapping Vector is a CONSTANT ZERO and paints the whole surface one flat colour - that is not 'use the default coordinates', which is what an unconnected texture node does, and the two facts sit one node apart. Rotation is DEGREES here and radians on the socket. And a pattern driving a scalar input takes the texture's scalar output (Fac, or Distance on a Voronoi, which has no Fac at all) while one driving a colour takes Color, because Blender converts silently either way and the wrong choice renders plausibly. input:'normal' goes through a BUMP node, not a Normal Map node - the opposite of what bl_set_material_texture does with an image, and deliberately: a procedural pattern is a HEIGHT field, and a Normal Map node would read it as tangent-space RGB and light the surface wrongly while every field still read as correct. Pass relief:'normalMap' for a pattern that genuinely is tangent-space RGB. `color_ramp` inserts a ramp between the pattern and the destination, which is what turns grey mush into a material. EVERY NODE THIS MAKES IS REMOVED AGAIN IF ANY PART OF IT REFUSES, the link is MEASURED off the destination socket afterwards rather than assumed from the call, and a link it replaces is put back if Blender rejects the new one. The response carries a full readback of the texture node so the values can be checked in the same round trip. A bump with no distance gets 1.0 on every build (Blender 5.0 lowered the node default to 0.001, which renders almost no relief); reliefStrength and reliefDistance are read back, and distanceNote says when it filled one in. A uvMap naming a UV layer the material's meshes lack is accepted and answered with uvMapNote: a UV Map node naming a missing layer renders a fixed fallback, not the active layer (measured on 3.6-5.2). scale and offset take a number (X and Y), [u, v] or [x, y, z] - in Object or Generated space pass all three, or the pattern stretches along Z on any face that does not face Z (the reply's scaleNote says so). rotation is degrees: a number turns about Z, [x, y, z] about each axis as the Mapping node does. projection 'box' gives each face the two coordinates across it, so brick lies in level courses on walls, floors and roofs (space Object or World)."
     return _blender("add_procedural_texture", material=material, type=type, nodeName=node_name,
                     input=input, toNode=to_node, toSocket=to_socket, fromSocket=from_socket,
                     settings=settings, properties=properties, space=space, uvMap=uv_map,
                     scale=scale, offset=offset, rotation=rotation, colorRamp=color_ramp,
-                    relief=relief, strength=strength, distance=distance, replace=replace)
+                    relief=relief, strength=strength, distance=distance, replace=replace, layer=layer,
+                    projection=projection)
 
 
 @mcp.tool()
@@ -6964,11 +8047,11 @@ def bl_bisect_plane(object: str, plane_co: list, axis: str = None, plane_no: lis
 @mcp.tool()
 def bl_set_shading(object: str, smooth: bool = None, indices: list = None,
                    auto_smooth_angle: float = None, weighted_normals: bool = None,
-                   weighted_normals_mode: str = None, keep_sharp: bool = None) -> dict:
+                   weighted_normals_mode: str = None, keep_sharp: bool = None, unit: str = None) -> dict:
     "Smooth or flat shading, the auto-smooth angle, and weighted normals - none of which the addon addressed at all, so setting flat shading per polygon was a raw Python loop. Hard-surface game assets need it constantly: it is the difference between a bevelled edge reading as a crease and reading as a smear. AUTO-SMOOTH MOVED IN 4.1 AND THE OLD PROPERTY IS GONE - mesh.use_auto_smooth and auto_smooth_angle were REMOVED and replaced by a Smooth by Angle geometry-nodes modifier, so writing the old property on a 4.1+ build raises, and swallowing that would report success having changed nothing on exactly the builds most people run. Both routes are implemented and the response says which was taken, which matters because the 4.1+ one is a MODIFIER: it shows in the modifier list, applies on export, and can be removed. weighted_normals adds the modifier that fixes a bevelled corner shading wrong no matter what the smooth flags say."
     return _blender("set_shading", object=object, smooth=smooth, indices=indices,
                     autoSmoothAngle=auto_smooth_angle, weightedNormals=weighted_normals,
-                    weightedNormalsMode=weighted_normals_mode, keepSharp=keep_sharp)
+                    weightedNormalsMode=weighted_normals_mode, keepSharp=keep_sharp, unit=unit)
 
 
 @mcp.tool()
@@ -7097,11 +8180,11 @@ def bl_transfer_shape_keys(source: str, target: str, keys: list = None, falloff:
 @mcp.tool()
 def bl_set_mesh_attribute(object: str, action: str, name: str, new_name: str = None, domain: str = None,
                           data_type: str = None, value: Any = None, values: list = None, indices: list = None,
-                          from_vertex_group: str = None, sample: int = None) -> dict:
-    "CREATE, WRITE, RENAME, CONVERT or READ a generic Blender mesh attribute (FLOAT, INT, vectors, colors, FLOAT2, QUATERNION 4.2+) on POINT, EDGE, FACE or CORNER - by value, per element, by index or from a vertex group. See mif_help."
+                          from_vertex_group: str = None, sample: int = None, file: str = None) -> dict:
+    "CREATE, WRITE, UPSERT, REMOVE, RENAME, CONVERT or READ a generic Blender mesh attribute (FLOAT, INT, vectors, colors, FLOAT2, QUATERNION 4.2+) on POINT, EDGE, FACE or CORNER - by value, per element, by index, from a vertex group or a .npy/.npz file. See mif_help."
     return _blender("set_mesh_attribute", object=object, action=action, name=name, newName=new_name, domain=domain,
                     dataType=data_type, value=value, values=values, indices=indices,
-                    fromVertexGroup=from_vertex_group, sample=sample)
+                    fromVertexGroup=from_vertex_group, sample=sample, file=file)
 
 
 @mcp.tool()
@@ -7136,11 +8219,17 @@ def bl_export_actions(armature: str, folder: str, actions: list = None, pattern:
 @mcp.tool()
 def bl_export_material_textures(folder: str, objects: Any = None, materials: list = None, pattern: str = None,
                                 normal_convention: str = None, pack_orm: bool = None, format: str = None,
-                                overwrite: bool = None, profile: str = None) -> dict:
-    "Save every image a Blender material's Principled inputs read, with engine names (T_{material}_BC / _N / _ORM / _E), color spaces, the normal map's green flipped for DIRECTX and roughness + metallic packed as ORM; constants and node chains not carried are listed. See mif_help."
+                                overwrite: bool = None, profile: str = None, size: int = None) -> dict:
+    "Save every image a Blender material's Principled inputs read, with engine names (T_{material}_BC / _N / _ORM / _E), color spaces, the normal map flipped from its own convention (read from the material) to the target's, ORM packing, size with normals renormalized; profile roblox. See mif_help."
     return _blender("export_material_textures", folder=folder, objects=objects, materials=materials, pattern=pattern,
                     normalConvention=normal_convention, packOrm=pack_orm, format=format, overwrite=overwrite,
-                    profile=profile)
+                    profile=profile, size=size)
+
+
+@mcp.tool()
+def bl_normal_map_convention(objects: Any = None, materials: list = None) -> dict:
+    "Read which convention each Blender material's normal map file is in - DirectX when its green is inverted on the way into the Normal Map node, OpenGL when it goes in straight - with the chain and what the file's name claims. Read only."
+    return _blender("normal_map_convention", objects=objects, materials=materials)
 
 
 @mcp.tool()
@@ -7162,17 +8251,19 @@ def bl_export_groom(objects: Any, file: str, frame_range: list = None, scale: fl
 @mcp.tool()
 def bl_uefn_check(objects: Any = None, file: str = None, generate_lods: Any = None, asset_folder: str = None,
                   strict: bool = None, embed_textures: bool = None, include_hulls: bool = None,
-                  overwrite: bool = None, animations: bool = None) -> dict:
+                  overwrite: bool = None, animations: bool = None, pack_orm: bool = None) -> dict:
     "Judge Blender meshes, static or skinned, against UEFN's published limits, each cited; with file, write .fbx/.glb/.gltf (a rig's clips too) and read it back. See mif_help."
     return _blender("uefn_check", objects=objects, file=file, generateLods=generate_lods, assetFolder=asset_folder,
                     strict=strict, embedTextures=embed_textures, includeHulls=include_hulls, overwrite=overwrite,
-                    animations=animations)
+                    animations=animations, packOrm=pack_orm)
 
 
 @mcp.tool()
-def bl_material_from_maps(material: str, folder: str, maps: list, overwrite: bool = None) -> dict:
+def bl_material_from_maps(material: str, folder: str, maps: list, overwrite: bool = None, ao_to: str = None,
+                          emission_strength: float = None) -> dict:
     "Wire a Blender material's Principled inputs from texture files, each map given a role and the channel it is read from - a packed ORM split back to three maps, a DirectX normal's green flipped. See mif_help."
-    return _blender("material_from_maps", material=material, folder=folder, maps=maps, overwrite=overwrite)
+    return _blender("material_from_maps", material=material, folder=folder, maps=maps, overwrite=overwrite, aoTo=ao_to,
+                    emissionStrength=emission_strength)
 
 
 @mcp.tool()
@@ -7196,13 +8287,40 @@ def bl_heightmap_from_mesh(object: str, file: str, width: int, height: int, cell
 
 
 @mcp.tool()
-def bl_retarget_action(source: str, target: str, action: str = None, map: Any = None, frame_range: list = None,
-                       new_action: str = None, root_bone: str = None, source_root: str = None, root_scale: float = None,
-                       assign: bool = None, sample_frames: int = None) -> dict:
+def bl_retarget_action(source: str = None, target: str = None, action: str = None, map: Any = None,
+                       frame_range: list = None, new_action: str = None, root_bone: str = None, source_root: str = None,
+                       root_scale: float = None, assign: bool = None, sample_frames: int = None, mode: str = None,
+                       fbx: str = None, fbx_options: dict = None, keep_source: bool = None, translation: dict = None,
+                       translation_tree: dict = None, skeleton: str = None, reference: dict = None,
+                       reference_space: str = None) -> dict:
     "Move a Blender action from one armature onto another with other bone names and rest pose - bone map (AUTO by name, or explicit), rest-pose difference compensated, root translation scaled, baked to a new action; per-bone error in degrees. See mif_help."
     return _blender("retarget_action", source=source, target=target, action=action, map=map, frameRange=frame_range,
                     newAction=new_action, rootBone=root_bone, sourceRoot=source_root, rootScale=root_scale,
-                    assign=assign, sampleFrames=sample_frames)
+                    assign=assign, sampleFrames=sample_frames, mode=mode, fbx=fbx, fbxOptions=fbx_options,
+                    keepSource=keep_source, translation=translation, translationTree=translation_tree,
+                    skeleton=skeleton, reference=reference, referenceSpace=reference_space, _timeout=900.0)
+
+
+@mcp.tool()
+def bl_pose_seams(object: str, action: str = None, actions: list = None, frame_range: list = None, bones: list = None,
+                  name_prefix: str = None, all: bool = None, turn_deg: float = None, twist_deg: float = None,
+                  fix: bool = None, fade_bones_above_deg: float = None, fade_frames: int = None, max_passes: int = None,
+                  max_rows: int = None) -> dict:
+    "Scan a Blender armature's actions for one-frame pose seams and twist flips (frame, bones, degrees); fix fades them out over a few frames and reports the largest per-frame turn and twist jump before and after. Call mif_help(\"bl_pose_seams\") first."
+    return _blender("pose_seams", object=object, action=action, actions=actions, frameRange=frame_range, bones=bones,
+                    namePrefix=name_prefix, all=all, turnDeg=turn_deg, twistDeg=twist_deg, fix=fix,
+                    fadeBonesAboveDeg=fade_bones_above_deg, fadeFrames=fade_frames, maxPasses=max_passes,
+                    maxRows=max_rows, _timeout=900.0)
+
+
+@mcp.tool()
+def bl_self_clipping(object: str, limb_bones: list, body_bones: list = None, armature: str = None, action: str = None,
+                     actions: list = None, frame_range: list = None, frame_step: int = None, tolerance: float = None,
+                     grid_resolution: int = None, max_rows: int = None) -> dict:
+    "Measure how deep a Blender skinned mesh's limbs go into its own body, per clip and frame (a winding-number distance grid of the body at rest); the deepest vertex, frames past a tolerance and the swing that would clear it. Call mif_help(\"bl_self_clipping\") first."
+    return _blender("self_clipping", object=object, limbBones=limb_bones, bodyBones=body_bones, armature=armature,
+                    action=action, actions=actions, frameRange=frame_range, frameStep=frame_step, tolerance=tolerance,
+                    gridResolution=grid_resolution, maxRows=max_rows, _timeout=1800.0)
 
 
 @mcp.tool()
@@ -7234,14 +8352,76 @@ def bl_set_sun_position(latitude: float, longitude: float, object: str = None, d
                     strength=strength, keyFrame=key_frame)
 
 
+@_closed
+class _Silhouette(TypedDict, total=False):     # ops_lookdev.silhouette_plan, _SIL_KEYS
+    color: list[float]
+    background: list[float]
+    collections: dict[str, list[float]]
+
+
 @mcp.tool()
 def bl_render_viewport(file_path: str = None, folder: str = None, frame_start: int = None, frame_end: int = None,
                        camera: str = None, shading: str = None, color_type: str = None, resolution_x: int = None,
-                       resolution_y: int = None, percentage: int = None, overlays: bool = None) -> dict:
+                       resolution_y: int = None, percentage: int = None, overlays: bool = None,
+                       silhouette: bool | _Silhouette = None) -> dict:
     "A Blender playblast: Viewport Render in a session with a 3D View, a matching Workbench render headless - a still or a frame range in seconds per frame; the reply names the route. See mif_help."
     return _blender("render_viewport", filePath=file_path, folder=folder, frameStart=frame_start, frameEnd=frame_end,
                     camera=camera, shading=shading, colorType=color_type, resolutionX=resolution_x,
-                    resolutionY=resolution_y, percentage=percentage, overlays=overlays, _timeout=600.0)
+                    resolutionY=resolution_y, percentage=percentage, overlays=overlays, silhouette=silhouette,
+                    _timeout=600.0)
+
+
+@mcp.tool()
+def bl_render_pixel_probe(x: int = None, y: int = None, pixels: list[list[float]] = None, camera: str = None,
+                          ao_distance: float = None, ao_rays: int = None) -> dict:
+    "Why is a pixel of a Blender render dark: the object and face the camera ray hits, the shading normal against the geometric one, a backface hit, the ambient occlusion there and the material's BSDF inputs, with a diagnosis. Writes nothing. See mif_help."
+    return _blender("render_pixel_probe", x=x, y=y, pixels=pixels, camera=camera, aoDistance=ao_distance,
+                    aoRays=ao_rays)
+
+
+@_closed
+class _GroupPick(TypedDict, total=False):      # ops_lookdev._ss_groups: one of _SS_SELECT
+    objects: list[str]
+    pattern: str
+    collection: str
+
+
+@_closed
+class _NamedGroup(_GroupPick, total=False):   # the list form: the same, with its name
+    name: Required[str]
+
+
+@mcp.tool()
+def bl_silhouette_stats(groups: dict[str, list[str] | _GroupPick] | list[_NamedGroup], camera: str = None,
+                        direction: list[float] = None, resolution: int = None) -> dict:
+    "Each group of Blender parts' share of the silhouette from a camera or a view direction: its own projected area, the area left visible after occlusion, and its share of the whole, in pixels - for 60/30/10 mass and accent-colour budgets. See mif_help."
+    return _blender("silhouette_stats", groups=groups, camera=camera, direction=direction, resolution=resolution,
+                    _timeout=600.0)
+
+
+class _CastCheck(TypedDict, total=False):      # look_studio / render_still castCheck {threshold}; other keys unread
+    threshold: float
+
+
+@mcp.tool()
+def bl_look_studio(subject: str | list[str] = None, hdri: str = None, hdri_strength: float = None,
+                   hdri_rotation: float = None, neutral_hdri: bool = None, background: list[float] = None,
+                   lights: bool = None, light_scale: float = None, floor: bool = None, camera: bool = None,
+                   azimuth: float = None, elevation: float = None, lens: float = None,
+                   cast_check: bool | _CastCheck = None, remove: bool = None) -> dict:
+    "A neutral Blender review stage in one call: HDRI light with its colour taken out and hidden from the camera (a flat backdrop instead), key, fill and rim lights, a floor and a camera framed on the subject; remove takes it all out. See mif_help."
+    return _blender("look_studio", subject=subject, hdri=hdri, hdriStrength=hdri_strength, hdriRotation=hdri_rotation,
+                    neutralHdri=neutral_hdri, background=background, lights=lights, lightScale=light_scale,
+                    floor=floor, camera=camera, azimuth=azimuth, elevation=elevation, lens=lens, castCheck=cast_check,
+                    remove=remove, _timeout=600.0)
+
+
+@mcp.tool()
+def bl_highlight_point(object: str, light: str, camera: str = None, surface_point: list[float] = None,
+                       distance: float = None, apply: bool = None) -> dict:
+    "Where a Blender light's mirror highlight lands on a surface for a camera - or, given a surface point, where to put the light so it lands there (apply moves and aims it). bl_render_still solo_light renders that light alone. See mif_help."
+    return _blender("highlight_point", object=object, light=light, camera=camera, surfacePoint=surface_point,
+                    distance=distance, apply=apply)
 
 
 @mcp.tool()
@@ -7269,20 +8449,45 @@ def bl_hair_to_cards(object: str, cards: int = None, segments: int = None, width
 
 
 @mcp.tool()
+def bl_bake_modifier_texture(object: str, modifier: str, target: str = None, name: str = None, channel: str = None,
+                             width: int = None, height: int = None, uv_layer: str = None, filepath: str = None) -> dict:
+    "Sample a Blender modifier's legacy texture (Displace, Wave, Warp) at the coordinates the modifier uses into a color attribute or a UV image, so a material follows the cells that shaped the geometry. See mif_help."
+    return _blender("bake_modifier_texture", object=object, modifier=modifier, target=target, name=name,
+                    channel=channel, width=width, height=height, uvLayer=uv_layer, filepath=filepath)
+
+
+@mcp.tool()
 def bl_bake_texture_set(object: str = None, types: list = None, folder: str = None, pattern: str = None,
                         width: int = None, height: int = None, samples: int = None, margin: int = None,
                         uv_layer: str = None, source: Any = None, extrusion: float = None,
                         max_ray_distance: float = None, cage: str = None, green_channel: str = None,
                         pack_orm: bool = None, out_of_process: bool = None, job_id: str = None,
                         memory_limit_gb: float = None, baked_material: str = None,
-                        assign_baked: bool = None, compute_backend: str = None) -> dict:
-    "Bake several maps of one Blender setup (high-to-low or self) in one job, out of process by default (a second Blender bakes a copy) - named T_{object}_{suffix}, ORM on request; job_id alone polls it. See mif_help."
+                        assign_baked: bool = None, compute_backend: str = None, wait: Any = None,
+                        ao_against: str = None, include: list = None, pieces: list = None,
+                        explode: float = None, match: dict = None, fix_normals: bool = None,
+                        check_islands: bool = None, single_slot: bool = None) -> dict:
+    "Bake a Blender mesh's maps in one job, out of process; job_id polls it. See mif_help."
     return _blender("bake_texture_set", object=object, types=types, folder=folder, pattern=pattern, width=width,
                     height=height, samples=samples, margin=margin, uvLayer=uv_layer, source=source,
                     extrusion=extrusion, maxRayDistance=max_ray_distance, cage=cage, greenChannel=green_channel,
                     packOrm=pack_orm, outOfProcess=out_of_process, jobId=job_id, memoryLimitGB=memory_limit_gb,
                     bakedMaterial=baked_material, assignBaked=assign_baked, computeBackend=compute_backend,
-                    _timeout=600.0)
+                    wait=wait, aoAgainst=ao_against, include=include, pieces=pieces,
+                    explode=explode, match=match, fixNormals=fix_normals,
+                    checkIslands=check_islands, singleSlot=single_slot, _timeout=600.0)
+
+
+@mcp.tool()
+def bl_roblox_pbr_bake(object: str, folder: str, size: int = 1024, pattern: str = None, uv_layer: str = None,
+                       unwrap: bool = None, angle_limit_deg: float = None, pack_margin: float = None, samples: int = None,
+                       margin: int = None, studs_per_unit: float = None, material: str = None,
+                       emissive: bool = None) -> dict:
+    "Bake a Blender mesh its own Roblox PBR set in one call: fresh unwrap in 0-1, texels per stud, color, OpenGL normal, roughness, metalness and an emissive mask as JPG, and the mesh left with one material reading them. Call mif_help(\"bl_roblox_pbr_bake\") first."
+    return _blender("roblox_pbr_bake", object=object, folder=folder, size=size, pattern=pattern, uvLayer=uv_layer,
+                    unwrap=unwrap, angleLimitDeg=angle_limit_deg, packMargin=pack_margin, samples=samples,
+                    margin=margin, studsPerUnit=studs_per_unit, material=material, emissive=emissive,
+                    _timeout=1800.0, _job_timeout=1770.0)
 
 
 @mcp.tool()
@@ -7385,13 +8590,13 @@ def bl_export_scene(file: str, objects: list = None, object: str = None,
                     selected_only: bool = None, apply_modifiers: bool = None,
                     frame_start: int = None, frame_end: int = None, animation: bool = None,
                     overwrite: bool = None, include_lights: bool = None, include_cameras: bool = None,
-                    exporter_options: dict = None, bvh: dict = None) -> dict:
+                    exporter_options: dict = None, bvh: dict = None, include_hidden: bool = None) -> dict:
     "Write glTF/GLB, OBJ, USD/USDA/USDC/USDZ, Alembic, STL or PLY - everything except the FBX bl_export_mesh owns. Measured: bl_import_mesh took .fbx/.gltf/.glb and bl_export_mesh wrote .fbx and NOTHING else, so glTF could come IN and not go OUT and USD was absent in both directions. The format comes from the EXTENSION. Blender moved its OBJ, STL and PLY exporters to wm.*_export at DIFFERENT versions (OBJ and PLY by 3.6, STL at 4.2) and EACH EXPORTER SPELLS ITS 'only the selection' OPTION DIFFERENTLY - four different keyword names across the six operators - so each format carries a list of candidate operators and its own keyword rather than a guess. Carrying one operator's spelling to another either raises or is silently ignored. A missing exporter (they are add-ons and can be disabled) is reported as a sentence naming the format, not an AttributeError. A frame range on a format that carries no time is REFUSED rather than ignored, because 'I exported an animation' and 'I exported frame 1' look identical afterwards. And ok:true is not a file: the mtime is taken before the call, so a leftover from an earlier run cannot pass as this export. Nor is it everything that was there: each format leaves some object types out - glTF writes lights and cameras only when asked, and OBJ, STL and PLY hold mesh geometry only - so the answer's notCarried names every object in scope the file does not carry, with the parameter that would include it where there is one. Lights and cameras stay out of a glTF by default, as in Blender's own exporter, because in a hand-off file they clutter an Unreal import; include_lights puts point, spot and sun lights in and include_cameras cameras. Both are glTF options, refused on every other format, which decides for itself (USD writes both, Alembic writes cameras). An existing file is REPLACED by default and the answer says so: overwrote, and when true replacedBytes and replacedModified (UTC), measured off the old file before the write; overwrite=False refuses the path by name. Grease Pencil strokes go out as .svg or .pdf (svgStrokes counts an SVG's strokes in the file), refused on Blender 4.3-4.5; a 5.x PDF the exporter does not write is refused after the call."
     return _blender("export_scene", file=file, objects=objects, object=object,
                     selectedOnly=selected_only, applyModifiers=apply_modifiers,
                     frameStart=frame_start, frameEnd=frame_end, animation=animation,
                     overwrite=overwrite, includeLights=include_lights, includeCameras=include_cameras,
-                    exporterOptions=exporter_options, bvh=bvh)
+                    exporterOptions=exporter_options, bvh=bvh, includeHidden=include_hidden)
 
 
 @mcp.tool()
@@ -7407,7 +8612,7 @@ def bl_export_mesh(object_name: str = None, file: str = None, object_types: list
                    apply_scale_options: str = None, path_mode: str = None, embed_textures: bool = None,
                    facing_body=None, split_shape_corners: bool = None, lod_groups: bool = None,
                    profile: str = None) -> dict:
-    "Export Blender objects to FBX for reimport into Unreal - object_name, or objects for one file in which every mesh keeps the scene origin as its pivot. The two axis arguments are the whole ballgame and are set for you: axis_up='Z', axis_forward='Y', which are NOT the operator defaults ('Y' / '-Z', the Maya convention) - the defaults"
+    "Export Blender objects to FBX for reimport into Unreal - object_name, or objects for one file in which every mesh keeps the scene origin as its pivot. The two axis arguments are set for you: axis_up='Z', axis_forward='Y', which are NOT the operator defaults ('Y' / '-Z', the Maya convention). They change the file's declared axes, not its vertex data: the defaults write UpAxis Y and a -90 degree X rotation on the model node over the same vertices, the pins UpAxis Z and no rotation. An importer that applies the file's axis header places the two the same - Unreal's FBX import did, the internal notes - and one that ignores it is left with the defaults' mesh turned 90 degrees, the pins' upright."
     # THE FOUR OVERRIDES BELOW WERE UNREACHABLE, and they are the ones that decide what UNREAL
     # receives rather than what Blender thinks it exported. The addon has always mapped them onto
     # the FBX exporter (_EXPORT_OVERRIDES, ops_mesh.py:227-231) and this tool sent none of them:
@@ -7458,7 +8663,7 @@ def bl_delete_scene(name: str) -> dict:
     #
     # THE ACTIVE-SCENE REFUSAL USED TO GIVE A FALSE REASON - "re-pointing bpy.context.scene needs a
     # window, which does not exist under `blender -b`". Measured 2026-09-20 on 3.6.23, 4.2.17 LTS,
-    # 4.4.0, 5.0.1 and 5.2.1 LTS (tools/probe_blender_background_window.py): every one has a window under -b
+    # 4.4.0, 5.0.1 and 5.2.1 LTS: every one has a window under -b
     # and window.scene is assignable. The refusal stands on its own merits; the reason is now the
     # true one and it names the op that clears it.
     return _blender("delete_scene", name=name)
@@ -7471,7 +8676,7 @@ def bl_set_current_scene(name: str, all_windows: bool = False) -> dict:
     # days before it existed - "set_current_scene is what switches to one" - because the addon
     # believed switching was impossible headless. It is not: measured on 3.6.23, 4.2.17 LTS, 4.4.0,
     # 5.0.1 and 5.2.1 LTS, `blender -b` has one window and window.scene assigns cleanly
-    # (tools/probe_blender_background_window.py). The write goes to window.scene and the claim is
+    #. The write goes to window.scene and the claim is
     # about context.scene, so the op reads context.scene back before reporting success.
     return _blender("set_current_scene", name=name, allWindows=all_windows)
 
@@ -7495,23 +8700,32 @@ def bl_undo_history() -> dict:
 
 
 @mcp.tool()
-def bl_delete_object(object_name: str, purge_orphans: bool = None) -> dict:
+def bl_delete_object(object_name: str = None, purge_orphans: bool = None, objects: list[str] = None,
+                     preview_id: str = None) -> dict:
     "Delete one object from the Blender scene by name. purge_orphans removes object data with no user - meshes, curves, lights, cameras, armatures, particle settings, in the whole file - which frees those names for a rebuild, named in orphansPurgedNames. Materials, images, node groups and actions the delete leaves with no user are KEPT and named in orphansKeptNames (since 2026-10-05: a purged car took its paint materials and the rebuild's bl_create_mesh refused them); bl_purge_orphans takes them by name, bl_clear_scene sweeps every orphan in the file. It defaults to FALSE here (unlike bl_clear_scene, which defaults it TRUE), so a mesh deleted this way leaves its mesh data behind until something purges it. Use it to clean up a specific import; bl_clear_scene is the whole-scene form. Deleting a RIGID BODY out of a baked rigid body world frees that bake (freedRigidBodyBake, rigidBodyBakeNote): the cache is stored by position in the world, so the bodies left behind would replay the deleted ones' frames. Deleting a rigid body also deletes every RIGID BODY JOINT that holds it (jointsRemovedWithBodies, and in `removed`): removing a body and its joint in the wrong order crashed Blender - 5.2.1 one way round, 4.2.17 the other - so both are taken out of the physics world first and the joint goes with its body. bl_undo takes a delete back, the object's modifiers and materials with it."
     # ops_scene.py:219 - `take_bool(params, "purgeOrphans", "purge", default=False)`. The differing
     # defaults between this and clear_scene are the addon's, not a mistake here, and worth stating in
     # the docstring: deleting one object leaves its data, clearing the scene does not.
-    return _blender("delete_object", object=object_name, purgeOrphans=purge_orphans)
+    if preview_id:          # the change cap's preview of an over-cap delete: preview_id alone runs the stored request
+        return _blender("delete_object", previewId=preview_id)
+    return _blender("delete_object", object=object_name, objects=objects, purgeOrphans=purge_orphans)
 
 
 @mcp.tool()
-def bl_clear_scene(object_type: str = None, purge_orphans: bool = None) -> dict:
-    "Delete objects in the Blender scene. object_type limits it to ONE Blender type ('MESH', 'ARMATURE', 'EMPTY', ...) so a rig or the lights and cameras can be kept while the meshes go; omit it to clear everything. purge_orphans (default TRUE in the addon) sweeps the WHOLE FILE for datablocks with zero users, not only the ones this call orphaned - so a material or node group made and not yet assigned is destroyed by it, and object_type='LIGHT' in a scene with no lights answers removedCount 0 while still purging. Measured; orphansPurgedNames and orphanPurgeNote now say what went. Pass purge_orphans=false to keep work in progress. bl_import_mesh already clears by default, so the usual reason to call this directly is to inspect a failed run's leftovers first and then reset. A baked rigid body world whose bodies go is freed and reported (freedRigidBodyBake): it would otherwise replay the old frames onto the next scene's bodies, which made shape, friction and bounciness look inert. Rigid body joints and bodies are taken out of the physics world before they are removed - removing them in either order crashed Blender on some build - and a joint whose body is cleared goes with it (jointsRemovedWithBodies), even when object_type would have kept it. bl_undo takes the whole clear back as one step. It deletes objects, not collections: emptyCollectionsLeft names the collections left empty, since bl_create_collection refuses a name that is still taken. Colour management is scene settings and survives it too: colorManagementKept reports it, with a note naming anything not at Blender's factory values."
+def bl_clear_scene(object_type: str = None, purge_orphans: bool = None, dry_run: bool = False, preview_id: str = None,
+                   preview_ttl_seconds: int = None) -> dict:
+    "Delete objects in the Blender file. object_type limits it to ONE Blender type ('MESH', 'ARMATURE', 'EMPTY', ...) so a rig or the lights and cameras can be kept while the meshes go; omit it to clear everything. purge_orphans (default TRUE in the addon) sweeps the WHOLE FILE for datablocks with zero users, not only the ones this call orphaned - so a material or node group made and not yet assigned is destroyed by it, and object_type='LIGHT' in a scene with no lights answers removedCount 0 while still purging. Measured; orphansPurgedNames and orphanPurgeNote now say what went. Pass purge_orphans=false to keep work in progress. bl_import_mesh already clears by default, so the usual reason to call this directly is to inspect a failed run's leftovers first and then reset. A baked rigid body world whose bodies go is freed and reported (freedRigidBodyBake): it would otherwise replay the old frames onto the next scene's bodies, which made shape, friction and bounciness look inert. Rigid body joints and bodies are taken out of the physics world before they are removed - removing them in either order crashed Blender on some build - and a joint whose body is cleared goes with it (jointsRemovedWithBodies), even when object_type would have kept it. bl_undo takes the whole clear back as one step. It deletes objects, not collections: emptyCollectionsLeft names the collections left empty, since bl_create_collection refuses a name that is still taken. Colour management is scene settings and survives it too: colorManagementKept reports it, with a note naming anything not at Blender's factory values. dry_run=True previews every object and data-block it would remove with a preview_id, which alone commits exactly that list; a clear over the change cap answers the same preview."
     # The addon has always taken both (ops_scene.py:204) and this wrapper sent NEITHER - it called
     # _blender("clear_scene") bare, so "clear the meshes and keep my armature" was unaskable and the
     # only available answer was to delete everything. purge_orphans matters separately: leaving
     # orphaned meshes and materials behind keeps a .blend growing across a long import session, and
     # turning it OFF is what you want when something else still references them.
-    return _blender("clear_scene", type=object_type, purgeOrphans=purge_orphans)
+    if preview_id:
+        return (_preview_commit_refusal(preview_id, object_type=object_type, purge_orphans=purge_orphans, dry_run=dry_run,
+                                        preview_ttl_seconds=preview_ttl_seconds)
+                or _blender("clear_scene", previewId=preview_id))
+    return _blender("clear_scene", type=object_type, purgeOrphans=purge_orphans, dryRun=dry_run or None,
+                    previewTtlSeconds=preview_ttl_seconds)
 
 
 @mcp.tool()
@@ -7534,7 +8748,7 @@ def bl_run_python(code: str = "", file: str = "", return_locals: bool = False, f
 # and the first geometry came in request 2 - so this reply lands between the look and the build.
 # WHY HERE AND NOT THE INSTRUCTIONS OR run_python's DESCRIPTION: those ride every request of every session, Unreal-only
 # ones included; this rides only the requests after a Blender Python call, of sessions that make one - 71 of round
-# ten's 81 requests against 81 and every other session's (docs/TOKEN_OPTIMIZATION.md 2.17). test_mcp_packs P148.
+# ten's 81 requests against 81 and every other session's. test_mcp_packs P148.
 # AN INSTRUCTION WITH THE CALL, NOT A LIST OF NAMES: as a list it reached all 15 shipped A3/A5/A8 runs and 14 went
 # straight on to a 100-200 line run_python build; the one that called bl_build_rock was its cell's cheapest (63k
 # tokens against a 99k median; 2.18). The example's keys are pinned to bl_build_rock's parameters (P150).
@@ -7560,7 +8774,7 @@ def _asset_tools_once(reply):
     # A REFUSAL BECAUSE PYTHON IS OFF CARRIES IT TOO: then the typed tools are the only way to build, and that refusal
     # is the first thing such a session reads. Benchmark round ten's Python-off arm opened all 20 runs with it, never saw
     # the note (it rode only a success), and went to find_tools('blender mesh', limit 40) - 14,737 characters replayed
-    # on every later request - to find the builders (docs/TOKEN_OPTIMIZATION.md 2.18). Any other failure still does not
+    # on every later request - to find the builders. Any other failure still does not
     # spend it.
     if _ASSET_TOOLS_HINTED or not isinstance(reply, dict):
         return reply
@@ -8007,7 +9221,7 @@ def _project_mode_after_call():
     return (_PROJECT_MODE_NOTE % " and ".join(unset) if unset else None), changed
 
 
-# PICTURES ARE IMAGE BLOCKS (docs/00_ARCHITECTURE.md "Pictures"). A model sees a picture only through an MCP image content
+# PICTURES ARE IMAGE BLOCKS. A model sees a picture only through an MCP image content
 # block: 22 headless runs got 0 of them, because a preview was base64 inside text, or withheld for its size, and a capture
 # was a path that a client with no file tool cannot open. _with_pictures is the one place results become blocks, for a
 # direct call and for mif_call alike. Which tools, and where each one's reply names its files, measured off each reply:
@@ -8016,6 +9230,7 @@ _PICTURE_TOOLS = {
     "capture_camera": ("path",), "capture_viewport": ("file",), "capture_level_map": ("file",),
     "preview_animation": ("frames.file",), "render_thumbnail": ("pngPath",), "preview_widget": ("path",),
     "preview_composite_widget": ("path",), "render_graph_image": ("path",), "mif_view_image": ("file",),
+    "mif_video_frames": ("frames.file",),
     "uefn_capture": ("file",),
 }
 _IMAGE_MODE = contextvars.ContextVar("mif_image_mode", default=None)    # None: a handler called outside call_tool
@@ -8133,7 +9348,7 @@ def bl_enable_addon(module: str = None, file: str = None, enable: bool = None, p
 # ---------------------------------------------------------------------------
 # GAP REPORTS, DRAFTED IN A SESSION (2026-10-11, spec "File a gap report from inside a session").
 #
-# Reports reach the report loop only when a person files them (docs/12): the issue template on the public tracker, or
+# Reports reach the report loop only when a person files them: the issue template on the public tracker, or
 # the site's form. This keeps the last failing calls - each backend's own refusals, not a timeout or an unreachable
 # editor - and mif_report_draft turns one into the template's exact shape for the PERSON to read and file. Nothing is
 # sent from here, ever: the answer is text and two addresses. What is left out is decided here, not by the reporter:
@@ -8160,18 +9375,29 @@ def _note_failed_call(backend, endpoint, payload, data):
 
 @mcp.tool()
 def mif_view_image(path: str, max_px: int = None, max_bytes: int = None) -> dict:
-    "Look at a PNG, BMP or JPG on disk: it comes back as an image block, scaled to max_px on its longest edge (default 1024, at most 1568) and max_bytes (default 512 KB). For a render a client cannot otherwise open: run_python's, a bl_render_animation frame, a baked map. Encoded here; nothing changes."
+    "Look at a PNG, BMP, JPG, GIF or WebP on disk: it comes back as an image block, scaled to max_px on its longest edge (default 1024, at most 1568) and max_bytes (default 512 KB). For a render a client cannot otherwise open: run_python's, a bl_render_animation frame, a baked map. A GIF or WebP shows its first frame, read with ffmpeg. Nothing changes."
     if not isinstance(path, str) or not os.path.isfile(path):
         return {"ok": False, "error": "%r is not a file this server can read. Nothing was shown." % (path,)}
+    from mif_media import video as _video
+    kind = _video.sniff(path)
+    if kind:
+        # GIF AND WEBP (FOUND 2026-11-16, the native media toolset reads both): no decoder for them in the standard
+        # library, so ffmpeg writes the first frame as a PNG in a new temp folder, and that PNG is what is shown
+        try:
+            ffmpeg, _probe = _video.tools(_ffmpeg_exe())
+            png = _video.still_png(_childproc.run, ffmpeg, path, os.path.join(_video.new_folder(), "first_frame.png"))
+        except _video.Refusal as exc:
+            return {"ok": False, "error": "%s is a %s: %s. Nothing was shown." % (path, kind.upper(), exc)}
+        return {"ok": True, "file": png, "source": path, "convertedFrom": kind, "_imageLimits": [max_px, max_bytes]}
     return {"ok": True, "file": path, "_imageLimits": [max_px, max_bytes]}
 
-# THE ROADMAP (1.3, docs/30_ROADMAP.md). "Help newbs plan every step to make their mod happen" - and the shallow version
+# THE ROADMAP. "Help newbs plan every step to make their mod happen" - and the shallow version
 # of that is worse than none: a plan that says "save the map" to a bridge in scratch mode, or names a call that refuses on
 # the user's engine, walks a newcomer into a failure they cannot tell from their own mistake. So the catalog
 # (roadmap.json) only says WHICH calls a step is made of; whether they work here is derived on every call - from the
 # Source (engine refusals, plugin needs, cooked handling, crash refusals: mif_roadmap_ground.scan_source), the shipped
 # pack rules, the live editor (self_audit's registry, write gate and undo bucket, enabled plugins, cooked content, the
-# generative setting, the catalog's read-only checks) and, in a checkout, the ledger and the verification board. No
+# generative setting, the catalog's read-only checks) and, in a checkout, the internal notes and the verification board. No
 # model is called: the assistant plans; this grounds. Nothing is written.
 _ROADMAP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "roadmap.json")
 
@@ -8270,7 +9496,7 @@ def mif_project_mode(mode: str = "", project: str = "all", change_cap: int = Non
     if want and want not in _MODES:
         return {"ok": False, "error": "mode must be one of %s (or empty to read it), not %r. Nothing was changed."
                                       % (", ".join(_MODES), mode)}
-    # THE CHANGE CAP (docs/15 section 6): a whole number from 0 (off) up. bool is an int in Python, so it is named.
+    # THE CHANGE CAP: a whole number from 0 (off) up. bool is an int in Python, so it is named.
     if change_cap is not None and (isinstance(change_cap, bool) or not isinstance(change_cap, int) or change_cap < 0):
         return {"ok": False, "error": "change_cap must be a whole number from 0 (off) up, not %r. Nothing was changed."
                                       % (change_cap,)}
@@ -8469,12 +9695,12 @@ def _expand_packs(names):
 
 
 # ---------------------------------------------------------------------------
-# PACK RULES - what an agent working one pack is told. Added 2026-09-21 (the request: "split up a math.md/ledger per
+# PACK RULES - what an agent working one pack is told. Added 2026-09-21 (the request: "split up a math.md/the internal notes per
 # each and train each one").
 #
-# Each rule is a mistake the confirmed-facts ledger shows that pack's work makes easily - a silent trap, a unit, an
+# Each rule is a mistake the confirmed-facts the internal notes shows that pack's work makes easily - a silent trap, a unit, an
 # order that matters, a field that does not prove what it seems to. They are distilled per pack in pack_rules.py
-# (dev-only; it keeps the ledger citations) and generated into packs.json as {"rule", "tools"}, so this server only
+# and generated into packs.json as {"rule", "tools"}, so this server only
 # reads them. They reach an agent four ways, because no single one reaches every agent:
 #   - the pack's prompt (mif-pack-<id>), when a person invokes it;
 #   - mif_enable_pack's response, for each pack it loads;
@@ -8513,7 +9739,7 @@ def _rules_payload(pids):
     return out
 
 
-# RULE BY RULE THROUGH mif_call, decided after benchmark round six (docs/TOKEN_OPTIMIZATION.md 2.10). The first
+# RULE BY RULE THROUGH mif_call, decided after benchmark round six. The first
 # tool mif_call registered from a pack carried the pack's whole list: each UMG run took 22 rules, ~6,100 characters
 # re-read on ~6 requests, and 5 of them named a tool it called - the 9 ui rules arrived with add_tree_widget and none
 # is about a widget tree. Now a tool's first call carries the rules that name it, and a pack's first call those that
@@ -8562,14 +9788,14 @@ def _with_pack_rules(name, out):
 # THE DEFAULT IS core, decided on 2026-09-23. A benchmark's core arm (33 runs on 11baf1c7, Claude Code's tool
 # search, 0 wrong) cost 227,116 tokens a task against 259,923 for all 711 tools - cheaper on 9 of 11 tasks - and a
 # client that loads every schema up front pays ~8k tokens a request for core against ~147k for all
-# (docs/TOKEN_OPTIMIZATION.md 3.5). The rest stay reachable: find_tools names a tool's pack, mif_enable_pack loads it
+#. The rest stay reachable: find_tools names a tool's pack, mif_enable_pack loads it
 # and mif_call calls any tool by name. MIF_TOOL_PACKS=all loads everything, as the default did until then; an EMPTY
 # value means the default, as unset does.
 #
-# THE DEFAULT IS "lean" SINCE LATER THE SAME DAY, decided again (docs/TOKEN_OPTIMIZATION.md 2.8): only the
+# THE DEFAULT IS "lean" SINCE LATER THE SAME DAY, decided again: only the
 # always-loaded tools are registered - find_tools, mif_call and the Python tool (the two became one run_python in 2.9)
 # - and every other tool, core's included, is held back where find_tools finds it and mif_call calls it. Measured with Claude Code's own token
-# count (ledger CC26): once ANY MCP tool is deferred, Claude Code sends its ToolSearch machinery on every request - 632
+# count: once ANY MCP tool is deferred, Claude Code sends its ToolSearch machinery on every request - 632
 # tokens for the first deferred tool, 16 for each after - so core's 16 deferred tools cost 872 tokens a request
 # (4,918 against 4,046). MIF_TOOL_PACKS=core loads core as before; "lean" can be named too, alone.
 _DEFAULT_PACKS = "lean"
@@ -8581,6 +9807,13 @@ def _apply_tool_packs(selection=None):
     raw = (os.environ.get("MIF_TOOL_PACKS", "") if selection is None else selection).strip().lower()
     raw = raw or _DEFAULT_PACKS
     if raw == "all":
+        # SAID ONCE, ON STDERR (FOUND 2026-11-22: the shipped sample set it, so every user who copied the sample paid it):
+        # the internal notes measured 167,392 tokens a request for every pack's schemas on a client that loads them up front,
+        # 18,953 under tool search; CC54 the lean default 3,901 and 3,911.
+        if selection is None:
+            print("[mif] MIF_TOOL_PACKS=all: every tool's schema is listed - about 167,000 tokens a request on a client "
+                  "that loads schemas up front (about 19,000 with tool search), against about 3,900 for the lean "
+                  "default. Unset it unless you mean it; mif_enable_pack adds a pack mid-session.", file=sys.stderr)
         return "all tools loaded"
     packs = _packs()
     if packs.get("__error__"):
@@ -8605,7 +9838,7 @@ def _apply_tool_packs(selection=None):
     if "unity" in known:
         _UNITY_SESSION["on"] = True
         _UNITY_SESSION["only"] = not [p for p in known if p not in ("core", "unity")]
-    for name in (packs.get("unity") or {}).get("tools") or []:
+    for name in [*((packs.get("unity") or {}).get("tools") or []), *((packs.get("roblox") or {}).get("tools") or [])]:
         if name in keep and name in _UNLOADED:
             mcp.add_tool(_UNLOADED.pop(name))
     if raw == "lean":
@@ -8619,7 +9852,7 @@ def _apply_tool_packs(selection=None):
 
 # A BLENDER SESSION DOES NOT CARRY UNREAL'S CORE TOOLS. Thirteen of core's eighteen talk to Unreal only (find_assets,
 # get/set_property, batch, the saves, ...), and a selection naming nothing but Blender packs paid ~2,300 tokens for
-# them on every request - ~17k a Blender task (a benchmark, 2026-09-22, docs/TOKEN_OPTIMIZATION.md). It was decided then
+# them on every request - ~17k a Blender task. It was decided then
 # that such a selection keeps only core's `neutral` tools, whether or not it also names core, since core is loaded
 # either way. The rest stay reachable: find_tools names their pack, mif_call reaches them, and enabling core or any
 # pack that is not Blender's brings them back (mif_enable_pack). A selection with any other pack is unchanged.
@@ -8635,7 +9868,7 @@ def _core_unreal_tools() -> set:
 # so a selection whose packs are Blender's and the uefn pack - UEFN alone, or the Blender-to-UEFN hand-off - keeps only
 # core's neutral tools too. uefn_status is in the uefn pack; find_tools and mif_call are neutral.
 # Unity's tools call neither Unreal nor Blender either, so a Unity selection takes only core's neutral tools the same way.
-_NON_UNREAL_BACKENDS = ("blender", "uefn", "unity")
+_NON_UNREAL_BACKENDS = ("blender", "uefn", "unity", "roblox")
 
 
 def _blender_only(pack_ids) -> bool:
@@ -8719,7 +9952,7 @@ def _register_pack_prompts():
 
 
 # ---------------------------------------------------------------------------
-# EXTENSIONS - third-party tools and tool packs from local folders (docs/32_EXTENSIONS.md, 1.3).
+# EXTENSIONS - third-party tools and tool packs from local folders.
 #
 # mifext.py finds, checks and imports each installed extension; this side registers its tools and makes its pack one of
 # the server's packs, so find_tools finds them, mif_call calls them, mif_enable_pack and MIF_TOOL_PACKS load them, and
@@ -8765,6 +9998,27 @@ def _load_unity():
     unity_backend.BLENDER = _blender
     packs["unity"] = dict(unity_backend.PACK)
     return "unity backend: %d tools held back" % len(unity_backend.TOOLS)
+
+
+def _load_roblox():
+    """The Roblox Studio backend's pack, every tool held back exactly as _load_unity holds
+    Unity's: never at import, never on a default. Its tools reach Studio through the loopback daemon the MifBridge Studio
+    plugin long-polls; this hands in the TCP-table reader so the daemon's port owner is measured, not believed."""
+    try:
+        from mif_roblox import tools as roblox_tools     # beside this file
+    except Exception as exc:  # noqa: BLE001 - a broken Roblox module must not take the other backends down
+        return "roblox backend: not loaded (%s: %s)" % (type(exc).__name__, exc)
+    packs = _packs()
+    if not isinstance(packs, dict) or packs.get("__error__"):
+        return "roblox backend: not loaded (packs.json unreadable)"
+    taken = set(getattr(getattr(mcp, "_tool_manager", None), "_tools", None) or {}) | set(_UNLOADED)
+    clash = sorted(n for n in roblox_tools.TOOLS if n in taken)
+    if clash:
+        return "roblox backend: not loaded (names taken: %s)" % ", ".join(clash)
+    _UNLOADED.update(roblox_tools.TOOLS)
+    roblox_tools.LISTENING_PID = _listening_pid
+    packs["roblox"] = dict(roblox_tools.PACK)
+    return "roblox backend: %d tools held back" % len(roblox_tools.TOOLS)
 
 
 def _load_extensions():
@@ -8825,7 +10079,7 @@ def _load_extensions():
 # same text to a client that shows no prompts. A template builds nothing and has no look of its own: the agent asks,
 # shows the plan with every value, and calls the tools after the user's yes. Like the pack prompts it costs nothing
 # until picked, and registers in main(), never at import (the test stubs' FakeMCP has tool() only). Every tool and
-# parameter a template's calls name is checked against this file's own signatures by tools/test_mcp_packs.py, so a
+# parameter a template's calls name is checked against this file's own signatures by a dev test, so a
 # renamed tool or parameter fails there rather than in a user's session.
 # ---------------------------------------------------------------------------
 _TEMPLATES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates.json")
@@ -8855,7 +10109,7 @@ def _template_id(name):
 # THE SKILLS, served by name. skills/<name>/SKILL.md is the read-before-you-drive text (hazards, call grammar, engine
 # versions); it reached an agent only as files, so a client without file access never saw it. mif_help('<name>') returns
 # it. The folder ships in the GitHub zip, not the store package, so an absent folder is said out loud rather than
-# answered "no tool named". tools/audit_skill_names.py checks every name a skill quotes against this build.
+# answered "no tool named". a dev test checks every name a skill quotes against this build.
 _SKILLS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "skills")
 
 
@@ -8960,7 +10214,7 @@ def mif_list_packs() -> dict:
                      "rules": len(_pack_rules(pid))})
     return {"packs": rows, "aliases": _pack_aliases(),
             "selection": os.environ.get("MIF_TOOL_PACKS", "").strip() or _DEFAULT_PACKS,
-            # MIF_DOCS_FIRST (docs/TOKEN_OPTIMIZATION.md 2.13): whether a guessed name is mapped or refused with docs
+            # MIF_DOCS_FIRST: whether a guessed name is mapped or refused with docs
             "docsFirst": _DOCS_FIRST,
             "blender": "For Blender load blender_core plus the workflow pack you need (a workflow pack brings "
                        "blender_core with it), or 'blender' for every Blender pack. A selection of Blender packs "
@@ -9050,7 +10304,7 @@ async def mif_enable_pack(pack: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# RESPONSE CONTROLS (2026-10-11, spec "MCP response controls"; docs/00_ARCHITECTURE.md "Response controls").
+# RESPONSE CONTROLS.
 #
 # Results were sized per endpoint (limit, results='errors', compact self_audit) and a long job was polled by hand. These
 # reserved keys work on EVERY tool, in a direct call's arguments or inside mif_call's args, and are taken off before the
@@ -9063,7 +10317,7 @@ async def mif_enable_pack(pack: str) -> dict:
 #                                progress notifications while it runs (a client that sent a progressToken sees them)
 #   _image  false                on a tool that shows a picture (_PICTURE_TOOLS): no image block, only the file's path.
 #                                'data' keeps bl_render_still's base64 in the text, as a client that reads the bytes wants
-# NOTHING IS ADDED TO ANY SCHEMA. Every always-loaded schema is paid for on every request (docs/TOKEN_OPTIMIZATION.md), so
+# NOTHING IS ADDED TO ANY SCHEMA. Every always-loaded schema is paid for on every request, so
 # the keys are named once in mif_call's description and in full in mif_help('mif_call').
 # `ok` and `error` always survive _select and _omit: failure is the presence of `error` (instructions, rule 2).
 # ---------------------------------------------------------------------------
@@ -9405,7 +10659,7 @@ async def mif_call(tool: str, args: dict | None = None) -> Any:
     # from the last tool it used: the Blender tools name the object they act on `object` (75 of them) or `object_name`
     # (22), and a benchmark's core arm - core became the default on 2026-09-23 - failed 10 of its 15 unknown-parameter
     # mif_call calls on exactly that, and one more in the add-on's camelCase names, as bl_describe_op reports them
-    # (ledger CC16). For a bl_ tool each is renamed to the tool's own parameter: the object's other spelling only when
+    #. For a bl_ tool each is renamed to the tool's own parameter: the object's other spelling only when
     # the tool takes it, an add-on name only through the map read off the tool's own call (_op_param_names), neither
     # when the call already gave the target name. Every rename comes back in argsRenamed, so the agent learns the name;
     # anything else unknown is still refused, by name, before anything runs.
@@ -9534,7 +10788,7 @@ def _forward_to_newer_editor(name, args):
     out["forwarded"] = True
     provider = out.get("providedBy")
     if isinstance(provider, str) and provider and provider != "MifBridge":
-        # AN EXTENSION'S NATIVE ENDPOINT (docs/32_EXTENSIONS.md): its plugin registered it and no tool was written for it,
+        # AN EXTENSION'S NATIVE ENDPOINT: its plugin registered it and no tool was written for it,
         # which is normal - this server is not older than anything. The editor checked the keys against its declaration.
         out["serverOlderThanPlugin"] = False
         out["forwardNote"] = ("%r is an extension endpoint registered by %s; it has no MCP tool of its own, so the call "
@@ -9561,7 +10815,7 @@ def _first_call_note(result, name: str, registered_now: bool):
     _tool_rules_payload), so this path is taught what the enable path is, as it needs it. A REFUSED FIRST CALL CARRIES
     THEM TOO: until 2026-09-27 only a successful one did, and the next call found the tool registered already, so a
     tool whose first call was refused never delivered its rules - rarely, while guesses were mapped, and on every guess
-    once docs-first mode refuses them (docs/TOKEN_OPTIMIZATION.md 2.13)."""
+    once docs-first mode refuses them."""
     if not registered_now or not isinstance(result, dict) or "mifCall" in result:
         return result
     note = {"tool": name, "registeredServerSide": True}
@@ -9580,7 +10834,7 @@ def main():
     parser.add_argument("--debug", action="store_true", help="log request/response to stderr")
     args = parser.parse_args()
     DEBUG = args.debug or os.environ.get("MIF_BRIDGE_DEBUG", "").lower() in ("1", "true", "yes")
-    _log(f"starting; ue={BASE} timeout={TIMEOUT}s token={'set' if TOKEN else 'empty'}")
+    _log(f"starting; ue={BASE} timeout={TIMEOUT}s token={'from MIF_BRIDGE_TOKEN' if TOKEN is not None else _CRED.bridge_tokens()[1]}")
     # Reported, never dialled: connecting to Blender at startup would block the
     # MCP handshake whenever Blender is closed. bl_* tools connect lazily.
     _log(f"           blender={BLENDER_HOST}:{BLENDER_PORT} connect={BLENDER_CONNECT_TIMEOUT}s "
@@ -9588,6 +10842,7 @@ def main():
     _log("generative tools: " + _apply_generative_mode())    # first: the packs must never hold a hidden gen tool back
     _log(_load_extensions())                                 # before the packs, so extension tools are held back too
     _log(_load_unity())
+    _log(_load_roblox())
     _log("tool packs: " + _apply_tool_packs())
     _log("docs first: " + _apply_docs_first())
     _log("pack prompts registered: %d" % _register_pack_prompts())
@@ -9659,7 +10914,7 @@ def mif_help(tool: str = "") -> dict:
     # A HELD-BACK TOOL IS A TOOL. The registry holds only what the pack selection loaded, so a tool in a pack that was
     # not loaded, with no extended-help entry, was answered "no tool named 'batch'" - false, and the house rule reads
     # `error` as failure. Rare while core was the default; on the lean default every one of core's own tools without an
-    # entry would have met it (tools/test_mcp_packs.py P124, found building that default, 2026-09-23).
+    # entry would have met it.
     known |= set(_UNLOADED)
     if name in known:
         # A TRIMMED DESCRIPTION IS EXTENDED HELP. Since 2026-09-11 list_tools sends any description

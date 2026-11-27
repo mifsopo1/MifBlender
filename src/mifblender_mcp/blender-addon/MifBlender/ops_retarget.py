@@ -18,7 +18,7 @@ import re
 
 import bpy
 
-from .ops_common import MifOpError, get_object, reject_unknown, require_editable, take, take_bool, take_float, take_int
+from .ops_common import MifOpError, get_object, remove_objects, reject_unknown, require_editable, take, take_bool, take_float, take_int
 
 
 def _armature(name, tail, what="armature"):
@@ -94,7 +94,11 @@ def _auto_map(src, tgt):
 # --------------------------------------------------------------------------------------------- retarget_action
 
 _RT_KEYS = ("source", "target", "action", "map", "frameRange", "newAction", "rootBone", "sourceRoot", "rootScale",
-            "assign", "sampleFrames")
+             "assign", "sampleFrames", "mode", "fbx", "fbxOptions", "keepSource", "translation", "translationTree",
+             "skeleton", "reference", "referenceSpace")
+_RT_UNREAL_ONLY = ("fbx", "fbxOptions", "keepSource", "translation", "translationTree", "skeleton", "reference",
+                   "referenceSpace")
+_RT_WORLD_ONLY = ("rootBone", "sourceRoot", "rootScale")
 
 
 def op_retarget_action(params):
@@ -115,6 +119,8 @@ def op_retarget_action(params):
       rootScale (float)        the translation scale (default: target root rest height / source root rest height)
       assign (bool)            leave the new action on the target (default true; false puts the old one back)
       sampleFrames (int)       frames the error is measured at (default 8)
+      mode (str)               WORLD (default, below) | UNREAL (1.4): the clip played the way Unreal plays it on a mesh of
+                               the same skeleton - see _retarget_unreal
     REST-POSE COMPENSATION: each mapped bone takes the source bone's WORLD rotation change from ITS rest, applied to the
     target bone's own rest - so an A-pose clip plays on a T-pose rig. Unmapped target bones keep their rest. Reply per
     mapped bone: the largest world-rotation difference between what the target shows and what the source asked, in
@@ -122,6 +128,15 @@ def op_retarget_action(params):
     """
     reject_unknown(params, _RT_KEYS, "retarget_action")
     tail = "NOTHING was changed."
+    mode = str(params.get("mode") or "WORLD").upper()
+    if mode not in ("WORLD", "UNREAL"):
+        raise MifOpError("mode is WORLD (default: rest-pose difference compensated) or UNREAL (the clip's local "
+                         "rotations played as Unreal plays them), got %r. %s" % (params.get("mode"), tail))
+    if mode == "UNREAL":
+        return _retarget_unreal(params, tail)
+    stray = [k for k in _RT_UNREAL_ONLY if params.get(k) is not None]
+    if stray:
+        raise MifOpError("%s belong%s to mode UNREAL. %s" % (", ".join(stray), "s" if len(stray) == 1 else "", tail))
     from mathutils import Matrix, Quaternion           # noqa: PLC0415,F401
     src = _armature(take(params, "source", required=True, kind=str), tail, "source")
     tgt = _armature(take(params, "target", required=True, kind=str), tail, "target")
@@ -261,6 +276,340 @@ def op_retarget_action(params):
     if worst > 1.0:
         out["warning"] = ("a bone's result differs from the source's rotation by up to %.2f degrees - a constraint or "
                           "driver on the target, or a bone that does not inherit rotation" % worst)
+    return out
+
+
+# --------------------------------------------------------------------------------------------- retarget_action UNREAL
+# FOUND 2026-11-19: Unreal plays a clip's ABSOLUTE local (parent-relative) bone rotations on every mesh of
+# the skeleton, with each bone's translation chosen by its retargeting mode - Animation (the clip's), Skeleton (the
+# mesh's own) or AnimationScaled (the clip's, times the mesh's reference length over the SKELETON's). Blender keeps an
+# imported FBX clip relative to the clip file's own bind pose, so the same clip attached to a differently posed armature
+# plays rest + offset: .blend files built that way were 43-75 m off Unreal's poses. Baking each frame's local rotations
+# with the target's translations brought every bone to 2-4 cm of Unreal's, every clip, every mesh.
+#
+# THE MATH: a bone's local transform is L = P(parent)^-1 @ P(bone) in armature space (the armature's own matrix for a
+# root). The target bone's basis that plays a wanted local L is B = Rrel^-1 @ L, Rrel = R(parent)^-1 @ R(bone) its rest
+# relative to its parent - so no depsgraph pass is needed per target bone. Both armatures must hold their bones in the
+# same frames (two FBX imports of one skeleton with the same bone-axis options): a local rotation means nothing across
+# different bone frames, which is why fbxOptions is the target's own import options.
+
+_TR_MODES = {"ANIMATION": "ANIMATION", "SKELETON": "SKELETON", "ANIMATIONSCALED": "ANIMATION_SCALED"}
+
+
+def _tr_mode(raw, key, tail):
+    m = _TR_MODES.get(re.sub(r"[^A-Z]", "", str(raw).upper())) if isinstance(raw, str) else None
+    if m is None:
+        raise MifOpError("%s: a translation mode is Animation, Skeleton or AnimationScaled, got %r. %s" % (key, raw, tail))
+    return m
+
+
+def _import_fbx_source(path, options, tail):
+    """Import a clip FBX; (armature, new objects, new actions). Everything imported is removed again on a refusal."""
+    import os                                          # noqa: PLC0415
+    if not isinstance(path, str) or not os.path.isfile(path):
+        raise MifOpError("fbx: no file at %r. %s" % (path, tail))
+    opts = dict(options or {})
+    if not isinstance(options or {}, dict):
+        raise MifOpError("fbxOptions is a dict of the FBX importer's options. %s" % tail)
+    known = {p.identifier for p in bpy.ops.import_scene.fbx.get_rna_type().properties} - {"rna_type", "filepath"}
+    bad = sorted(k for k in opts if k not in known)
+    if bad:
+        raise MifOpError("fbxOptions %s %s not an option of this Blender's FBX importer (it takes: %s). %s"
+                         % (", ".join(bad), "is" if len(bad) == 1 else "are", ", ".join(sorted(known)), tail))
+    objs0, acts0 = set(bpy.data.objects), set(bpy.data.actions)
+    try:
+        bpy.ops.import_scene.fbx(filepath=os.path.abspath(path), **opts)
+    except Exception as exc:                           # noqa: BLE001 - the importer's own message
+        _remove_imported([o for o in bpy.data.objects if o not in objs0], [a for a in bpy.data.actions if a not in acts0])
+        raise MifOpError("the FBX importer refused %s: %s. %s" % (path, str(exc).strip()[:300], tail))
+    new_objs = [o for o in bpy.data.objects if o not in objs0]
+    new_acts = [a for a in bpy.data.actions if a not in acts0]
+    arms = [o for o in new_objs if o.type == "ARMATURE"]
+    if len(arms) != 1:
+        _remove_imported(new_objs, new_acts)
+        raise MifOpError("fbx %s held %d armatures - a clip file holds one. %s" % (path, len(arms), tail))
+    return arms[0], new_objs, new_acts
+
+
+def _remove_imported(objs, acts):
+    datas = [o.data for o in objs if o.data is not None]
+    remove_objects(objs)
+    homes = {bpy.types.Mesh: bpy.data.meshes, bpy.types.Armature: bpy.data.armatures, bpy.types.Camera: bpy.data.cameras,
+             bpy.types.Light: bpy.data.lights}
+    for d in datas:
+        coll = next((c for t, c in homes.items() if isinstance(d, t)), None)
+        if coll is not None and d.users == 0:
+            coll.remove(d)
+    for a in acts:
+        if a.users == 0 or (a.use_fake_user and a.users == 1):
+            bpy.data.actions.remove(a)
+
+
+def _local(arm_pose, b):
+    """A pose bone's local (parent-relative) matrix from armature-space pose matrices."""
+    m = arm_pose[b.name]
+    return arm_pose[b.parent.name].inverted_safe() @ m if b.parent else m.copy()
+
+
+def _parse_reference(raw, space, tgt, start, end, tail):
+    if raw is None:
+        return None
+    frames = raw.get("frames") if isinstance(raw, dict) else None
+    if not isinstance(frames, dict) or not frames:
+        raise MifOpError("reference is {frames: {frame: {bone: [x, y, z]}}} - the bone heads of a pose set to compare "
+                         "against. %s" % tail)
+    out = {}
+    for fk, bones in frames.items():
+        try:
+            f = int(fk)
+        except (TypeError, ValueError):
+            raise MifOpError("reference frame %r is not a whole frame. %s" % (fk, tail))
+        if f < start or f > end:
+            raise MifOpError("reference frame %d is outside the baked range %d-%d. %s" % (f, start, end, tail))
+        if not isinstance(bones, dict) or not bones:
+            raise MifOpError("reference frame %d names no bones. %s" % (f, tail))
+        row = {}
+        for bn, p in bones.items():
+            if tgt.data.bones.get(bn) is None:
+                raise MifOpError("reference frame %d: the target has no bone '%s'. %s" % (f, bn, tail))
+            if not isinstance(p, (list, tuple)) or len(p) != 3 or any(
+                    isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in p):
+                raise MifOpError("reference frame %d bone '%s' is [x, y, z], got %r. %s" % (f, bn, p, tail))
+            row[bn] = tuple(float(v) for v in p)
+        out[f] = row
+    if space not in ("ARMATURE", "WORLD"):
+        raise MifOpError("referenceSpace is ARMATURE (default: the target armature's own space) or WORLD. %s" % tail)
+    return out
+
+
+def _retarget_unreal(params, tail):
+    from mathutils import Matrix, Vector               # noqa: PLC0415
+    tgt = _armature(take(params, "target", required=True, kind=str), tail, "target")
+    require_editable(tgt, "animate")
+    src_name = take(params, "source", default=None, kind=str)
+    fbx = params.get("fbx")
+    if (src_name is None) == (fbx is None):
+        raise MifOpError("mode UNREAL takes the clip as source (an armature in the scene with the action) OR fbx (a clip "
+                         "file to import) - exactly one. %s" % tail)
+    stray = [k for k in _RT_WORLD_ONLY if params.get(k) is not None]
+    if stray:
+        raise MifOpError("%s belong%s to mode WORLD: in UNREAL each bone's translation comes from translation / "
+                         "translationTree. %s" % (", ".join(stray), "s" if len(stray) == 1 else "", tail))
+    if fbx is None and (params.get("fbxOptions") is not None or params.get("keepSource") is not None):
+        raise MifOpError("fbxOptions and keepSource go with fbx. %s" % tail)
+    # EVERYTHING ABOUT THE TARGET IS CHECKED BEFORE AN IMPORT, so a refusal leaves the scene as it was.
+    bones_t = tgt.data.bones
+    trans = {}
+    for key in ("translation", "translationTree"):
+        raw = params.get(key)
+        if raw is None:
+            trans[key] = {}
+            continue
+        if not isinstance(raw, dict):
+            raise MifOpError("%s is {bone: Animation | Skeleton | AnimationScaled}. %s" % (key, tail))
+        missing = sorted(b for b in raw if bones_t.get(b) is None)
+        if missing:
+            raise MifOpError("%s names bones the target does not have: %s. %s" % (key, ", ".join(missing[:10]), tail))
+        trans[key] = {b: _tr_mode(m, "%s.%s" % (key, b), tail) for b, m in raw.items()}
+    mode_of = {}
+    for b in bones_t:
+        m = trans["translation"].get(b.name)
+        if m is None:
+            m = next((trans["translationTree"][a.name] for a in [b] + list(b.parent_recursive)
+                      if a.name in trans["translationTree"]), "ANIMATION")
+        mode_of[b.name] = m
+    rest_t = {b.name: b.matrix_local.copy() for b in bones_t}
+    rel_t = {b.name: (rest_t[b.parent.name].inverted_safe() @ rest_t[b.name]) if b.parent else rest_t[b.name]
+             for b in bones_t}
+    scaled = sorted(n for n, m in mode_of.items() if m == "ANIMATION_SCALED")
+    ratio = {}
+    if scaled:
+        skel_name = take(params, "skeleton", default=None, kind=str)
+        if skel_name is None:
+            raise MifOpError("AnimationScaled on %s needs skeleton: the armature whose rest pose is the Unreal Skeleton's "
+                             "reference (the mesh the skeleton was made from) - Unreal scales by the mesh's length over "
+                             "the SKELETON's, not the clip file's (ledger U776). %s" % (", ".join(scaled[:5]), tail))
+        skel = _armature(skel_name, tail, "skeleton")
+        for n in scaled:
+            sb = skel.data.bones.get(n)
+            if sb is None:
+                raise MifOpError("skeleton '%s' has no bone '%s'. %s" % (skel.name, n, tail))
+            srel = (sb.parent.matrix_local.inverted_safe() @ sb.matrix_local) if sb.parent else sb.matrix_local
+            ls = srel.translation.length
+            if ls < 1e-9:
+                raise MifOpError("'%s' sits on its parent in skeleton '%s' (length 0), so AnimationScaled has nothing to "
+                                 "scale by. %s" % (n, skel.name, tail))
+            ratio[n] = rel_t[n].translation.length / ls
+    elif params.get("skeleton") is not None:
+        raise MifOpError("skeleton is only read for AnimationScaled bones, and none is set. %s" % tail)
+    ref_space = str(params.get("referenceSpace") or "ARMATURE").upper()
+    samples = max(2, take_int(params, "sampleFrames", default=8))
+    assign = take_bool(params, "assign", default=True)
+    keep_source = take_bool(params, "keepSource", default=False)
+    imported = ([], [])
+    if fbx is not None:
+        src, objs, acts = _import_fbx_source(fbx, params.get("fbxOptions"), tail)
+        imported = (objs, acts)
+    else:
+        src = _armature(src_name, tail, "source")
+        if src is tgt:
+            raise MifOpError("source and target are one armature. %s" % tail)
+    try:
+        act_name = take(params, "action", default=None, kind=str)
+        if act_name is not None:
+            act = bpy.data.actions.get(act_name)
+            if act is None:
+                raise MifOpError("no action named '%s'%s. %s" % (
+                    act_name, " (the file brought %s)" % [a.name for a in imported[1]] if imported[1] else "", tail))
+        else:
+            act = src.animation_data.action if src.animation_data else None
+            if act is None:
+                raise MifOpError("'%s' has no action assigned - name one with action. %s" % (src.name, tail))
+        raw_map = params.get("map", "SAME")
+        if isinstance(raw_map, str) and raw_map.upper() == "SAME":
+            bone_map = {b.name: b.name for b in bones_t if src.data.bones.get(b.name) is not None}
+            how = "SAME"
+        elif isinstance(raw_map, str) and raw_map.upper() == "AUTO":
+            bone_map, how = _auto_map(src, tgt), "AUTO"
+        elif isinstance(raw_map, dict) and raw_map:
+            bad = [(t, s) for t, s in raw_map.items() if bones_t.get(t) is None or not isinstance(s, str)
+                   or src.data.bones.get(s) is None]
+            if bad:
+                raise MifOpError("map pairs name bones the armatures do not have (target: source): %s. %s"
+                                 % (bad[:10], tail))
+            bone_map, how = dict(raw_map), "explicit"
+        else:
+            raise MifOpError("map is 'SAME' (default in UNREAL: one skeleton, one set of names), 'AUTO' or "
+                             "{targetBone: sourceBone}. %s" % tail)
+        if not bone_map:
+            raise MifOpError("no bone of '%s' has a namesake in '%s' - they are not one skeleton; pass map. %s"
+                             % (tgt.name, src.name, tail))
+        fr = params.get("frameRange")
+        if fr is None:
+            start, end = (int(round(v)) for v in act.frame_range)
+        else:
+            if not isinstance(fr, list) or len(fr) != 2 or any(isinstance(v, bool) or not isinstance(v, int)
+                                                                for v in fr) or fr[1] < fr[0]:
+                raise MifOpError("frameRange is [start, end] whole frames, got %r. %s" % (fr, tail))
+            start, end = fr
+        reference = _parse_reference(params.get("reference"), ref_space, tgt, start, end, tail)
+        new_name = take(params, "newAction", default="%s_%s" % (act.name, tgt.name), kind=str)
+        return _bake_unreal(src, tgt, act, bone_map, how, mode_of, ratio, rel_t, start, end, new_name, samples,
+                            assign, reference, ref_space, Matrix, Vector, fbx, keep_source, imported)
+    finally:
+        if fbx is not None and not keep_source:
+            live_objs, live_acts = set(bpy.data.objects.keys()), set(bpy.data.actions.keys())
+            _remove_imported([o for o in imported[0] if o.name in live_objs],
+                             [a for a in imported[1] if a.name in live_acts])
+
+
+def _bake_unreal(src, tgt, act, bone_map, how, mode_of, ratio, rel_t, start, end, new_name, samples, assign,
+                 reference, ref_space, Matrix, Vector, fbx, keep_source, imported):
+    scene = bpy.context.scene
+    s_ad, t_ad = src.animation_data, tgt.animation_data
+    saved = (s_ad.action if s_ad else None, t_ad.action if t_ad else None, scene.frame_current,
+             {pb.name: pb.matrix_basis.copy() for pb in tgt.pose.bones})
+    order = [b for b in _ordered(tgt) if b.name in bone_map]
+    new = bpy.data.actions.new(new_name)
+    wanted = {}
+    prev_q = {}
+    try:
+        _assign(src, act)
+        _assign(tgt, new)
+        for pb in tgt.pose.bones:
+            pb.matrix_basis = Matrix.Identity(4)
+        for f in range(start, end + 1):
+            scene.frame_set(f)
+            spose = {pb.name: pb.matrix.copy() for pb in src.pose.bones}
+            want_f = {}
+            for b in order:
+                sb = src.data.bones[bone_map[b.name]]
+                loc, rot, sca = _local(spose, sb).decompose()
+                m = mode_of[b.name]
+                t = rel_t[b.name].translation if m == "SKELETON" else (
+                    loc * ratio[b.name] if m == "ANIMATION_SCALED" else loc)
+                want = Matrix.Translation(t) @ rot.to_matrix().to_4x4() @ Matrix.Diagonal(sca.to_4d())
+                want_f[b.name] = (rot.copy(), Vector(t))
+                bl, bq, bs = (rel_t[b.name].inverted_safe() @ want).decompose()
+                if b.name in prev_q:
+                    bq.make_compatible(prev_q[b.name])
+                prev_q[b.name] = bq.copy()
+                pb = tgt.pose.bones[b.name]
+                pb.location = bl
+                pb.keyframe_insert("location", frame=f, group=b.name)
+                _write_rotation(pb, bq, f, b.name)
+                pb.scale = bs
+                pb.keyframe_insert("scale", frame=f, group=b.name)
+            wanted[f] = want_f
+        # THE MEASUREMENT, off the target evaluated from its new keys: each bone's local rotation and translation
+        # against what the clip asked for that frame.
+        steps = sorted({int(round(start + (end - start) * i / (samples - 1))) for i in range(samples)})
+        err = {b.name: [0.0, 0.0] for b in order}
+        for f in steps:
+            scene.frame_set(f)
+            tpose = {pb.name: pb.matrix.copy() for pb in tgt.pose.bones}
+            for b in order:
+                tl, tq, _ts = _local(tpose, b).decompose()
+                wq, wt = wanted[f][b.name]
+                d = tq.rotation_difference(wq).angle
+                err[b.name][0] = max(err[b.name][0], math.degrees(min(d, 2 * math.pi - d)))
+                err[b.name][1] = max(err[b.name][1], (tl - wt).length)
+        ref_out = None
+        if reference:
+            per, worst = [], None
+            mw = tgt.matrix_world
+            for f in sorted(reference):
+                scene.frame_set(f)
+                top = None
+                for bn, p in reference[f].items():
+                    head = tgt.pose.bones[bn].head
+                    got = (mw @ head) if ref_space == "WORLD" else head
+                    dist = (got - Vector(p)).length
+                    if top is None or dist > top[1]:
+                        top = (bn, dist)
+                    if worst is None or dist > worst["difference"]:
+                        worst = {"frame": f, "bone": bn, "difference": round(dist, 6), "got": [round(v, 6) for v in got],
+                                 "reference": list(p)}
+                per.append({"frame": f, "bones": len(reference[f]), "maxDifference": round(top[1], 6),
+                            "worstBone": top[0]})
+            ref_out = {"space": ref_space, "frames": per, "maxDifference": worst["difference"], "worst": worst}
+    except Exception:
+        _assign(tgt, saved[1])
+        bpy.data.actions.remove(new)
+        for n, mtx in saved[3].items():
+            tgt.pose.bones[n].matrix_basis = mtx
+        raise
+    finally:
+        if src.name in bpy.data.objects:
+            _assign(src, saved[0])
+        scene.frame_set(saved[2])
+    if not assign:
+        _assign(tgt, saved[1])
+        new.use_fake_user = True
+    rows = [{"target": b.name, "source": bone_map[b.name], "translationMode": mode_of[b.name],
+             "maxErrorDeg": round(err[b.name][0], 4), "maxTranslationError": round(err[b.name][1], 6)}
+            for b in order]
+    for r in rows:
+        if r["translationMode"] == "ANIMATION_SCALED":
+            r["scale"] = round(ratio[r["target"]], 6)
+    worst = max((r["maxErrorDeg"] for r in rows), default=0.0)
+    out = {"mode": "UNREAL", "source": src.name if fbx is None else None, "fbx": fbx, "target": tgt.name,
+           "action": act.name if fbx is None or keep_source else None, "sourceAction": act.name,
+           "newAction": new.name, "map": how, "frameStart": start, "frameEnd": end, "bonesBaked": len(rows),
+           "bones": rows, "maxErrorDeg": round(worst, 4),
+           "maxTranslationError": round(max((r["maxTranslationError"] for r in rows), default=0.0), 6),
+           "translationModes": {m: sum(1 for r in rows if r["translationMode"] == m)
+                                for m in ("ANIMATION", "SKELETON", "ANIMATION_SCALED")},
+           "unmappedTarget": sorted(b.name for b in tgt.data.bones if b.name not in bone_map)[:200],
+           "assigned": assign, "framesMeasured": steps, "reference": ref_out}
+    if fbx is not None:
+        out["sourceKept"] = keep_source
+        if keep_source:
+            out["sourceArmature"] = src.name
+            out["imported"] = [o.name for o in imported[0]]
+    if worst > 1.0:
+        out["warning"] = ("a bone's local rotation differs from the clip's by up to %.2f degrees - a constraint or driver "
+                          "on the target, or a bone that does not inherit rotation" % worst)
     return out
 
 

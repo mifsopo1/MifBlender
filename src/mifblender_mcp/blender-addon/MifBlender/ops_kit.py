@@ -29,9 +29,11 @@ fbx_type is "LodGroup", which Blender's FBX exporter writes as the node's type (
 5.8:993-1030). The source object stays LOD0 under its own name, so hulls named UCX_<name>_NN still attach
 (FbxStaticMeshImport.cpp 5.8:588-598 and 2707-2745 match a hull to its mesh node's name).
 """
+import json
 import math
 import os
 import random
+import re
 import time
 
 import bmesh
@@ -52,11 +54,12 @@ BUILD_KIT_PIECE_PARAMS = (
     "name", "kind", "opening", "module", "length", "height", "width", "thickness", "openingWidth", "openingHeight",
     "sillHeight", "openingOffset", "pivot", "bevel", "bevelSegments", "trim", "uvTileCm", "color", "material",
     "trimColor", "trimMaterial", "gridCm", "collision", "location", "rotation", "collection", "slatPitch",
-    "hoodRadius", "hardware", "louver", "minThicknessCm",
+    "hoodRadius", "hardware", "louver", "minThicknessCm", "corner",
 )
 VERTEX_RULE_PARAMS = (
     "object", "rule", "name", "channel", "range", "invert", "combine", "seed", "element", "distance", "rays",
-    "space", "makeActive", "dirt", "group", "adjust", "weightCombine",
+    "space", "makeActive", "dirt", "group", "adjust", "weightCombine", "noise", "facing", "distanceTo", "attributeType",
+    "fromMaterial",
 )
 _DIRT_KEYS = {"blurStrength", "blurIterations", "cleanAngle", "dirtAngle", "dirtOnly", "normalize"}
 LOD_CHAIN_PARAMS = ("object", "ratios", "file", "overwrite")
@@ -75,6 +78,10 @@ _KIT_NOTES = {
     "materials": "slot 0 is the surface (material or color), slot 1 the trim (trimMaterial or trimColor); a floor, "
                  "or a piece with trim false, has slot 0 only.",
     "roundness": "bevel (cm) and bevelSegments set how the edges are rounded; bevel 0 leaves hard edges.",
+    "legs": "a corner's legs are length (along X) and width (along Y), in modules, measured on its grid faces.",
+    "cornerType": "spelt corner: outer (the grid faces meet at the convex corner) or inner (at the concave one).",
+    "outer": "pass kind corner with corner outer (the default) or inner.",
+    "inner": "pass kind corner with corner inner.",
 }
 _VCOL_NOTES = {
     "by": "the rule is 'rule': up, height, cavity or random.",
@@ -96,7 +103,10 @@ _LOD_NOTES = {
     "mode": "the chain decimates by edge collapse, which is the mode that takes a ratio.",
 }
 
-_KINDS = ("wall", "floor", "pillar", "shutter", "door_leaf")
+_KINDS = ("wall", "floor", "pillar", "shutter", "door_leaf", "corner")
+# A CORNER is an L of two wall legs: which of its faces lies on the grid through the pivot - the convex one (outer) or
+# the concave one (inner)
+_CORNERS = ("outer", "inner")
 # WHAT FILLS AN OPENING is built in the frame of the wall it fills - the same length, height, thickness, opening,
 # offset, trim and pivot - so it lands in that wall's opening on that wall actor's transform
 _INFILL = ("shutter", "door_leaf")
@@ -110,6 +120,7 @@ _DEFAULTS = {
     "pillar": {"height": 3.0, "thickness": 40.0, "bevel": 1.5, "pivot": "center"},
     "shutter": {"length": 4.0, "height": 3.0, "thickness": 12.0, "bevel": 0.3, "pivot": "corner"},
     "door_leaf": {"length": 4.0, "height": 3.0, "thickness": 12.0, "bevel": 0.3, "pivot": "corner"},
+    "corner": {"length": 2.0, "width": 2.0, "height": 3.0, "thickness": 12.0, "bevel": 1.0, "pivot": "corner"},
 }
 _OPENING_DEFAULTS = {"door": (110.0, 220.0, 0.0), "window": (100.0, 120.0, 90.0)}   # width, height, sill (cm)
 # TRIM IN CENTIMETERS. Each moulding is two steps - a board and a thicker band on its outer edge - because one flat
@@ -468,7 +479,10 @@ def _part_bmesh(part):
         bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
         return bm
     us, vs, keep = part["us"], part["vs"], part["keep"]
-    w0, w1 = part["w"]
+    # ws: the extrusion's own lines, w0 to w1. A side face is split at each one, so a corner's legs, extruded up z, carry
+    # the grid lines up their faces a wall's slab carries across its face
+    ws = list(part.get("ws") or part["w"])
+    top = len(ws) - 1
     to_xyz = part["to_xyz"]
     verts = {}
 
@@ -476,7 +490,7 @@ def _part_bmesh(part):
         key = (i, j, side)
         v = verts.get(key)
         if v is None:
-            v = bm.verts.new(to_xyz(us[i], vs[j], (w0, w1)[side]))
+            v = bm.verts.new(to_xyz(us[i], vs[j], ws[side]))
             verts[key] = v
         return v
 
@@ -487,15 +501,26 @@ def _part_bmesh(part):
         for j in range(len(vs) - 1):
             if not keep[i][j]:
                 continue
-            for side in (0, 1):
+            for side in (0, top):
                 bm.faces.new([vert(i, j, side), vert(i + 1, j, side), vert(i + 1, j + 1, side), vert(i, j + 1, side)])
             # the four cell edges: (a, b) grid points and the neighbor across them
             for (a, b), (ni, nj) in ((((i, j), (i + 1, j)), (i, j - 1)), (((i + 1, j), (i + 1, j + 1)), (i + 1, j)),
                                      (((i + 1, j + 1), (i, j + 1)), (i, j + 1)), (((i, j + 1), (i, j)), (i - 1, j))):
                 if not kept(ni, nj):
-                    bm.faces.new([vert(a[0], a[1], 0), vert(b[0], b[1], 0), vert(b[0], b[1], 1), vert(a[0], a[1], 1)])
+                    for k in range(top):
+                        bm.faces.new([vert(a[0], a[1], k), vert(b[0], b[1], k), vert(b[0], b[1], k + 1),
+                                      vert(a[0], a[1], k + 1)])
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
     return bm
+
+
+def _on_plane(co, sq):
+    """Is the point on a square plane: (axis index, value) - an axis-aligned plane - or ((nx, ny, nz), d), n . co = d
+    (a mitre). In cm, to 1e-6."""
+    if isinstance(sq[0], int):
+        return abs(co[sq[0]] - sq[1]) < 1e-6
+    n, d = sq
+    return abs(n[0] * co[0] + n[1] * co[1] + n[2] * co[2] - d) < 1e-6
 
 
 def _bevel_part(bm, offset, segments, square=()):
@@ -506,7 +531,7 @@ def _bevel_part(bm, offset, segments, square=()):
         return set()
 
     def on_square(e):
-        return any(all(abs(v.co[ax] - val) < 1e-6 for v in e.verts) for ax, val in square)
+        return any(all(_on_plane(v.co, sq) for v in e.verts) for sq in square)
     edges = [e for e in bm.edges if len(e.link_faces) == 2 and e.calc_face_angle(0.0) > math.radians(1.0)
              and not on_square(e)]
     if not edges:
@@ -517,10 +542,69 @@ def _bevel_part(bm, offset, segments, square=()):
         # A SQUARE BACK GATHERS THE BEVELLED SIDE EDGES' ENDS, so it comes out an n-gon (KP103 found 4 on a plain wall):
         # it is split into triangles - it lies against the slab, where nothing sees how it is cut
         ngons = [f for f in bm.faces if len(f.verts) > 4 and any(
-            all(abs(v.co[ax] - val) < 1e-6 for v in f.verts) for ax, val in square)]
+            all(_on_plane(v.co, sq) for v in f.verts) for sq in square)]
         if ngons:
             bmesh.ops.triangulate(bm, faces=ngons, quad_method="BEAUTY", ngon_method="BEAUTY")
     return set(out.get("faces") or [])
+
+
+def _prism(foot, z0, z1, bevel, name, slot, square=()):
+    """A closed solid standing from z0 to z1 on a footprint of four (x, y) points - a board cut at an angle at its
+    end, which a box cannot be. Six quads; _part_bmesh recalculates the normals outward."""
+    verts = [(x, y, z) for z in (z0, z1) for x, y in foot]
+    faces = [[0, 1, 2, 3], [4, 5, 6, 7], [0, 1, 5, 4], [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7]]
+    return {"mesh": (verts, faces), "bevel": bevel, "name": name, "slot": slot, "square": tuple(square)}
+
+
+def _corner_frame(spec):
+    """The corner's L in cm, in the space of _kit_parts: (o, t, LA, LB) - the slab is [o, LA] x [o, o + t] (the leg
+    along X) and [o, o + t] x [o + t, LB] (the leg along Y). Outer: o 0, so the grid faces y 0 and x 0 are the outside
+    faces and meet at the convex corner, the pivot. Inner: o -t, so they are the inside faces and meet at the concave
+    corner. Either way each leg is length (or width) modules along its grid face, the face a straight wall's back face
+    continues."""
+    t = spec["thickness"]
+    o = 0.0 if spec["corner"] == "outer" else -t
+    return o, t, spec["lengthCm"], spec["widthCm"]
+
+
+# THE MITRE PLANE, x - y = 0: every board of a corner meets its twin from the other leg on it, at the outside corner and
+# the inside one, so the joint closes with no gap and no overlap - each board stops on the plane its twin starts from
+_MITRE = ((1.0, -1.0, 0.0), 0.0)
+
+
+def _corner_parts(spec):
+    """A corner: the L-shaped slab as ONE closed solid - extruded up z, its faces split on the grid like a wall's - with
+    the plinth and its band on both faces of both legs, each board mitred where it meets the other leg's (a 45 degree
+    cut on the plane x - y = 0, on the outside of the corner and the inside), and two box hulls that abut at the joint."""
+    o, t, la, lb = _corner_frame(spec)
+    height, grid, bev = spec["heightCm"], spec["gridCm"], spec["bevel"]
+    trim_bev = min(bev, 0.5)
+    near = (0.0, _SUPPORT_OUT) if (spec["trim"] and grid > 0.0) else ()
+    xs = _with_grid((o, o + t, la), grid)
+    ys = _with_grid((o, o + t, lb), grid)
+    zs = _with_grid(_with_lines((0.0, height), [_PLINTH_H + d for d in near]), grid)
+    keep = [[(xs[i] + xs[i + 1]) / 2.0 < o + t or (ys[j] + ys[j + 1]) / 2.0 < o + t for j in range(len(ys) - 1)]
+            for i in range(len(xs) - 1)]
+    slab = _cells(xs, ys, keep, 0.0, height, _along_z, bev, "slab", 0)
+    slab["ws"] = zs
+    parts = [slab]
+    if spec["trim"]:
+        a_end, b_end = la - _END_INSET, lb - _END_INSET
+        oi = o + t                                    # the inside faces' plane on both legs
+        for z0, z1, p in ((0.0, _PLINTH_H - _BEAD_H, _PLINTH_PROUD), (_PLINTH_H - _BEAD_H, _PLINTH_H, _BEAD_PROUD)):
+            # OUTSIDE: each leg's board runs past the slab's outside corner by its own proudness to the mitre
+            parts.append(_prism(((o - p, o - p), (a_end, o - p), (a_end, o), (o, o)), z0, z1, trim_bev, "plinth", 1,
+                                ((1, o), _MITRE)))
+            parts.append(_prism(((o - p, o - p), (o, o), (o, b_end), (o - p, b_end)), z0, z1, trim_bev, "plinth", 1,
+                                ((0, o), _MITRE)))
+            # INSIDE: each leg's board stops at the inside corner on the same plane
+            parts.append(_prism(((oi, oi), (a_end, oi), (a_end, oi + p), (oi + p, oi + p)), z0, z1, trim_bev,
+                                "plinth", 1, ((1, oi), _MITRE)))
+            parts.append(_prism(((oi, oi), (oi + p, oi + p), (oi + p, b_end), (oi, b_end)), z0, z1, trim_bev,
+                                "plinth", 1, ((0, oi), _MITRE)))
+    # THE HULLS ABUT AT THE JOINT: the X leg's box takes the corner square, the Y leg's starts on its inside face
+    hulls = [(o, la, o, o + t, 0.0, height), (o, o + t, o + t, lb, 0.0, height)]
+    return parts, hulls
 
 
 def _kit_parts(spec):
@@ -531,6 +615,8 @@ def _kit_parts(spec):
         return _shutter_parts(spec)
     if kind == "door_leaf":
         return _leaf_parts(spec)
+    if kind == "corner":
+        return _corner_parts(spec)
     trim_bev = min(bev, 0.5)
     parts, hulls = [], []
     if kind == "wall":
@@ -655,6 +741,27 @@ def _kit_parts(spec):
                               height - cap_h - cstep_h, height - cap_h, bev, "capital", 1))
         hulls.append((0.0, t, 0.0, t, 0.0, height))
     return parts, hulls
+
+
+def _corner_report(mesh, spec):
+    """A corner's own read-back: the legs as asked, and the slab's faces measured on the built mesh - the grid faces at
+    y 0 and x 0 and each leg's end - from the surface slot's vertices."""
+    o, t, la, lb = _corner_frame(spec)
+    idx = {i for p in mesh.polygons if p.material_index == 0 for i in p.vertices}
+    co = [mesh.vertices[i].co * 100.0 for i in idx]
+    out = {"corner": spec["corner"], "legsCm": {"x": round(la, 3), "y": round(lb, 3)},
+           "gridFaces": ("the outside faces y 0 (the leg along X) and x 0 (the leg along Y): a straight wall's back face "
+                         "continues each" if spec["corner"] == "outer" else
+                         "the inside faces y 0 (the leg along X) and x 0 (the leg along Y): a straight wall's back face "
+                         "continues each"),
+           "legEnds": {"x": "x %g cm, the leg's end face, from y %g to %g" % (la, o, o + t),
+                       "y": "y %g cm, the leg's end face, from x %g to %g" % (lb, o, o + t)},
+           "mitre": "every plinth and band board meets its twin from the other leg on the plane x - y = 0"}
+    if co:
+        out["slabBoundsCm"] = {"min": [round(min(c[k] for c in co), 3) for k in range(3)],
+                               "max": [round(max(c[k] for c in co), 3) for k in range(3)],
+                               "measuredBy": "the surface slot's vertices (the slab)"}
+    return out
 
 
 def _clear_opening(spec):
@@ -896,6 +1003,9 @@ def _kit_name(spec):
         size = (spec["openingWidth"], spec["openingHeight"])
     elif kind == "floor":
         label, size = "Floor", (spec["lengthCm"], spec["widthCm"])
+    elif kind == "corner":
+        label = "WallCornerOuter" if spec["corner"] == "outer" else "WallCornerInner"
+        size = (spec["lengthCm"], spec["widthCm"], spec["heightCm"])
     else:
         label, size = "Pillar", (spec["thickness"], spec["heightCm"])
     dims = "x".join(("%d" % round(s)) if abs(s - round(s)) < 1e-6 else ("%g" % s).replace(".", "p") for s in size)
@@ -1056,8 +1166,17 @@ def op_build_kit_piece(params):
     stamped chevron louver. Every part is a closed solid; a thin formed sheet is capped with quads between its two
     runs, never an n-gon that triangulates into fans. Slot 0 is the curtain or leaf, slot 1 the hardware.
 
+    A CORNER (2026-11-26): kind corner is an L of two wall legs as one closed slab - an outside or inside corner of a
+    room or a building - with the plinth and its band mitred round it on both faces (each board cut at 45 degrees on
+    the plane x - y = 0 and meeting its twin from the other leg there, with no gap and no overlap), one surface slot and
+    one trim slot, and two UCX_ box hulls that abut at the joint. corner outer puts the convex corner on the pivot, so
+    the two outside faces (y 0 and x 0) are the grid faces; corner inner puts the concave corner there, so the inside
+    faces are. Each leg is length (along +X) or width (along +Y) modules measured on its grid face, the face a straight
+    wall's back face continues from the leg's end.
+
     params:
-      kind (str)            wall (default), floor, pillar, shutter, door_leaf
+      kind (str)            wall (default), floor, pillar, shutter, door_leaf, corner
+      corner (str)          a corner's: outer (default) or inner - which faces meet at the pivot and lie on the grid
       opening (str)         none (default), door, window - a wall; a shutter door (default) or window; a door_leaf door
       slatPitch (cm)        a shutter's slat pitch, default 6.7; 3 to 15
       hoodRadius (cm)       the rounding of a shutter hood's front, default 8; 0 (square) to 15
@@ -1065,9 +1184,9 @@ def op_build_kit_piece(params):
                             and drip cap; default true
       louver (bool)         a door leaf's stamped louver, default false
       module (cm)           the grid, default 100; 10 to 1000
-      length (modules)      a wall's or a floor's length along X, default 4
-      height (modules)      a wall's or a pillar's height, default 3
-      width (modules)       a floor's depth along Y, default 4
+      length (modules)      a wall's or a floor's length along X, default 4; a corner's leg along X, default 2
+      height (modules)      a wall's, a corner's or a pillar's height, default 3
+      width (modules)       a floor's depth along Y, default 4; a corner's leg along Y, default 2
       thickness (cm)        a wall's (default 12) or a floor's (default 7) slab, or a pillar's side (default 40)
       openingWidth, openingHeight (cm)   the CLEAR opening, default 110 x 220 (door) or 100 x 120 (window); the
                             lining sits outside it in the slab's reveal. The reply's clearOpeningCm is it measured on
@@ -1124,18 +1243,27 @@ def op_build_kit_piece(params):
                        ("louver", ("door_leaf",))):
         if params.get(key) is not None and kind not in kinds:
             raise MifOpError("'%s' shapes a %s; kind is '%s'. NOTHING was created." % (key, " or ".join(kinds), kind))
+    if params.get("corner") is not None and kind != "corner":
+        raise MifOpError("'corner' says which faces of a corner piece lie on the grid; kind is '%s'. NOTHING was "
+                         "created." % kind)
     if kind == "shutter" and params.get("gridCm") is not None:
         raise MifOpError("gridCm adds lines across a slab's face; a shutter's slats have no slab face. NOTHING was "
                          "created.")
     module = take_float(params, "module", default=100.0)
     if not 10.0 <= module <= 1000.0:
         raise MifOpError("module is %g cm; it must be 10 to 1000 cm. NOTHING was created." % module)
-    used = {"floor": ("length", "width"), "pillar": ("height",)}.get(kind, ("length", "height"))
+    used = {"floor": ("length", "width"), "pillar": ("height",),
+            "corner": ("length", "width", "height")}.get(kind, ("length", "height"))
     for key in ("length", "height", "width"):
         if key not in used and params.get(key) is not None:
             raise MifOpError("'%s' does not size a %s (it takes %s). NOTHING was created."
                              % (key, kind, " and ".join(used)))
     spec = {"kind": kind, "opening": opening, "module": module}
+    if kind == "corner":
+        corner = take(params, "corner", default="outer", kind=str)
+        if corner not in _CORNERS:
+            raise MifOpError("corner must be one of %s, got '%s'. NOTHING was created." % (", ".join(_CORNERS), corner))
+        spec["corner"] = corner
     for key in used:
         count = take_float(params, key, default=d[key])
         cm = count * module
@@ -1151,6 +1279,9 @@ def op_build_kit_piece(params):
     if walled and t > min(spec["lengthCm"], spec["heightCm"]) / 2.0:
         raise MifOpError("thickness %g cm is more than half the wall's shorter side; that is a block, not a wall. "
                          "NOTHING was created." % t)
+    if kind == "corner" and t > min(spec["lengthCm"], spec["widthCm"], spec["heightCm"]) / 2.0:
+        raise MifOpError("thickness %g cm is more than half the corner's shortest side; each leg would be a block, not "
+                         "a wall. NOTHING was created." % t)
     if kind == "pillar" and t > spec["heightCm"]:
         raise MifOpError("a pillar %g cm thick and %g cm tall is wider than it is tall. NOTHING was created."
                          % (t, spec["heightCm"]))
@@ -1192,6 +1323,9 @@ def op_build_kit_piece(params):
     pivot = take(params, "pivot", default=d["pivot"], kind=str)
     if pivot not in _PIVOTS:
         raise MifOpError("pivot must be one of %s, got '%s'. NOTHING was created." % (", ".join(_PIVOTS), pivot))
+    if kind == "corner" and pivot != "corner":
+        raise MifOpError("a corner's pivot is its corner - where its two grid faces meet, the point a straight wall's "
+                         "pivot continues from - so pivot is corner, not '%s'. NOTHING was created." % pivot)
     spec["pivot"] = pivot
     bev = take_float(params, "bevel", default=d["bevel"])
     bev_max = min(t * 0.3, 1.0) if kind in _INFILL else t * 0.3
@@ -1322,7 +1456,9 @@ def op_build_kit_piece(params):
                     "floor": {"corner": "a bottom corner of the slab", "side": "the middle of its -Y edge, at the bottom",
                               "center": "the center of its underside"},
                     "pillar": {"corner": "the shaft's bottom corner", "side": "the middle of the shaft's -Y side, at "
-                               "the bottom", "center": "the shaft's bottom center"}}.get(kind, {
+                               "the bottom", "center": "the shaft's bottom center"},
+                    "corner": {"corner": "the %s corner, where the grid faces y 0 and x 0 meet, at the bottom"
+                               % ("convex" if spec.get("corner") == "outer" else "concave")}}.get(kind, {
                         "corner": "the bottom corner of the wall it fills (x 0, y 0 at the wall's back face, z 0)",
                         "side": "the middle of that wall's back face, at the bottom",
                         "center": "that wall's bottom center"})[pivot],
@@ -1364,6 +1500,8 @@ def op_build_kit_piece(params):
                 "measure it before relying on it"
                 % ("unmeasurable" if measured is None else "%g x %g cm" % (measured["width"], measured["height"]),
                    spec["openingWidth"], spec["openingHeight"]))
+    if kind == "corner":
+        out.update(_corner_report(mesh, spec))
     if min_t is not None:
         out["minThicknessCm"] = min_t
         out["belowMinThickness"] = out.get("thicknessCm") is not None and out["thicknessCm"] < min_t
@@ -1374,8 +1512,998 @@ def op_build_kit_piece(params):
     return out
 
 
+# ---------------------------------------------------------------------------------------------------------- build_stairs
+# A STRAIGHT FLIGHT AS A KIT PIECE (2026-11-26): a generator built its stairs with create_mesh. The engine's numbers the
+# defaults are set from, read in each engine's source (UE 5.3-5.8) and the repo's the internal notes:
+#   UCharacterMovementComponent MaxStepHeight 45 cm (CharacterMovementComponent.cpp 5.3 :551, 5.4 :604, 5.5 :659,
+#     5.6 :681, 5.7 :679, 5.8 :689) - the tallest step a character walks up
+#   its WalkableFloorZ 0.71 (5.3 :544, 5.8 :682), acos 0.71 = 44.77 degrees - the steepest surface it walks on
+#   the navmesh agent's AgentMaxStepHeight 35 cm and AgentMaxSlope 44 degrees (BaseEngine.ini RecastNavMesh, the same on
+#     5.3-5.8: the internal notes)
+# THE HULL IS A RAMP, the usual game collision for a flight: its top runs through every tread's nosing, so a foot stands
+# on the treads, not in them, and its front is one riser high - the one step a character takes onto it. So two numbers
+# must hold: the riser under the step heights (45 a character's, 35 a navmesh agent's, the tighter) and the ramp's slope,
+# the flight's pitch, under the slopes (44.77 and 44). The default step count keeps each riser at most 18 cm - about half
+# the agent's 35 - and the default flight's pitch is 31 degrees.
+BUILD_STAIRS_PARAMS = (
+    "name", "module", "rise", "run", "width", "steps", "side", "nosing", "treadThickness", "bevel", "bevelSegments",
+    "uvTileCm", "gridCm", "color", "material", "trimColor", "trimMaterial", "collision", "location", "rotation",
+    "collection",
+)
+_STAIRS_NOTES = {
+    "height": "a flight's height is rise, in modules (rise 3 at module 100 is 300 cm).",
+    "length": "a flight's horizontal length is run, in modules.",
+    "depth": "a flight's horizontal length is run, in modules.",
+    "stepCount": "spelt steps: how many risers the flight has.",
+    "riser": "a riser is rise / steps; pass steps to set it.",
+    "tread": "a tread's going is run / steps; pass run and steps to set it.",
+    "stringer": "pass side stringer (two side boards, open beneath) or solid (the default, solid to the floor).",
+    "railing": "a flight has no railing; this op builds the flight.",
+    "pivot": "the pivot is the bottom of the first riser's face, on the flight's -X side: x 0, y 0, z 0.",
+    "kind": "this op builds a straight flight; build_kit_piece builds the walls, floors and corners round it.",
+}
+_STAIR_SIDES = ("solid", "stringer")
+_STEP_HEIGHT_CM = 45.0            # UCharacterMovementComponent MaxStepHeight (above)
+_WALKABLE_DEG = math.degrees(math.acos(0.71))
+_NAV_STEP_CM, _NAV_SLOPE_DEG = 35.0, 44.0
+_DEFAULT_RISER_CM = 18.0
+_STRINGER_T, _STRINGER_DEPTH, _STRINGER_OVER = 4.0, 28.0, 6.0     # a stringer's thickness, its depth across the pitch,
+#                                                                   and how far it stands above the nosing line
+
+
+def _stairs_dims(spec):
+    """The flight in cm: riser, going, the ramp's slope, and for stringers where their outline breaks. One place, so a
+    refusal and the geometry cannot disagree."""
+    n, rise, run = spec["steps"], spec["riseCm"], spec["runCm"]
+    r, g = rise / n, run / n
+    out = {"riser": r, "going": g, "pitchDeg": math.degrees(math.atan2(r, g)),
+           # the ramp hull's top runs through the nosings, so it slopes as the flight does
+           "rampDeg": math.degrees(math.atan2(r, g))}
+    if spec["side"] == "stringer":
+        s, nos, m = r / g, spec["nosing"], _STRINGER_OVER
+        # deep enough that every tread's back foot is inside it: below the nosing line by a riser, the nosing's rise,
+        # the stand-over and the tread, and 1 cm more
+        dv = max(_STRINGER_DEPTH / math.cos(math.atan(s)), r + s * nos + m + spec["treadThickness"] + 1.0)
+        yf = -nos
+        yb = (dv - r - m) / s - nos                    # where its lower edge meets the floor
+        yk = (n - 1) * g - nos                         # where its upper edge levels off at the top
+        out["stringer"] = {"slope": s, "dv": dv, "yf": yf, "yb": yb, "yk": yk}
+    return out
+
+
+def _stringer_part(x0, x1, d, spec, name):
+    """One closed stringer from x0 to x1: its side outline (y, z) is a band along the pitch, standing _STRINGER_OVER cm
+    above the treads' nosing line, cut level on the floor and at the top, square at its foot and its head - three quads
+    a side between its lower chain and its upper one, so no n-gon is triangulated into a fan."""
+    st, r, nos, rise, run = d["stringer"], d["riser"], spec["nosing"], spec["riseCm"], spec["runCm"]
+    s, dv, yf, yb, yk = st["slope"], st["dv"], st["yf"], st["yb"], st["yk"]
+    m = _STRINGER_OVER
+
+    def top(y):
+        return min(rise + m, r + s * (y + nos) + m)
+
+    def low(y):
+        return max(0.0, r + s * (y + nos) + m - dv)
+    lower = [(yf, 0.0), (yb, 0.0), (yk, low(yk)), (run, low(run))]
+    upper = [(yf, top(yf)), (yb, top(yb)), (yk, top(yk)), (run, top(run))]
+    verts = []
+    for x in (x0, x1):
+        verts += [(x, y, z) for y, z in lower] + [(x, y, z) for y, z in upper]
+
+    def lo(i, side):
+        return side * 8 + i
+
+    def up(i, side):
+        return side * 8 + 4 + i
+    faces = []
+    for i in range(3):
+        faces.append([lo(i, 0), lo(i + 1, 0), up(i + 1, 0), up(i, 0)])         # the -X side
+        faces.append([lo(i, 1), up(i, 1), up(i + 1, 1), lo(i + 1, 1)])         # the +X side
+        faces.append([lo(i, 0), lo(i, 1), lo(i + 1, 1), lo(i + 1, 0)])         # the lower edge
+        faces.append([up(i, 0), up(i + 1, 0), up(i + 1, 1), up(i, 1)])         # the upper edge
+    faces.append([lo(0, 0), up(0, 0), up(0, 1), lo(0, 1)])                     # the foot's front
+    faces.append([lo(3, 0), lo(3, 1), up(3, 1), up(3, 0)])                     # the head
+    # EVERY EDGE BEVELLED, the foot and the head too: a square plane here left the side faces 5-gons where a bevelled
+    # edge met an unbevelled one (4 on the default flight, measured on 5.0.1)
+    return {"mesh": (verts, faces), "bevel": spec["bevel"], "name": name, "slot": 0}
+
+
+def _stairs_parts(spec):
+    """Every part in cm, the pivot's space: x across the flight from 0 to width, y up the flight from the first riser's
+    face (0) to the top (run), z up. Returns (parts, the ramp hull's corner points)."""
+    d = _stairs_dims(spec)
+    n, r, g = spec["steps"], d["riser"], d["going"]
+    w, nos, tt, grid = spec["widthCm"], spec["nosing"], spec["treadThickness"], spec["gridCm"]
+    trim_bev = min(spec["bevel"], 0.5)
+    parts = []
+    x0, x1 = 0.0, w
+    if spec["side"] == "solid":
+        # THE BODY: a staircase profile in (y, z) on its own grid - a column per step, from the floor to under its tread -
+        # extruded across the width; every face a quad, closed
+        ys = [g * k for k in range(n + 1)]
+        zs = sorted(set([0.0] + [r * (k + 1) - tt for k in range(n)]))
+        keep = [[zs[j + 1] <= r * (i + 1) - tt + 1e-6 for j in range(len(zs) - 1)] for i in range(n)]
+        body = _cells(ys, zs, keep, x0, x1, lambda u, v, ww: (ww, u, v), spec["bevel"], "body", 0)
+        body["ws"] = _with_grid((x0, x1), grid)
+        parts.append(body)
+    else:
+        parts.append(_stringer_part(x0, x0 + _STRINGER_T, d, spec, "stringer"))
+        parts.append(_stringer_part(x1 - _STRINGER_T, x1, d, spec, "stringer"))
+        x0, x1 = x0 + _STRINGER_T, x1 - _STRINGER_T
+    # THE TREADS, in the trim slot: a board per step, its nosing standing proud of the riser below; its back and bottom
+    # butt the next riser and its own step (square, no groove), and on stringers its ends butt the stringers
+    for k in range(n):
+        tread = _box(x0, x1, g * k - nos, g * (k + 1), r * (k + 1) - tt, r * (k + 1), trim_bev, "tread", 1)
+        tread["square"] = ((2, r * (k + 1) - tt), (1, g * (k + 1))) + (((0, x0), (0, x1)) if spec["side"] == "stringer"
+                                                                      else ())
+        parts.append(tread)
+    # THE RAMP: one riser up at the first nosing, through every nosing to the top tread's, level to the back
+    ramp = [(-nos, 0.0), (spec["runCm"], 0.0), (spec["runCm"], spec["riseCm"]), ((n - 1) * g - nos, spec["riseCm"]),
+            (-nos, r)]
+    hull = [(x, y, z) for x in (0.0, w) for y, z in ramp]
+    return parts, hull, d
+
+
+def _hull_points(name, pts_cm, shift, coll, obj):
+    """One UCX_ hull from the corners of a prism (cm) - one outline's points, then the same moved across -
+    made through bmesh's convex hull of the points and audited as _hull_box's are. (row, None) or (None, reason)."""
+    sx, sy, sz = shift
+    bm = bmesh.new()
+    try:
+        vs = [bm.verts.new(((x - sx) / 100.0, (y - sy) / 100.0, (z - sz) / 100.0)) for x, y, z in pts_cm]
+        res = bmesh.ops.convex_hull(bm, input=vs)
+        doomed = []
+        for key in ("geom_interior", "geom_unused", "geom_holes"):
+            for e in res.get(key, []):
+                if e not in doomed:
+                    doomed.append(e)
+        if doomed:
+            bmesh.ops.delete(bm, geom=doomed, context="VERTS")
+        bmesh.ops.dissolve_limit(bm, angle_limit=math.radians(0.5), verts=bm.verts[:], edges=bm.edges[:])
+        bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
+        mesh = bpy.data.meshes.new(name)
+        bm.to_mesh(mesh)
+    finally:
+        bm.free()
+    audit = _hull_audit(mesh)
+    bad = [k for k in ("boundaryEdges", "nonManifoldEdges", "looseVertices", "convexityViolations") if audit[k]]
+    if audit["eulerCharacteristic"] != 2 or audit["volume"] <= 1e-9 or audit["vertices"] > _UE_HULL_VERT_LIMIT:
+        bad.append("eulerCharacteristic, volume or vertex count")
+    if bad:
+        bpy.data.meshes.remove(mesh)
+        return None, "the hull %s failed its audit (%s): %s" % (name, ", ".join(bad), audit)
+    hull = bpy.data.objects.new(name, mesh)
+    hull.display_type = "WIRE"
+    hull.hide_render = True
+    coll.objects.link(hull)
+    hull.matrix_world = obj.matrix_world.copy()
+    return {"object": hull.name, "pointsCm": [[round(v, 3) for v in p] for p in pts_cm], "vertices": audit["vertices"],
+            "faces": len(mesh.polygons), "volumeM3": audit["volume"], "audit": "closed, manifold, convex"}, None
+
+
+def op_build_stairs(params):
+    """Build a straight stair flight as a kit piece: rise, run and width on the module grid and a step count, a solid side
+    (to the floor) or two stringers (open beneath), treads with a nosing, a surface slot and a trim slot (the treads),
+    UV0 in meters, a lightmap UV layer last and one UCX_ ramp hull - the usual game collision for a flight - read back
+    as build_kit_piece reads its pieces. Sizes are real: the object is in meters, built from centimeters.
+
+    THE DEFAULTS COME FROM THE ENGINE'S CHARACTER (module comment above): each riser at most 18 cm (the default step
+    count, ceil(rise / 18)), half the 35 cm a navmesh agent steps and well under the 45 cm a character does; the ramp
+    hull's slope is what a character and a navmesh walk, and the reply's walkable block measures both against the
+    engine's limits and warns past them - never a refusal: a steeper flight is a choice.
+
+    params:
+      module (cm)           the grid, default 100; 10 to 1000
+      rise (modules)        the flight's height, default 3 (300 cm at the default module)
+      run (modules)         its horizontal length, from the first riser's face to the top tread's back, default 5
+      width (modules)       across the flight, default 1
+      steps (int)           risers, default ceil(rise cm / 18); 2 to 100. Each riser is rise / steps, each going
+                            run / steps (the treads are as many as the risers: the top one is level with the floor above)
+      side (str)            solid (default: solid to the floor) or stringer (two 4 cm stringers, open beneath)
+      nosing (cm)           how far a tread stands proud of the riser below, default 2; 0 to 6
+      treadThickness (cm)   default 4; 1 to half a riser
+      bevel (cm), bevelSegments   as build_kit_piece; default 1 and 3 (the treads at most 0.5)
+      uvTileCm, gridCm      as build_kit_piece; gridCm splits the body's faces across the width
+      color, material       slot 0, the body or the stringers; trimColor, trimMaterial slot 1, the treads
+      collision (bool)      a UCX_<name>_00 ramp hull; default true
+      name (str)            default SM_Stairs_<width>x<run>x<rise>_01a, the first number free
+      location, rotation ([x,y,z] or {x,y,z}), collection
+    The pivot is the bottom of the first riser's face on the flight's -X side; the nosing of the first tread stands in
+    front of it, at y -nosing.
+    """
+    reject_unknown(params, BUILD_STAIRS_PARAMS, "build_stairs", _STAIRS_NOTES)
+    started = time.perf_counter()
+    module = take_float(params, "module", default=100.0)
+    if not 10.0 <= module <= 1000.0:
+        raise MifOpError("module is %g cm; it must be 10 to 1000 cm. NOTHING was created." % module)
+    spec = {"module": module, "kind": "stairs"}
+    for key, dflt in (("rise", 3.0), ("run", 5.0), ("width", 1.0)):
+        count = take_float(params, key, default=dflt)
+        cm = count * module
+        if count <= 0.0 or not 20.0 <= cm <= _MAX_SIDE_CM:
+            raise MifOpError("%s is %g modules (%g cm); it must be 20 to %g cm. NOTHING was created."
+                             % (key, count, cm, _MAX_SIDE_CM))
+        spec[key + "Cm"], spec[key + "Modules"] = cm, count
+    steps = take_int(params, "steps", default=max(2, math.ceil(spec["riseCm"] / _DEFAULT_RISER_CM - 1e-9)))
+    if not 2 <= steps <= 100:
+        raise MifOpError("steps is %d; a flight has 2 to 100 risers. NOTHING was created." % steps)
+    spec["steps"] = steps
+    side = take(params, "side", default="solid", kind=str)
+    if side not in _STAIR_SIDES:
+        raise MifOpError("side must be one of %s, got '%s'. NOTHING was created." % (", ".join(_STAIR_SIDES), side))
+    spec["side"] = side
+    riser, going = spec["riseCm"] / steps, spec["runCm"] / steps
+    nos = take_float(params, "nosing", default=2.0)
+    if not 0.0 <= nos <= 6.0:
+        raise MifOpError("nosing is %g cm; it must be 0 to 6 cm. NOTHING was created." % nos)
+    if nos >= going / 2.0:
+        raise MifOpError("nosing %g cm is half or more of a %g cm going; the treads would overhang each other's steps. "
+                         "NOTHING was created." % (nos, round(going, 3)))
+    spec["nosing"] = nos
+    tt = take_float(params, "treadThickness", default=4.0)
+    if not 1.0 <= tt <= riser / 2.0:
+        raise MifOpError("treadThickness is %g cm; it must be 1 cm to half a riser (%g cm). NOTHING was created."
+                         % (tt, round(riser / 2.0, 3)))
+    spec["treadThickness"] = tt
+    if side == "stringer" and spec["widthCm"] < 2.0 * _STRINGER_T + 20.0:
+        raise MifOpError("a flight %g cm wide has no room between its two %g cm stringers for a tread (at least %g cm). "
+                         "NOTHING was created." % (spec["widthCm"], _STRINGER_T, 2.0 * _STRINGER_T + 20.0))
+    bev = take_float(params, "bevel", default=1.0)
+    bev_max = round(0.3 * (_STRINGER_T if side == "stringer" else min(riser, going)), 3)
+    if not 0.0 <= bev <= bev_max:
+        raise MifOpError("bevel is %g cm; it must be 0 to %g cm (30%% of %s), or the rounding eats it. NOTHING was "
+                         "created." % (bev, bev_max, "a stringer's thickness" if side == "stringer" else "a step"))
+    spec["bevel"] = bev
+    segments = take_int(params, "bevelSegments", default=3)
+    if not 1 <= segments <= 8:
+        raise MifOpError("bevelSegments is %d; it must be 1 to 8. NOTHING was created." % segments)
+    grid = take_float(params, "gridCm", default=50.0)
+    if grid != 0.0 and not 5.0 <= grid <= 1000.0:
+        raise MifOpError("gridCm is %g; it must be 0 (no extra lines) or 5 to 1000 cm. NOTHING was created." % grid)
+    spec["gridCm"] = grid
+    tile = take_float(params, "uvTileCm", default=200.0)
+    if not 10.0 <= tile <= 10000.0:
+        raise MifOpError("uvTileCm is %g; it must be 10 to 10000 cm per repeat. NOTHING was created." % tile)
+    d = _stairs_dims(spec)
+    if side == "stringer" and not d["stringer"]["yf"] < d["stringer"]["yb"] < d["stringer"]["yk"] < spec["runCm"]:
+        raise MifOpError("this flight is too short for stringers: %d steps of %g x %g cm leave a stringer no length "
+                         "between its foot and its head. Pass more steps, or side solid. NOTHING was created."
+                         % (steps, round(riser, 3), round(going, 3)))
+    color = _color3(params, "color", (0.55, 0.54, 0.52))
+    trim_color = _color3(params, "trimColor", (0.36, 0.27, 0.19))
+    materials = []
+    for mkey, ckey in (("material", "color"), ("trimMaterial", "trimColor")):
+        mat_name = take(params, mkey, kind=str)
+        if mat_name is not None and params.get(ckey) is not None:
+            raise MifOpError("'%s' reuses an existing material and '%s' colors the one made here; pass one. NOTHING "
+                             "was created." % (mkey, ckey))
+        if mat_name is not None and bpy.data.materials.get(mat_name) is None:
+            raise MifOpError("no material named '%s'. NOTHING was created." % mat_name)
+        materials.append(bpy.data.materials.get(mat_name) if mat_name is not None else None)
+    want_hull = take_bool(params, "collision", default=True)
+    name = take(params, "name", kind=str)
+    if name is None:
+        dims = "x".join(("%d" % round(v)) if abs(v - round(v)) < 1e-6 else ("%g" % v).replace(".", "p")
+                        for v in (spec["widthCm"], spec["runCm"], spec["riseCm"]))
+        taken = {o.name for o in bpy.data.objects}
+        name = next((nm for nm in ("SM_Stairs_%s_%02da" % (dims, k) for k in range(1, 100))
+                     if nm not in taken and "UCX_%s_00" % nm not in taken), None)
+        if name is None:
+            raise MifOpError("SM_Stairs_%s_01a to _99a are all taken. Pass 'name'. NOTHING was created." % dims)
+    else:
+        if not name.strip() or any(ord(ch) < 32 for ch in name):
+            raise MifOpError("name cannot be empty or hold a control character, got %r. NOTHING was created." % name)
+        if name in bpy.data.objects:
+            raise MifOpError("an object named '%s' already exists; Blender would name this one '%s.001', and a kit "
+                             "piece's name is its asset name. NOTHING was created." % (name, name))
+    if want_hull and len(name) > 56:
+        raise MifOpError("name is %d characters; with collision on it can be at most 56, so UCX_<name>_00 fits the "
+                         "63 characters Blender keeps in a name. NOTHING was created." % len(name))
+    if want_hull and ("UCX_%s_00" % name) in bpy.data.objects:
+        raise MifOpError("UCX_%s_00 already exists, so the hull would be suffixed .001 and attach to nothing. Remove it, "
+                         "pass another name, or collision false. NOTHING was created." % name)
+    try:
+        placed = _place_values(params)
+    except MifOpError as exc:
+        raise MifOpError("%s. NOTHING was created." % str(exc).rstrip("."))
+    coll = _resolve_collection(params)
+
+    parts, hull_pts, d = _stairs_parts(spec)
+    shift = (0.0, 0.0, 0.0)
+    bm = _assemble(parts, shift, segments)
+    mesh = bpy.data.meshes.new(name)
+    try:
+        bm.to_mesh(mesh)
+    finally:
+        bm.free()
+    if hasattr(mesh, "use_auto_smooth"):
+        mesh.use_auto_smooth = True
+        mesh.auto_smooth_angle = math.pi
+    _box_uvs(mesh, tile / 100.0)
+    mesh.update()
+    obj = bpy.data.objects.new(name, mesh)
+    _link_new(obj, coll)
+    _place(obj, placed)
+    slots = []
+    for i, mat in enumerate(materials):
+        made_mat = mat is None
+        if made_mat:
+            mat = _kit_material("M_%s%s" % (name, "_Trim" if i else ""), trim_color if i else color, trim=bool(i))
+        mesh.materials.append(mat)
+        slots.append({"slot": i, "part": "treads" if i else ("stringers" if side == "stringer" else "body"),
+                      "material": mat.name, "made": made_mat})
+    lm, lm_row, method = _lightmap_layer(obj)
+    mesh.uv_layers.active = mesh.uv_layers["UVMap"]
+    try:
+        mesh.uv_layers["UVMap"].active_render = True
+    except (AttributeError, TypeError):
+        pass
+    hulls, hull_notes = [], []
+    if want_hull:
+        row, note = _hull_points("UCX_%s_00" % name, hull_pts, shift, coll, obj)
+        if row:
+            hulls.append(row)
+        else:
+            hull_notes.append(note)
+
+    out = _created(obj, coll, "MESH", "build_stairs", params.get("name"))
+    co = [v.co for v in mesh.vertices]
+    lo = [min(c[i] for c in co) for i in range(3)]
+    hi = [max(c[i] for c in co) for i in range(3)]
+    largest = max(t - b for t, b in zip(hi, lo))
+    # THE TREADS AS BUILT, measured on the trim slot's faces that look up: each one's height, so the riser the reply
+    # states is the one the mesh has
+    tops = sorted({round(sum(mesh.vertices[i].co.z for i in p.vertices) / len(p.vertices) * 100.0, 3)
+                   for p in mesh.polygons if p.material_index == 1 and p.normal.z > 0.99})
+    warnings = []
+    if d["riser"] > _NAV_STEP_CM:
+        warnings.append("each riser is %g cm, over the %g cm a navmesh agent steps (AgentMaxStepHeight)%s - and the "
+                        "ramp hull starts one riser up, so that is the step onto it; pass more steps"
+                        % (round(d["riser"], 3), _NAV_STEP_CM, " and the %g cm a character does (MaxStepHeight)"
+                           % _STEP_HEIGHT_CM if d["riser"] > _STEP_HEIGHT_CM else ""))
+    if d["rampDeg"] > _NAV_SLOPE_DEG:
+        warnings.append("the ramp hull slopes %g degrees, over the navmesh's %g (AgentMaxSlope)%s: an agent cannot walk "
+                        "it - lengthen the run, or lower the rise"
+                        % (round(d["rampDeg"], 2), _NAV_SLOPE_DEG,
+                           " and a character's %g (WalkableFloorZ 0.71)" % round(_WALKABLE_DEG, 2)
+                           if d["rampDeg"] > _WALKABLE_DEG else ""))
+    out.update({
+        "kind": "stairs", "side": side, "moduleCm": module,
+        "sidesCm": {"rise": spec["riseCm"], "run": spec["runCm"], "width": spec["widthCm"]},
+        "onModule": {k: abs(spec[k + "Modules"] - round(spec[k + "Modules"])) < 1e-6 for k in ("rise", "run", "width")},
+        "steps": steps, "riserCm": round(d["riser"], 4), "goingCm": round(d["going"], 4), "nosingCm": nos,
+        "treadThicknessCm": tt, "pitchDeg": round(d["pitchDeg"], 3),
+        "treadTopsCm": tops,
+        "walkable": {"rampDeg": round(d["rampDeg"], 3), "riserCm": round(d["riser"], 4),
+                     "characterMaxStepHeightCm": _STEP_HEIGHT_CM, "characterWalkableFloorDeg": round(_WALKABLE_DEG, 3),
+                     "navAgentMaxStepHeightCm": _NAV_STEP_CM, "navAgentMaxSlopeDeg": _NAV_SLOPE_DEG,
+                     "character": d["rampDeg"] <= _WALKABLE_DEG and d["riser"] <= _STEP_HEIGHT_CM,
+                     "navmesh": d["rampDeg"] <= _NAV_SLOPE_DEG
+                     and d["riser"] <= _NAV_STEP_CM,
+                     "source": "UE 5.3-5.8 UCharacterMovementComponent defaults and BaseEngine.ini RecastNavMesh"},
+        "pivot": "corner", "pivotAt": "the bottom of the first riser's face, on the flight's -X side (x 0, y 0, z 0)",
+        "boundsLocalCm": {"min": [round(v * 100.0, 3) for v in lo], "max": [round(v * 100.0, 3) for v in hi]},
+        "parts": [p["name"] for p in parts], "bevelCm": bev, "bevelSegments": segments, "gridCm": grid,
+        "vertices": len(mesh.vertices), "faces": len(mesh.polygons),
+        "triangles": sum(len(p.vertices) - 2 for p in mesh.polygons),
+        "ngons": sum(1 for p in mesh.polygons if len(p.vertices) > 4),
+        "uvLayers": [u.name for u in mesh.uv_layers],
+        "uv0": {"name": "UVMap", "projection": "box, in meters", "cmPerRepeat": tile},
+        "lightmap": {"layer": _LIGHTMAP_LAYER, "index": len(mesh.uv_layers) - 1, "method": method,
+                     "lightmapReady": bool(lm_row.get("lightmapReady")), "reason": lm_row.get("lightmapReadyReason"),
+                     "islands": lm_row.get("islandCount"), "resolutionSuggested": _lightmap_res(largest),
+                     "unwrapWarnings": (lm or {}).get("warnings") or None},
+        "materialSlots": slots, "collisionHulls": hulls, "collisionNotes": hull_notes or None,
+        "warnings": warnings or None,
+        "elapsedSeconds": round(time.perf_counter() - started, 2),
+    })
+    return out
+
+
+# --------------------------------------------------------------------------------------------- build_railing, build_sign
+# A RAILING AND A SIGN AS KIT PIECES (2026-11-26): a generator had neither. The dimensions they are built to, each from
+# the reference that sets it (the defaults; every one can be passed):
+#   GUARD HEIGHT 106.7 cm - IBC 2021 1015.3: a guard is at least 42 in (1067 mm) above the walking surface; IRC R312.1.2
+#     allows 36 in (914 mm) in a dwelling, and UK Approved Document K 900-1100 mm. Measured vertically to the rail's top,
+#     from the path (on a stair, the nosing line).
+#   OPENINGS UNDER 10.16 cm - IBC 1015.4 and IRC R312.1.3: no opening in a guard passes a 4 in (102 mm) sphere (ADK the
+#     same 100 mm). So the clear gap between balusters, and the gap under the bottom rail, stay under it by default.
+#   THE TOP RAIL 4.5 cm ROUND - IBC 1014.3.1 Type I handrail: a circular section 1-1/4 to 2 in (32-51 mm) across, so the
+#     top rail is graspable; IBC 1014.2 puts a handrail 34-38 in (864-965 mm) up, which is height 90 for a stair handrail.
+#   POSTS 8.9 cm, AT MOST 183 cm APART - the American Wood Council's DCA 6 (prescriptive residential wood deck guide):
+#     4x4 guard posts (3.5 in, 89 mm) at no more than 6 ft (1829 mm) on centre.
+# A railing is posts, rails and balusters along a path of points; a pitched segment (a stair's) keeps its posts and
+# balusters plumb and measures every height vertically. Round parts are build_tube's sweep (its ring and caps), square
+# ones the same ring of four turned square.
+#   A SIGN PLATE 61 x 30.5 cm - MUTCD 2009 Table 2D-1, D3-1 street name sign: width varies with the legend x 12 in
+#     (305 mm) on a conventional road, 8 in the minimum; no standard fixes a wall sign's plate, so the same default.
+#   WHERE IT HANGS: wall - its centre at 137 cm, the middle of ADA 2010 703.4.1's band (the baseline of the lowest tactile
+#     character at least 48 in, 1220 mm, the highest at most 60 in, 1525 mm); post - its bottom at 213.4 cm, MUTCD 2A.18's
+#     7 ft where pedestrians or parking are likely (5 ft, 152.4 cm, rural); projecting - its bottom at 203.2 cm, ADA
+#     307.4's 80 in (2030 mm) headroom, since ADA 307.2 lets an object 27-80 in up stand only 4 in into a route.
+BUILD_RAILING_PARAMS = (
+    "name", "points", "height", "postSpacing", "postSize", "profile", "railProfile", "railSize", "bottomRail",
+    "bottomClearance", "infill", "balusterSize", "balusterGap", "sides", "bevel", "bevelSegments", "uvTileCm", "color",
+    "material", "trimColor", "trimMaterial", "collision", "location", "rotation", "collection",
+)
+BUILD_SIGN_PARAMS = (
+    "name", "width", "height", "thickness", "face", "faceDepth", "border", "twoSided", "mount", "mountHeight",
+    "standoff", "postSize", "armLength", "profile", "sides", "bevel", "bevelSegments", "uvTileCm", "color", "material",
+    "trimColor", "trimMaterial", "collision", "location", "rotation", "collection",
+)
+_RAILING_NOTES = {
+    "path": "spelt points: [[x, y, z], ...] in meters, the walking surface the railing stands on.",
+    "length": "a railing's length is its path: pass points (default [[0, 0, 0], [2, 0, 0]]).",
+    "balusterSpacing": "pass balusterGap, the largest clear gap in cm; the balusters are spread evenly to keep under it.",
+    "spacing": "postSpacing (cm, posts at most that far apart) or balusterGap (cm, the clear gap).",
+    "handrail": "the top rail is the handrail: railProfile round and railSize 3.2-5.1 cm keep it graspable.",
+    "stairs": "pass the flight's nosing line as points: [[x, -nosing, riser], [x, (steps - 1) x going - nosing, rise]] "
+              "in meters, from build_stairs' reply.",
+}
+_SIGN_NOTES = {
+    "size": "pass width and height in cm.",
+    "text": "this op builds the plate; the face is its own material slot (slot 1) for a texture or decal.",
+    "mounting": "spelt mount: wall, post, projecting or none.",
+    "inset": "pass face inset (a recessed panel inside a border) or raised (a panel standing proud).",
+    "depth": "thickness is the plate's, faceDepth how far the face is recessed or raised.",
+}
+_RAIL_PROFILES = ("square", "round")
+_RAIL_INFILL = ("balusters", "none")
+_GUARD_CM, _SPHERE_CM, _IRC_GUARD_CM = 106.68, 10.16, 91.44
+_GRASP_CM = (3.175, 5.08)
+_SIGN_FACES = ("inset", "raised")
+_SIGN_MOUNTS = ("wall", "post", "projecting", "none")
+_SIGN_HEIGHT = {"wall": 137.16, "post": 213.36, "projecting": 203.2, "none": 0.0}
+
+
+def _kit_name_free(label, dims):
+    """SM_<label>_<dims>_NNa, the first number free with no UCX_ hull of that name either."""
+    tag = "x".join(("%d" % round(v)) if abs(v - round(v)) < 1e-6 else ("%g" % round(v, 2)).replace(".", "p")
+                   for v in dims)
+    taken = {o.name for o in bpy.data.objects}
+    for k in range(1, 100):
+        nm = "SM_%s_%s_%02da" % (label, tag, k)
+        if nm not in taken and not any(o.startswith("UCX_%s_" % nm) for o in taken):
+            return nm
+    raise MifOpError("SM_%s_%s_01a to _99a are all taken. Pass 'name'. NOTHING was created." % (label, tag))
+
+
+def _kit_common(params, op, label, dims, color_default, trim_default):
+    """What every kit builder reads alike, before anything is made: materials or colors for slot 0 and slot 1, the name
+    (and its hull name), the placement and the collection. Returns a dict; every refusal ends NOTHING was created."""
+    out = {"color": _color3(params, "color", color_default), "trimColor": _color3(params, "trimColor", trim_default)}
+    mats = []
+    for mkey, ckey in (("material", "color"), ("trimMaterial", "trimColor")):
+        mat_name = take(params, mkey, kind=str)
+        if mat_name is not None and params.get(ckey) is not None:
+            raise MifOpError("'%s' reuses an existing material and '%s' colors the one made here; pass one. NOTHING "
+                             "was created." % (mkey, ckey))
+        if mat_name is not None and bpy.data.materials.get(mat_name) is None:
+            raise MifOpError("no material named '%s'. NOTHING was created." % mat_name)
+        mats.append(bpy.data.materials.get(mat_name) if mat_name is not None else None)
+    out["materials"] = mats
+    out["hull"] = take_bool(params, "collision", default=True)
+    name = take(params, "name", kind=str)
+    if name is None:
+        name = _kit_name_free(label, dims)
+    else:
+        if not name.strip() or any(ord(ch) < 32 for ch in name):
+            raise MifOpError("name cannot be empty or hold a control character, got %r. NOTHING was created." % name)
+        if name in bpy.data.objects:
+            raise MifOpError("an object named '%s' already exists; Blender would name this one '%s.001', and a kit "
+                             "piece's name is its asset name. NOTHING was created." % (name, name))
+        if out["hull"] and any(o.name.startswith("UCX_%s_" % name) for o in bpy.data.objects):
+            raise MifOpError("a UCX_%s_ hull already exists, so a new hull would be suffixed .001 and attach to "
+                             "nothing. Remove it, pass another name, or collision false. NOTHING was created." % name)
+    if out["hull"] and len(name) > 56:
+        raise MifOpError("name is %d characters; with collision on it can be at most 56, so UCX_<name>_NN fits the 63 "
+                         "characters Blender keeps in a name. NOTHING was created." % len(name))
+    out["name"] = name
+    out["requested"] = params.get("name")
+    try:
+        out["placed"] = _place_values(params)
+    except MifOpError as exc:
+        raise MifOpError("%s. NOTHING was created." % str(exc).rstrip("."))
+    out["coll"] = _resolve_collection(params)
+    segments = take_int(params, "bevelSegments", default=2)
+    if not 1 <= segments <= 8:
+        raise MifOpError("bevelSegments is %d; it must be 1 to 8. NOTHING was created." % segments)
+    out["segments"] = segments
+    tile = take_float(params, "uvTileCm", default=200.0)
+    if not 10.0 <= tile <= 10000.0:
+        raise MifOpError("uvTileCm is %g; it must be 10 to 10000 cm per repeat. NOTHING was created." % tile)
+    out["tile"] = tile
+    return out
+
+
+def _kit_finish(c, parts, hulls_cm, op, slot_parts):
+    """Build the parts into one mesh object in meters, the kit's way (build_stairs'): slot 0 and slot 1 materials, UV0
+    box-projected in meters, the lightmap layer last, and UCX_<name>_NN hulls from point sets (cm, convex hulls,
+    audited). Returns the reply's shared fields."""
+    name, coll = c["name"], c["coll"]
+    bm = _assemble(parts, (0.0, 0.0, 0.0), c["segments"])
+    mesh = bpy.data.meshes.new(name)
+    try:
+        bm.to_mesh(mesh)
+    finally:
+        bm.free()
+    if hasattr(mesh, "use_auto_smooth"):
+        mesh.use_auto_smooth = True
+        mesh.auto_smooth_angle = math.pi
+    _box_uvs(mesh, c["tile"] / 100.0)
+    mesh.update()
+    obj = bpy.data.objects.new(name, mesh)
+    _link_new(obj, coll)
+    _place(obj, c["placed"])
+    slots = []
+    for i, mat in enumerate(c["materials"]):
+        made_mat = mat is None
+        if made_mat:
+            mat = _kit_material("M_%s%s" % (name, "_Trim" if i else ""), c["trimColor"] if i else c["color"],
+                                trim=bool(i))
+        mesh.materials.append(mat)
+        slots.append({"slot": i, "part": slot_parts[i], "material": mat.name, "made": made_mat})
+    lm, lm_row, method = _lightmap_layer(obj)
+    mesh.uv_layers.active = mesh.uv_layers["UVMap"]
+    try:
+        mesh.uv_layers["UVMap"].active_render = True
+    except (AttributeError, TypeError):
+        pass
+    hulls, notes = [], []
+    if c["hull"]:
+        for k, (label, pts) in enumerate(hulls_cm):
+            row, note = _hull_points("UCX_%s_%02d" % (name, k), pts, (0.0, 0.0, 0.0), coll, obj)
+            if row:
+                row["covers"] = label
+                hulls.append(row)
+            else:
+                notes.append(note)
+    out = _created(obj, coll, "MESH", op, c["requested"])
+    co = [v.co for v in mesh.vertices]
+    lo = [min(v[i] for v in co) for i in range(3)]
+    hi = [max(v[i] for v in co) for i in range(3)]
+    out.update({
+        "boundsLocalCm": {"min": [round(v * 100.0, 3) for v in lo], "max": [round(v * 100.0, 3) for v in hi]},
+        "parts": sorted({p["name"] for p in parts}), "vertices": len(mesh.vertices), "faces": len(mesh.polygons),
+        "triangles": sum(len(p.vertices) - 2 for p in mesh.polygons),
+        "ngons": sum(1 for p in mesh.polygons if len(p.vertices) > 4),
+        "uvLayers": [u.name for u in mesh.uv_layers],
+        "uv0": {"name": "UVMap", "projection": "box, in meters", "cmPerRepeat": c["tile"]},
+        "lightmap": {"layer": _LIGHTMAP_LAYER, "index": len(mesh.uv_layers) - 1, "method": method,
+                     "lightmapReady": bool(lm_row.get("lightmapReady")), "reason": lm_row.get("lightmapReadyReason"),
+                     "islands": lm_row.get("islandCount"),
+                     "resolutionSuggested": _lightmap_res(max(t - b for t, b in zip(hi, lo))),
+                     "unwrapWarnings": (lm or {}).get("warnings") or None},
+        "materialSlots": slots, "collisionHulls": hulls, "collisionNotes": notes or None,
+    })
+    return out
+
+
+def _bar(cx, cy, z0, z1, size, heading, profile, sides, bevel, name, slot):
+    """A plumb bar from z0 to z1 round (cx, cy): square (size across, its faces along heading, radians in plan) or round
+    (size the diameter, `sides` even, capped by quads)."""
+    if profile == "round":
+        return _cyl(cx, cy, size / 2.0, z0, z1, sides, lambda u, v, w: (u, v, w), name, slot)
+    c, s, h = math.cos(heading), math.sin(heading), size / 2.0
+    ring = [(cx + c * a - s * b, cy + s * a + c * b) for a, b in ((-h, -h), (h, -h), (h, h), (-h, h))]
+    verts = [(x, y, z0) for x, y in ring] + [(x, y, z1) for x, y in ring]
+    faces = [[0, 3, 2, 1], [4, 5, 6, 7]] + [[k, (k + 1) % 4, 4 + (k + 1) % 4, 4 + k] for k in range(4)]
+    return {"mesh": (verts, faces), "bevel": bevel, "name": name, "slot": slot}
+
+
+def _swept(pts, size, profile, sides, name, slot):
+    """A rail along pts (cm): build_tube's sweep and flat caps, round (size the diameter) or square (its ring of four
+    turned square, size across)."""
+    vecs = [Vector(p) for p in pts]
+    if profile == "round":
+        verts, faces, _uvs, _al = _tube_sweep(vecs, False, size / 2.0, sides, 1.0, "FLAT")
+    else:
+        verts, faces, _uvs, _al = _tube_sweep(vecs, False, size / math.sqrt(2.0), 4, 1.0, "FLAT", phase=math.pi / 4)
+    return {"mesh": (verts, faces), "bevel": 0.0, "name": name, "slot": slot}
+
+
+def op_build_railing(params):
+    """Build a railing as a kit piece: posts, a top rail, a bottom rail and balusters along a path of points, the top
+    rail and bottom rail in the trim slot, UV0 in meters, the lightmap layer last and a UCX_ hull per bay - read back as
+    build_stairs reads its flight. The sizes default to the building codes (module comment above): a 106.7 cm guard,
+    openings under a 10.16 cm sphere, a graspable 4.5 cm round top rail, 8.9 cm posts at most 183 cm apart. Past a code
+    number the reply warns; it never refuses - a lower rail is a choice.
+
+    params:
+      points ([[x,y,z],...]) the walking surface it stands on, in meters, two or more (default [[0,0,0],[2,0,0]]). A
+                             segment that climbs is a stair's pitch: posts and balusters stay plumb and every height is
+                             measured vertically from the path. Each segment at least 20 cm in plan, at most 60 degrees
+      height (cm)            the top rail's top above the path, default 106.68 (IBC 1015.3, 42 in); 40 to 200
+      postSpacing (cm)       posts at every point and at most this far apart between, default 182.88 (DCA 6, 6 ft)
+      postSize (cm)          default 8.9 (a 4x4); profile square (default) or round, for posts and balusters
+      railProfile, railSize  the top and bottom rails: round (default) or square, 4.5 cm across by default
+      bottomRail (bool)      default true; bottomClearance (cm) its underside above the path, default 5
+      infill                 balusters (default) or none; balusterSize (cm) default 2, balusterGap (cm) the largest
+                             clear gap between them, default 10 (IBC 1015.4's sphere is 10.16)
+      sides (int)            a round part's ring, default 16, even, 6 to 64
+      bevel (cm), bevelSegments  the square posts' and balusters' edges, default 0.5 and 2
+      uvTileCm, color, material (slot 0: posts and balusters), trimColor, trimMaterial (slot 1: the rails),
+      collision (default true), name (default SM_Railing_<plan length>x<height>_01a), location, rotation, collection
+    The pivot is the path's own origin: the points are in the object's local space.
+    """
+    reject_unknown(params, BUILD_RAILING_PARAMS, "build_railing", _RAILING_NOTES)
+    started = time.perf_counter()
+    raw = params.get("points")
+    if raw is None:
+        raw = [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]]
+    if not isinstance(raw, (list, tuple)) or len(raw) < 2 or len(raw) > 200 or any(
+            not isinstance(p, (list, tuple)) or len(p) != 3 for p in raw):
+        raise MifOpError("points must be 2 to 200 [x, y, z] in meters. NOTHING was created.")
+    pts = [tuple(v * 100.0 for v in finite_floats(list(p), "points")) for p in raw]
+    segs = []
+    for i in range(len(pts) - 1):
+        (ax, ay, az), (bx, by, bz) = pts[i], pts[i + 1]
+        plan = math.hypot(bx - ax, by - ay)
+        if plan < 20.0:
+            raise MifOpError("points %d and %d are %g cm apart in plan; a railing segment needs at least 20 cm. "
+                             "NOTHING was created." % (i, i + 1, round(plan, 3)))
+        slope = math.degrees(math.atan2(abs(bz - az), plan))
+        if slope > 60.0:
+            raise MifOpError("the segment from point %d climbs %g degrees; a railing follows a path or a stair's pitch "
+                             "up to 60 degrees. NOTHING was created." % (i, round(slope, 2)))
+        segs.append({"a": pts[i], "b": pts[i + 1], "plan": plan, "dir": ((bx - ax) / plan, (by - ay) / plan),
+                     "slope": slope, "dz": (bz - az) / plan})
+    height = take_float(params, "height", default=_GUARD_CM)
+    if not 40.0 <= height <= 200.0:
+        raise MifOpError("height is %g cm; it must be 40 to 200 cm. NOTHING was created." % height)
+    spacing = take_float(params, "postSpacing", default=182.88)
+    if not 30.0 <= spacing <= 400.0:
+        raise MifOpError("postSpacing is %g cm; it must be 30 to 400 cm. NOTHING was created." % spacing)
+    profile = take(params, "profile", default="square", kind=str)
+    rprofile = take(params, "railProfile", default="round", kind=str)
+    for key, val in (("profile", profile), ("railProfile", rprofile)):
+        if val not in _RAIL_PROFILES:
+            raise MifOpError("%s must be one of %s, got '%s'. NOTHING was created." % (key, ", ".join(_RAIL_PROFILES),
+                                                                                     val))
+    ps = take_float(params, "postSize", default=8.9)
+    rs = take_float(params, "railSize", default=4.5)
+    bs = take_float(params, "balusterSize", default=2.0)
+    for key, val, lo, hi in (("postSize", ps, 2.0, 30.0), ("railSize", rs, 1.0, 20.0), ("balusterSize", bs, 0.5, 15.0)):
+        if not lo <= val <= hi:
+            raise MifOpError("%s is %g cm; it must be %g to %g cm. NOTHING was created." % (key, val, lo, hi))
+    if rs > ps or bs > ps:
+        raise MifOpError("railSize %g and balusterSize %g cm must not be wider than the %g cm posts they run between. "
+                         "NOTHING was created." % (rs, bs, ps))
+    # A SQUARE BAR AS WIDE AS THE SQUARE BAR IT RUNS INTO shares its side planes with it, which z-fights
+    infill_asked = params.get("infill", "balusters") == "balusters"
+    for what, a, b in (("rail", rs, ps), ("baluster", bs, rs)):
+        if rprofile == "square" and profile == "square" and abs(a - b) < 0.2 and (what == "rail" or infill_asked):
+            raise MifOpError("a square %g cm %s into a square %g cm %s puts their side faces in one plane, which "
+                             "z-fights; make one narrower or round. NOTHING was created."
+                             % (a, what, b, "post" if what == "rail" else "rail"))
+    bottom = take_bool(params, "bottomRail", default=True)
+    clear = take_float(params, "bottomClearance", default=5.0)
+    if params.get("bottomClearance") is not None and not bottom:
+        raise MifOpError("bottomClearance places the bottom rail; pass bottomRail true or drop it. NOTHING was created.")
+    if not 0.5 <= clear <= 60.0:
+        raise MifOpError("bottomClearance is %g cm; it must be 0.5 to 60 cm. NOTHING was created." % clear)
+    infill = take(params, "infill", default="balusters", kind=str)
+    if infill not in _RAIL_INFILL:
+        raise MifOpError("infill must be one of %s, got '%s'. NOTHING was created." % (", ".join(_RAIL_INFILL), infill))
+    gap = take_float(params, "balusterGap", default=10.0)
+    if infill == "none" and (params.get("balusterGap") is not None or params.get("balusterSize") is not None):
+        raise MifOpError("balusterGap and balusterSize set the balusters; infill none has none. NOTHING was created.")
+    if not 2.0 <= gap <= 50.0:
+        raise MifOpError("balusterGap is %g cm; it must be 2 to 50 cm. NOTHING was created." % gap)
+    sides = take_int(params, "sides", default=16)
+    if not 6 <= sides <= 64 or sides % 2:
+        raise MifOpError("sides is %d; it must be even, 6 to 64. NOTHING was created." % sides)
+    bev = take_float(params, "bevel", default=0.5)
+    bev_max = round(0.3 * min(ps, bs if infill == "balusters" else ps), 3)
+    if not 0.0 <= bev <= bev_max:
+        raise MifOpError("bevel is %g cm; it must be 0 to %g cm (30%% of the thinnest square bar). NOTHING was created."
+                         % (bev, bev_max))
+    worst = max(s["slope"] for s in segs)
+    hv = rs / 2.0 / math.cos(math.radians(worst))
+    room = height - 2.0 * hv - ((clear + 2.0 * hv) if bottom else 0.0)
+    if room < 10.0:
+        raise MifOpError("a %g cm railing leaves %g cm between its rails (each %g cm deep measured plumb on the "
+                         "steepest segment); it needs at least 10. NOTHING was created."
+                         % (height, round(room, 2), round(2.0 * hv, 3)))
+    total = sum(s["plan"] for s in segs)
+    c = _kit_common(params, "build_railing", "Railing", (total, height), (0.32, 0.32, 0.33), (0.22, 0.2, 0.19))
+
+    def hv_of(seg):
+        return rs / 2.0 / math.cos(math.radians(seg["slope"]))
+
+    # THE POSTS: at every point, and evenly between where a segment is longer than postSpacing
+    posts = []
+    for i, s in enumerate(segs):
+        k = max(1, int(math.ceil(s["plan"] / spacing - 1e-9)))
+        for j in range(k):
+            t = j / k
+            p = tuple(s["a"][m] + (s["b"][m] - s["a"][m]) * t for m in range(3))
+            if j == 0 and i > 0:
+                d0, d1 = segs[i - 1]["dir"], s["dir"]
+                head = math.atan2(d0[1] + d1[1], d0[0] + d1[0])
+            else:
+                head = math.atan2(s["dir"][1], s["dir"][0])
+            posts.append({"at": p, "heading": head, "seg": i, "t": t})
+    last = segs[-1]
+    posts.append({"at": last["b"], "heading": math.atan2(last["dir"][1], last["dir"][0]), "seg": len(segs) - 1,
+                  "t": 1.0})
+    parts = []
+    top_hv = [hv_of(s) for s in segs]
+    for p in posts:
+        x, y, z = p["at"]
+        # each post stops at the top rail's centre line, inside the rail
+        parts.append(_bar(x, y, z, z + height - top_hv[p["seg"]], ps, p["heading"], profile, sides, bev, "post", 0))
+    # THE TOP RAIL: one run along the path, its top `height` above it, carried 1 cm past the end posts' outer faces
+    ext = ps / 2.0 + 1.0
+    line = []
+    for i, p in enumerate(pts):
+        hvv = top_hv[0] if i == 0 else top_hv[-1] if i == len(pts) - 1 else max(top_hv[i - 1], top_hv[i])
+        line.append([p[0], p[1], p[2] + height - hvv])
+    f, b = segs[0], segs[-1]
+    line[0] = [line[0][0] - f["dir"][0] * ext, line[0][1] - f["dir"][1] * ext, line[0][2] - f["dz"] * ext]
+    line[-1] = [line[-1][0] + b["dir"][0] * ext, line[-1][1] + b["dir"][1] * ext, line[-1][2] + b["dz"] * ext]
+    parts.append(_swept(line, rs, rprofile, sides, "topRail", 1))
+    # BAYS between posts: the bottom rail butts into each post, the balusters between it and the top rail
+    gaps, n_bal, bays, hulls = [], 0, [], []
+    pen_post = max(0.5, rs * rs / (4.0 * ps) + 0.2) if profile == "round" else 0.5
+    for a, q in zip(posts, posts[1:]):
+        s = segs[q["seg"]] if q["t"] > 0 else segs[a["seg"]]
+        ax, ay, az = a["at"]
+        qx, qy, qz = q["at"]
+        span = math.hypot(qx - ax, qy - ay)
+        hvs = hv_of(s)
+        ux, uy = (qx - ax) / span, (qy - ay) / span
+
+        def at(d, ax=ax, ay=ay, az=az, ux=ux, uy=uy, dz=s["dz"]):
+            return ax + ux * d, ay + uy * d, az + dz * d
+        if bottom:
+            d0, d1 = ps / 2.0 - pen_post, span - ps / 2.0 + pen_post
+            p0, p1 = at(d0), at(d1)
+            parts.append(_swept([[p0[0], p0[1], p0[2] + clear + hvs], [p1[0], p1[1], p1[2] + clear + hvs]], rs,
+                                rprofile, sides, "bottomRail", 1))
+        row = {"fromPost": posts.index(a), "spanCm": round(span, 3), "balusters": 0, "clearGapCm": None}
+        if infill == "balusters":
+            clear_len = span - ps
+            n = max(0, int(math.ceil((clear_len - gap) / (bs + gap) - 1e-9)))
+            g = (clear_len - n * bs) / (n + 1)
+            tilt = abs(s["dz"]) * bs / 2.0
+            curve = (rs / 2.0 - math.sqrt(max(0.0, (rs / 2.0) ** 2 - (bs / 2.0) ** 2))) if rprofile == "round" else 0.0
+            pen = 0.5 + tilt + curve
+            for j in range(n):
+                d = ps / 2.0 + g * (j + 1) + bs * j + bs / 2.0
+                x, y, z = at(d)
+                z0 = (z + clear + 2.0 * hvs - pen) if bottom else z
+                z1 = z + height - 2.0 * hvs + pen
+                parts.append(_bar(x, y, z0, z1, bs, math.atan2(uy, ux), profile, sides, bev, "baluster", 0))
+            n_bal += n
+            gaps.append(g)
+            row.update({"balusters": n, "clearGapCm": round(g, 4)})
+        under = clear if bottom else (height - 2.0 * hvs)
+        row["underBottomRailCm"] = round(under, 4)
+        bays.append(row)
+        w = max(ps, rs, bs) / 2.0
+        nx, ny = -uy * w, ux * w
+        hulls.append(("bay %d" % (len(bays) - 1), [
+            (px + sx * nx, py + sx * ny, pz + h) for (px, py, pz) in ((ax, ay, az), (qx, qy, qz))
+            for sx in (-1.0, 1.0) for h in (0.0, height)]))
+    out = _kit_finish(c, parts, hulls, "build_railing", ["posts and balusters", "rails"])
+    warnings = []
+    if height < _IRC_GUARD_CM - 1e-6:
+        warnings.append("the top rail is %g cm up, under the 91.44 cm (36 in) a guard needs even in a dwelling (IRC "
+                        "R312.1.2; IBC 1015.3 asks 106.68)" % height)
+    elif height < _GUARD_CM - 1e-6:
+        warnings.append("the top rail is %g cm up: a dwelling's 91.44 cm guard (IRC R312.1.2), under IBC 1015.3's "
+                        "106.68 cm elsewhere" % height)
+    big = [g for g in gaps if g >= _SPHERE_CM]
+    if big:
+        warnings.append("a clear gap between balusters is %g cm, which passes the 10.16 cm (4 in) sphere a guard must "
+                        "stop (IBC 1015.4)" % round(max(big), 3))
+    if infill == "none":
+        warnings.append("infill none leaves the space between the rails open: a guard needs balusters, panels or rails "
+                        "that stop a 10.16 cm sphere (IBC 1015.4)")
+    elif bottom and clear >= _SPHERE_CM:
+        warnings.append("the bottom rail's underside is %g cm up, which passes the 10.16 cm sphere (IBC 1015.4)" % clear)
+    elif not bottom:
+        warnings.append("with no bottom rail the balusters stand on the path; a gap there is the path's own")
+    if not _GRASP_CM[0] - 1e-6 <= rs <= _GRASP_CM[1] + 1e-6 or rprofile != "round":
+        warnings.append("the top rail is %s %g cm: a handrail that must be graspable is round and 3.18-5.08 cm across "
+                        "(IBC 1014.3.1 Type I)" % (rprofile, rs))
+    out.update({
+        "kind": "railing", "heightCm": height, "pathPoints": len(pts), "planLengthCm": round(total, 3),
+        "steepestDeg": round(worst, 3), "profile": profile, "railProfile": rprofile, "postSizeCm": ps, "railSizeCm": rs,
+        "posts": len(posts), "postSpacingMaxCm": spacing,
+        "postSpacingCm": [round(r["spanCm"], 3) for r in bays],
+        "infill": infill, "balusters": n_bal, "balusterSizeCm": bs if infill == "balusters" else None,
+        "maxClearGapCm": round(max(gaps), 4) if gaps else None, "bottomRail": bottom,
+        "bottomClearanceCm": clear if bottom else None, "bays": bays,
+        "pivot": "the path's origin: points are local, in meters",
+        "codes": {"guardHeightCm": _GUARD_CM, "dwellingGuardHeightCm": _IRC_GUARD_CM, "openingSphereCm": _SPHERE_CM,
+                  "graspableRoundCm": list(_GRASP_CM), "postSpacingCm": 182.88,
+                  "source": "IBC 2021 1014.2, 1014.3.1, 1015.3, 1015.4; IRC R312.1.2-3; AWC DCA 6"},
+        "warnings": warnings or None, "elapsedSeconds": round(time.perf_counter() - started, 2),
+    })
+    return out
+
+
+def op_build_sign(params):
+    """Build a sign as a kit piece: a plate with an inset or raised face (its own slot, for a texture or decal), on its
+    mounting - flat on a wall (or held off it on four standoffs), on a post, or projecting from a wall on an arm - with UV0
+    in meters, the lightmap layer last and UCX_ box hulls. It hangs where the standards put it by default (module
+    comment above): a wall sign's centre at 137.16 cm (ADA 703.4.1), a post sign's bottom at 213.36 cm (MUTCD 2A.18), a
+    projecting sign's bottom at 203.2 cm (ADA 307.4). Below those the reply warns; it never refuses.
+
+    params:
+      width, height (cm)    the plate, default 61 x 30.5 (MUTCD Table 2D-1, a D3-1 plate); 5 to 1000
+      thickness (cm)        default 1; face inset (default: a panel recessed inside a border) or raised (a panel standing
+                            proud); faceDepth (cm) default 0.4; border (cm) the frame round the face, default 2.5
+      twoSided (bool)       a face on the back too: projecting (default true) or none only
+      mount                 wall (default), post, projecting or none; mountHeight (cm) the plate's centre (wall) or
+                            bottom (post, projecting) above the pivot, defaults above; none: the plate's bottom at 0
+      standoff (cm)         wall only: hold the plate this far off the wall on four round standoffs (default 0, flush)
+      postSize (cm)         the post's or the arm's size, default 6; profile round (default) or square
+      armLength (cm)        projecting only: the arm, default the plate's width + 15 (the plate hangs 5 cm out)
+      sides, bevel, bevelSegments, uvTileCm, color, material (slot 0: plate and mounting), trimColor, trimMaterial
+      (slot 1: the face), collision (default true), name (default SM_Sign_<width>x<height>_01a), location, rotation,
+      collection
+    The face looks along -Y. The pivot is on the wall plane (y 0) at the floor below the plate (wall, projecting), or at
+    the post's foot (post).
+    """
+    reject_unknown(params, BUILD_SIGN_PARAMS, "build_sign", _SIGN_NOTES)
+    started = time.perf_counter()
+    width = take_float(params, "width", default=60.96)
+    height = take_float(params, "height", default=30.48)
+    for key, val in (("width", width), ("height", height)):
+        if not 5.0 <= val <= 1000.0:
+            raise MifOpError("%s is %g cm; it must be 5 to 1000 cm. NOTHING was created." % (key, val))
+    t = take_float(params, "thickness", default=1.0)
+    if not 0.2 <= t <= 30.0:
+        raise MifOpError("thickness is %g cm; it must be 0.2 to 30 cm. NOTHING was created." % t)
+    face = take(params, "face", default="inset", kind=str)
+    if face not in _SIGN_FACES:
+        raise MifOpError("face must be one of %s, got '%s'. NOTHING was created." % (", ".join(_SIGN_FACES), face))
+    mount = take(params, "mount", default="wall", kind=str)
+    if mount not in _SIGN_MOUNTS:
+        raise MifOpError("mount must be one of %s, got '%s'. NOTHING was created." % (", ".join(_SIGN_MOUNTS), mount))
+    two = take_bool(params, "twoSided", default=mount == "projecting")
+    if two and mount in ("wall", "post"):
+        raise MifOpError("twoSided puts a face on the back, and a %s sign's back is against its %s; pass it with mount "
+                         "projecting or none. NOTHING was created." % (mount, mount))
+    fd = take_float(params, "faceDepth", default=0.4)
+    border = take_float(params, "border", default=2.5)
+    if not 0.05 <= fd <= 10.0:
+        raise MifOpError("faceDepth is %g cm; it must be 0.05 to 10 cm. NOTHING was created." % fd)
+    if face == "inset" and fd * (2 if two else 1) > t - 0.1:
+        raise MifOpError("an inset face %g cm deep%s needs a plate thicker than %g cm, got %g. NOTHING was created."
+                         % (fd, " on both sides" if two else "", round(fd * (2 if two else 1) + 0.1, 3), t))
+    if not 0.5 <= border <= min(width, height) / 2.0 - 1.0:
+        raise MifOpError("border is %g cm; it must be 0.5 cm to %g cm (half the plate's shorter side less 1 cm). NOTHING "
+                         "was created." % (border, round(min(width, height) / 2.0 - 1.0, 3)))
+    mh = take_float(params, "mountHeight", default=_SIGN_HEIGHT[mount])
+    if not 0.0 <= mh <= 2000.0:
+        raise MifOpError("mountHeight is %g cm; it must be 0 to 2000 cm. NOTHING was created." % mh)
+    if mount == "wall" and mh < height / 2.0:
+        raise MifOpError("a wall sign's centre at %g cm puts its bottom below the floor. NOTHING was created." % mh)
+    standoff = take_float(params, "standoff", default=0.0)
+    if params.get("standoff") is not None and mount != "wall":
+        raise MifOpError("standoff holds a wall sign off its wall; this sign is mount %s. NOTHING was created." % mount)
+    if not 0.0 <= standoff <= 30.0:
+        raise MifOpError("standoff is %g cm; it must be 0 to 30 cm. NOTHING was created." % standoff)
+    post = take_float(params, "postSize", default=6.0)
+    if params.get("postSize") is not None and mount not in ("post", "projecting"):
+        raise MifOpError("postSize sizes a post or an arm; this sign is mount %s. NOTHING was created." % mount)
+    if not 1.0 <= post <= 40.0:
+        raise MifOpError("postSize is %g cm; it must be 1 to 40 cm. NOTHING was created." % post)
+    arm = take_float(params, "armLength", default=width + 15.0)
+    gap = 5.0                       # a projecting plate hangs this far out from the wall
+    if params.get("armLength") is not None and mount != "projecting":
+        raise MifOpError("armLength is a projecting sign's arm; this sign is mount %s. NOTHING was created." % mount)
+    if not width + gap + 1.0 <= arm <= 1000.0:
+        raise MifOpError("armLength is %g cm; it must reach past the %g cm plate hung %g cm out (at least %g) and be at "
+                         "most 1000. NOTHING was created." % (arm, width, gap, width + gap + 1.0))
+    profile = take(params, "profile", default="round", kind=str)
+    if profile not in _RAIL_PROFILES:
+        raise MifOpError("profile must be one of %s, got '%s'. NOTHING was created." % (", ".join(_RAIL_PROFILES),
+                                                                                        profile))
+    sides = take_int(params, "sides", default=16)
+    if not 6 <= sides <= 64 or sides % 2:
+        raise MifOpError("sides is %d; it must be even, 6 to 64. NOTHING was created." % sides)
+    bev = take_float(params, "bevel", default=min(0.3, 0.3 * t))
+    if not 0.0 <= bev <= 0.3 * min(t, border):
+        raise MifOpError("bevel is %g cm; it must be 0 to %g cm (30%% of the plate's thickness or border). NOTHING was "
+                         "created." % (bev, round(0.3 * min(t, border), 3)))
+    c = _kit_common(params, "build_sign", "Sign", (width, height), (0.82, 0.82, 0.8), (0.08, 0.22, 0.45))
+
+    # THE PLATE in its own (u, v, w): u across from -width/2, v up from 0, w through from the back (0) to the front (t)
+    bottom_z = {"wall": mh - height / 2.0, "none": 0.0}.get(mount, mh)
+    if mount == "projecting":
+        y_mid = -(gap + width / 2.0)
+
+        def to_xyz(u, v, w):
+            return (w - t / 2.0, y_mid - u, bottom_z + v)
+    else:
+        back_y = {"wall": -standoff, "post": -post / 2.0 + (0.3 if profile == "round" else 0.0)}.get(mount, 0.0)
+
+        def to_xyz(u, v, w):
+            return (u, back_y - w, bottom_z + v)
+    us = (-width / 2.0, -width / 2.0 + border, width / 2.0 - border, width / 2.0)
+    vs = (0.0, border, height - border, height)
+    parts = []
+    if face == "inset":
+        ring = [[not (i == 1 and j == 1) for j in range(3)] for i in range(3)]
+        parts.append(_cells(us, vs, ring, 0.0, t, to_xyz, bev, "plate", 0))
+        parts.append(_cells(us[1:3], vs[1:3], [[True]], fd if two else 0.0, t - fd, to_xyz, 0.0, "face", 1))
+        face_front = t - fd
+    else:
+        parts.append(_cells((us[0], us[3]), (vs[0], vs[3]), [[True]], 0.0, t, to_xyz, bev, "plate", 0))
+        parts.append(_cells(us[1:3], vs[1:3], [[True]], t, t + fd, to_xyz, 0.0, "face", 1))
+        if two:
+            parts.append(_cells(us[1:3], vs[1:3], [[True]], -fd, 0.0, to_xyz, 0.0, "face", 1))
+        face_front = t + fd
+    hulls = []
+    lo = [to_xyz(us[0], vs[0], -fd if (two and face == "raised") else 0.0),
+          to_xyz(us[3], vs[3], face_front if face == "raised" else t)]
+    hulls.append(("plate", [(x, y, z) for x in (lo[0][0], lo[1][0]) for y in (lo[0][1], lo[1][1])
+                            for z in (lo[0][2], lo[1][2])]))
+    mounting = {"mount": mount}
+    if mount == "wall" and standoff > 0.0:
+        r = 1.0
+        for cu in (us[0] + border, us[3] - border):
+            for cv in (vs[0] + border, vs[3] - border):
+                parts.append(_cyl(cu, bottom_z + cv, r, 0.0, standoff + 0.2, sides, lambda u, v, w: (u, -w, v),
+                                  "standoff", 0))
+        mounting.update({"standoffCm": standoff, "standoffs": 4})
+    elif mount == "post":
+        top = bottom_z + height
+        parts.append(_bar(0.0, 0.0, 0.0, top, post, 0.0, profile, sides, 0.0, "post", 0))
+        hulls.append(("post", [(x, y, z) for x in (-post / 2.0, post / 2.0) for y in (-post / 2.0, post / 2.0)
+                               for z in (0.0, top)]))
+        mounting.update({"postSizeCm": post, "postTopCm": round(top, 3)})
+    elif mount == "projecting":
+        top = bottom_z + height
+        zc = top + post / 2.0 - 0.3
+        parts.append(_swept([[0.0, 0.5, zc], [0.0, -arm, zc]], post, profile, sides, "arm", 0))
+        fl = max(post * 2.5, 12.0)
+        parts.append(_box(-fl / 2.0, fl / 2.0, -1.0, 0.0, zc - fl / 2.0, zc + fl / 2.0, min(bev, 0.3), "flange", 0))
+        hulls.append(("arm", [(x, y, z) for x in (-post / 2.0, post / 2.0) for y in (0.0, -arm)
+                              for z in (zc - post / 2.0, zc + post / 2.0)]))
+        mounting.update({"armLengthCm": arm, "armCentreCm": round(zc, 3), "flangeCm": fl})
+    out = _kit_finish(c, parts, hulls, "build_sign", ["plate and mounting", "face"])
+    warnings = []
+    if mount == "wall" and not 121.92 <= mh <= 152.4:
+        warnings.append("the plate's centre is %g cm up, outside ADA 703.4.1's band for tactile characters (baselines "
+                        "121.92-152.4 cm, 48-60 in)" % mh)
+    if mount == "post" and mh < 213.36 - 1e-6:
+        warnings.append("the plate's bottom is %g cm up, under MUTCD 2A.18's 213.36 cm (7 ft) where pedestrians or "
+                        "parking are likely%s" % (mh, "; and under the 152.4 cm (5 ft) of a rural road" if mh < 152.4
+                                                  else ""))
+    if mount == "projecting" and mh < 203.2 - 1e-6:
+        warnings.append("the plate's bottom is %g cm up and stands %g cm out from the wall: ADA 307.2 lets an object "
+                        "under 203.2 cm (80 in) stand at most 10.16 cm (4 in) into a route" % (mh, round(arm, 3)))
+    if mount == "post" and height < 20.32 - 1e-6:
+        warnings.append("the plate is %g cm high, under the 20.32 cm (8 in) MUTCD Table 2D-1 gives a street name sign "
+                        "at its smallest" % height)
+    out.update({
+        "kind": "sign", "plateCm": {"width": width, "height": height, "thickness": t}, "face": face,
+        "faceDepthCm": fd, "borderCm": border, "twoSided": two,
+        "faceCm": {"width": round(width - 2.0 * border, 4), "height": round(height - 2.0 * border, 4)},
+        "mountHeightCm": mh, "plateBottomCm": round(bottom_z, 4), "plateTopCm": round(bottom_z + height, 4),
+        "mounting": mounting,
+        "pivot": ("the post's foot" if mount == "post" else
+                  "on the wall plane (y 0) at the floor below the plate" if mount in ("wall", "projecting") else
+                  "the plate's back, bottom centre"),
+        "standards": {"wallCentreCm": 137.16, "wallBandCm": [121.92, 152.4], "postBottomCm": 213.36,
+                      "ruralPostBottomCm": 152.4, "projectingBottomCm": 203.2, "plateHeightCm": 30.48,
+                      "source": "ADA 2010 307.2, 307.4, 703.4.1; MUTCD 2009 2A.18, Table 2D-1"},
+        "warnings": warnings or None, "elapsedSeconds": round(time.perf_counter() - started, 2),
+    })
+    return out
+
+
 # ------------------------------------------------------------------------------------------ set_vertex_color_by_rule
-_RULES = ("up", "height", "cavity", "random", "dirt", "fromWeight", "adjust")
+_RULES = ("up", "height", "cavity", "random", "dirt", "fromWeight", "adjust", "noise", "facing", "distanceTo",
+          "fromMaterial")
+_ATTR_TYPES = ("BYTE_COLOR", "FLOAT_COLOR", "FLOAT")
+_NOISE_KEYS = {"scale", "seed", "amount", "octaves"}
 _ADJUST_KEYS = {"levels", "hsv", "brightnessContrast"}
 
 
@@ -1558,6 +2686,176 @@ def _cavity(obj, mesh, distance, rays):
     return out
 
 
+def _vc_noise(spec, world, tail):
+    """noise {scale (metres per feature, default a tenth of the largest side), seed, amount (0-1), octaves (1-8)}: per
+    vertex 1 - amount x (1 - n), n a fractal Perlin 0-1 at the world position - a breakup term to multiply a mask by."""
+    from mathutils import noise as mnoise   # noqa: PLC0415 - after the refusals (offline stub)
+    if not isinstance(spec, dict) or set(spec) - _NOISE_KEYS:
+        raise MifOpError("noise is {scale, seed, amount, octaves}, got %r. %s" % (spec, tail))
+    side = max(max(w[i] for w in world) - min(w[i] for w in world) for i in range(3))
+    scale = finite_float(spec.get("scale", side / 10.0 if side > 0 else 1.0), "noise.scale")
+    amount = finite_float(spec.get("amount", 1.0), "noise.amount")
+    seed = spec.get("seed", 1)
+    octaves = spec.get("octaves", 3)
+    if not scale > 0 or not 0.0 <= amount <= 1.0:
+        raise MifOpError("noise.scale must be above 0 (metres per feature) and noise.amount 0-1. %s" % tail)
+    if isinstance(seed, bool) or not isinstance(seed, int) or isinstance(octaves, bool) \
+            or not isinstance(octaves, int) or not 1 <= octaves <= 8:
+        raise MifOpError("noise.seed is a whole number and noise.octaves 1-8. %s" % tail)
+    gen = random.Random(seed)
+    off = Vector((gen.uniform(-1000, 1000), gen.uniform(-1000, 1000), gen.uniform(-1000, 1000)))
+    vals = []
+    for p in world:
+        q = p / scale + off
+        acc, amp, tot = 0.0, 1.0, 0.0
+        for _o in range(octaves):
+            acc += amp * mnoise.noise(q, noise_basis="PERLIN_ORIGINAL")
+            tot += amp
+            amp *= 0.5
+            q = q * 2.0
+        n01 = min(1.0, max(0.0, 0.5 + 0.5 * acc / tot))
+        vals.append(1.0 - amount * (1.0 - n01))
+    return vals, {"scale": round(scale, 6), "seed": seed, "amount": amount, "octaves": octaves,
+                  "rawMin": round(min(vals), 4), "rawMax": round(max(vals), 4)}
+
+
+def _vc_segments_of(obj, tail):
+    """World segments [(a, b)] of a skeleton: an armature's posed bones, a curve's evaluated polyline, a mesh's edges
+    (when it has no faces); [] for a mesh with faces (measured to its surface) or an empty (a point)."""
+    mw = obj.matrix_world
+    if obj.type == "ARMATURE":
+        return [(mw @ pb.head, mw @ pb.tail) for pb in obj.pose.bones]
+    if obj.type in ("CURVE", "MESH"):
+        if obj.type == "MESH" and len(obj.data.polygons):
+            return []
+        dg = bpy.context.evaluated_depsgraph_get()
+        ev = obj.evaluated_get(dg)
+        me = ev.to_mesh()
+        try:
+            return [(mw @ me.vertices[e.vertices[0]].co, mw @ me.vertices[e.vertices[1]].co) for e in me.edges]
+        finally:
+            ev.to_mesh_clear()
+    return None
+
+
+def _vc_distance_to(spec, obj, world, tail):
+    """distanceTo {object, range}: each vertex's world distance (metres) to another object - a mesh's surface, the
+    segments of an armature's bones, a curve or an edge-only mesh (a skeleton), or an empty's point."""
+    from mathutils.kdtree import KDTree   # noqa: PLC0415
+    if not isinstance(spec, dict) or set(spec) - {"object", "range"} or not isinstance(spec.get("object"), str):
+        raise MifOpError("distanceTo is {object, range [near, far] metres}, got %r. %s" % (spec, tail))
+    tgt = bpy.data.objects.get(spec["object"])
+    if tgt is None:
+        raise MifOpError("distanceTo.object: no object named %r. %s" % (spec["object"], tail))
+    if tgt == obj:
+        raise MifOpError("distanceTo.object is the object being coloured. %s" % tail)
+    segs = _vc_segments_of(tgt, tail)
+    if tgt.type == "MESH" and segs == []:
+        dg = bpy.context.evaluated_depsgraph_get()
+        ev = tgt.evaluated_get(dg)
+        me = ev.to_mesh()
+        try:
+            mw = tgt.matrix_world
+            tree = BVHTree.FromPolygons([mw @ v.co for v in me.vertices], [tuple(p.vertices) for p in me.polygons],
+                                        epsilon=0.0)
+        finally:
+            ev.to_mesh_clear()
+        return [tree.find_nearest(p)[3] for p in world], "surface"
+    if segs is None:
+        q = tgt.matrix_world.translation
+        return [(p - q).length for p in world], "point"
+    segs = [(a, b) for a, b in segs if (b - a).length > 1e-12] or [(a, a) for a, _b in segs]
+    if not segs:
+        raise MifOpError("distanceTo.object '%s' has no bones, edges or points to measure to. %s" % (tgt.name, tail))
+    tot = sum((b - a).length for a, b in segs)
+    step = max(tot / 20000.0, 1e-6)
+    pts = []
+    for i, (a, b) in enumerate(segs):
+        n = max(1, int((b - a).length / step))
+        for k in range(n + 1):
+            pts.append((a.lerp(b, k / n), i))
+    kd = KDTree(len(pts))
+    for j, (p, _i) in enumerate(pts):
+        kd.insert(p, j)
+    kd.balance()
+    out = []
+    for p in world:
+        best = None
+        for _co, j, _d in kd.find_n(p, 6):
+            a, b = segs[pts[j][1]]
+            ab = b - a
+            ll = ab.length_squared
+            t = 0.0 if ll < 1e-30 else max(0.0, min(1.0, (p - a).dot(ab) / ll))
+            d = (p - (a + ab * t)).length
+            best = d if best is None or d < best else best
+        out.append(best)
+    return out, "skeleton (%d segments)" % len(segs)
+
+
+def _vc_from_material(spec, obj, mesh, tail):
+    """fromMaterial {slot (index or material name), falloff (metres, default twice the median edge)}: per vertex a
+    smooth 0-1 across the border of the faces using that slot - 1 inside, 0 outside, 0.5 on the border, a smoothstep
+    over `falloff` centred on it - so a colour border blended by this mask bakes as a soft line, not the faces' steps."""
+    from mathutils.kdtree import KDTree   # noqa: PLC0415
+    if not isinstance(spec, dict) or set(spec) - {"slot", "falloff"} or spec.get("slot") is None:
+        raise MifOpError("fromMaterial is {slot (index or material name), falloff (metres)}, got %r. %s" % (spec, tail))
+    slot = spec["slot"]
+    names = [s.material.name if s.material else None for s in obj.material_slots]
+    if isinstance(slot, str):
+        if slot not in names:
+            raise MifOpError("fromMaterial.slot: '%s' has no slot holding material %r (it has %s). %s"
+                             % (obj.name, slot, names, tail))
+        idx = names.index(slot)
+    elif isinstance(slot, int) and not isinstance(slot, bool):
+        if not 0 <= slot < max(1, len(names)):
+            raise MifOpError("fromMaterial.slot %d is not one of '%s''s %d slots. %s" % (slot, obj.name, len(names),
+                                                                                         tail))
+        idx = slot
+    else:
+        raise MifOpError("fromMaterial.slot is a slot index or a material name, got %r. %s" % (slot, tail))
+    mw = obj.matrix_world
+    world = [mw @ v.co for v in mesh.vertices]
+    inside_f = [p.material_index == idx for p in mesh.polygons]
+    if not any(inside_f):
+        raise MifOpError("no face of '%s' uses slot %d - the mask would be 0 everywhere. %s" % (obj.name, idx, tail))
+    nv = len(mesh.vertices)
+    n_in, n_all = [0] * nv, [0] * nv
+    for p, ins in zip(mesh.polygons, inside_f):
+        for vi in p.vertices:
+            n_all[vi] += 1
+            if ins:
+                n_in[vi] += 1
+    lens = sorted((world[e.vertices[0]] - world[e.vertices[1]]).length for e in mesh.edges)
+    med = lens[len(lens) // 2] if lens else 0.0
+    falloff = finite_float(spec.get("falloff", 2.0 * med), "fromMaterial.falloff")
+    if not falloff >= 0.0:
+        raise MifOpError("fromMaterial.falloff is a width in metres, 0 or more, got %r. %s" % (falloff, tail))
+    border = [world[i] for i in range(nv) if 0 < n_in[i] < n_all[i]]
+    if not border:
+        return [1.0 if n_in[i] else 0.0 for i in range(nv)], {"slot": idx, "falloff": falloff, "borderVertices": 0,
+                                                              "medianEdge": round(med, 6)}
+    kd = KDTree(len(border))
+    for j, p in enumerate(border):
+        kd.insert(p, j)
+    kd.balance()
+    vals = []
+    for i in range(nv):
+        if 0 < n_in[i] < n_all[i]:
+            vals.append(0.5)
+            continue
+        side = 1.0 if n_in[i] else -1.0
+        if falloff <= 0.0:
+            vals.append(1.0 if side > 0 else 0.0)
+            continue
+        d = kd.find(world[i])[2]
+        x = min(1.0, max(0.0, 0.5 + side * d / falloff))
+        vals.append(x * x * (3.0 - 2.0 * x))
+    return vals, {"slot": idx, "material": names[idx] if idx < len(names) else None, "falloff": round(falloff, 6),
+                  "borderVertices": len(border), "medianEdge": round(med, 6),
+                  "note": None if falloff >= med else "falloff %g m is under the median edge %g m, so the border "
+                  "still steps face by face - widen it or subdivide" % (falloff, med)}
+
+
 def op_set_vertex_color_by_rule(params):
     """Write a 0-1 mask into a color attribute by a rule - what a material blends moss, dirt, grime or per-piece
     variation with. The value is stored as value x 255 in an 8-bit (BYTE_COLOR) attribute, which the FBX export
@@ -1583,6 +2881,20 @@ def op_set_vertex_color_by_rule(params):
                 offset); hsv {hue (0.5 leaves it), saturation, value}: RGB only; brightnessContrast {brightness,
                 contrast} -100 to 100} - Blender's Levels, Hue/Saturation/Value and Brightness/Contrast, in that order,
                 then invert; the attribute must exist
+      noise     (2026-11-25) a breakup term: noise {scale (m per feature, default a tenth of the largest side), seed,
+                amount (0-1, default 1), octaves (1-8, default 3)} gives 1 - amount x (1 - n), n a fractal Perlin 0-1 at
+                the world position - combine multiply breaks up a mask, amount 0 leaves it
+      facing    (2026-11-25) how much the surface faces a world direction: facing {direction [x,y,z], range (default
+                [0, 1], of the dot product)} - moss on the north side; the shading normal per face corner as up's
+      distanceTo (2026-11-25) each vertex's distance in metres to another object - a mesh's surface, an armature's
+                bones, a curve or an edge-only mesh (a skeleton), an empty's point: distanceTo {object, range [near, far]
+                (default 0 to the farthest)} - with invert, 1 near a root or a branch
+      fromMaterial (2026-11-25) a soft mask from face material regions: fromMaterial {slot (index or material name),
+                falloff (metres, default twice the median edge)} - 1 on the slot's faces, 0 off them, a smoothstep over
+                falloff centred on the border; Mix two colours by it in one material and the border bakes as a line,
+                not as the faces' steps
+    attributeType (2026-11-25): BYTE_COLOR (default), FLOAT_COLOR or FLOAT - a new FLOAT_COLOR or FLOAT attribute is on
+      points, holds the value unquantised (FLOAT one value, no channel), and is what a material's Attribute node reads
 
     params:
       object (str)          required, a mesh in OBJECT mode
@@ -1618,8 +2930,9 @@ def op_set_vertex_color_by_rule(params):
     if combine not in _COMBINES:
         raise MifOpError("combine must be one of %s, got '%s'. NOTHING was changed." % (", ".join(_COMBINES), combine))
     make_active = take_bool(params, "makeActive", default=True)
-    only = {"seed": "random", "element": "random", "distance": "cavity", "rays": "cavity", "space": "up or height",
-            "dirt": "dirt", "group": "fromWeight", "adjust": "adjust"}
+    only = {"seed": "random", "element": "random", "distance": "cavity", "rays": "cavity",
+            "space": "up or height or facing", "dirt": "dirt", "group": "fromWeight", "adjust": "adjust",
+            "noise": "noise", "facing": "facing", "distanceTo": "distanceTo", "fromMaterial": "fromMaterial"}
     for key, owner in only.items():
         if params.get(key) is not None and rule not in owner.split(" or "):
             raise MifOpError("'%s' is read by rule %s only; rule is %s. It is refused rather than ignored. NOTHING "
@@ -1671,6 +2984,39 @@ def op_set_vertex_color_by_rule(params):
     if weight_combine not in ("max", "sum"):
         raise MifOpError("weightCombine is max (the strongest group weight) or sum (added, clamped at 1), got %r. "
                          "NOTHING was changed." % weight_combine)
+    atype = str(take(params, "attributeType", default="BYTE_COLOR", kind=str)).upper()
+    if atype not in _ATTR_TYPES:
+        raise MifOpError("attributeType is %s, got %r. NOTHING was changed." % (", ".join(_ATTR_TYPES), atype))
+    if atype == "FLOAT" and params.get("channel") is not None:
+        raise MifOpError("a FLOAT attribute holds one value - channel is a color attribute's. NOTHING was changed.")
+    if atype == "FLOAT" and rule == "adjust":
+        raise MifOpError("adjust edits a color attribute; attributeType FLOAT holds one value. NOTHING was changed.")
+    if rule == "facing" and params.get("facing") is None:
+        raise MifOpError("rule facing needs facing: {direction [x,y,z], range}. NOTHING was changed.")
+    if rule == "fromMaterial" and params.get("fromMaterial") is None:
+        raise MifOpError("rule fromMaterial needs fromMaterial: {slot, falloff}. NOTHING was changed.")
+    if rule == "distanceTo" and params.get("distanceTo") is None:
+        raise MifOpError("rule distanceTo needs distanceTo: {object, range}. NOTHING was changed.")
+    face_dir, face_rng = None, None
+    if rule == "facing":
+        fs = params["facing"]
+        if not isinstance(fs, dict) or set(fs) - {"direction", "range"} or fs.get("direction") is None:
+            raise MifOpError("facing is {direction [x,y,z], range [from, to]}, got %r. NOTHING was changed." % (fs,))
+        dv = fs["direction"]
+        if not isinstance(dv, (list, tuple)) or len(dv) != 3:
+            raise MifOpError("facing.direction is [x, y, z], got %r. NOTHING was changed." % (dv,))
+        face_dir = Vector(finite_floats(list(dv), "facing.direction"))
+        if face_dir.length < 1e-9:
+            raise MifOpError("facing.direction has no length. NOTHING was changed.")
+        face_dir.normalize()
+        if fs.get("range") is not None:
+            if rng_in is not None:
+                raise MifOpError("pass facing.range or range, not both. NOTHING was changed.")
+            face_rng = _range({"range": fs["range"]}, rule)
+    if rule == "distanceTo" and isinstance(params["distanceTo"], dict) and params["distanceTo"].get("range") is not None:
+        if rng_in is not None:
+            raise MifOpError("pass distanceTo.range or range, not both. NOTHING was changed.")
+        rng_in = _range({"range": params["distanceTo"]["range"]}, rule)
     adjust = None
     if rule == "adjust":
         if params.get("adjust") is None:
@@ -1692,15 +3038,20 @@ def op_set_vertex_color_by_rule(params):
     if not mesh.polygons:
         raise MifOpError("'%s' has no faces, so there is nothing to color. NOTHING was changed." % obj.name)
 
-    attr = mesh.color_attributes.get(name)
-    if attr is not None:
+    attr = mesh.attributes.get(name) if atype == "FLOAT" else mesh.color_attributes.get(name)
+    if attr is not None and atype != "BYTE_COLOR":
+        if attr.data_type != atype or attr.domain not in ("CORNER", "POINT"):
+            raise MifOpError("'%s' is %s on %s; attributeType %s writes a %s attribute on face corners or points. Use "
+                             "another name. NOTHING was changed." % (name, attr.data_type, attr.domain, atype, atype))
+        domain = attr.domain
+    elif attr is not None:
         if attr.data_type != "BYTE_COLOR" or attr.domain not in ("CORNER", "POINT"):
             raise MifOpError("'%s' is %s on %s; this op writes 8-bit masks, which is what Unreal's vertex color "
                              "stores, into a BYTE_COLOR attribute on face corners or points. Use another name. "
                              "NOTHING was changed." % (name, attr.data_type, attr.domain))
         domain = attr.domain
     else:
-        domain = "CORNER"
+        domain = "CORNER" if atype == "BYTE_COLOR" else "POINT"
     if rule == "adjust" and attr is None:
         raise MifOpError("'%s' has no color attribute '%s' to adjust (it has %s). NOTHING was changed."
                          % (obj.name, name, ", ".join(a.name for a in mesh.color_attributes) or "none"))
@@ -1753,6 +3104,25 @@ def op_set_vertex_color_by_rule(params):
     elif rule == "adjust":
         raw = None
         resolved = (0.0, 1.0)
+    elif rule == "facing":
+        nm = mw.to_3x3().inverted_safe().transposed()
+        if domain == "CORNER":
+            per_corner = [(nm @ c).normalized().dot(face_dir) for c in _corner_normals(mesh)]
+            raw = None
+        else:
+            raw = [(nm @ v.normal).normalized().dot(face_dir) for v in mesh.vertices]
+        resolved = face_rng or rng_in or (0.0, 1.0)
+    elif rule == "noise":
+        raw, noise_row = _vc_noise(params["noise"] if params.get("noise") is not None else {},
+                                   [obj.matrix_world @ v.co for v in mesh.vertices], "NOTHING was changed.")
+        resolved = rng_in or (0.0, 1.0)
+    elif rule == "fromMaterial":
+        raw, mat_row = _vc_from_material(params["fromMaterial"], obj, mesh, "NOTHING was changed.")
+        resolved = rng_in or (0.0, 1.0)
+    elif rule == "distanceTo":
+        raw, dist_kind = _vc_distance_to(params["distanceTo"], obj, [obj.matrix_world @ v.co for v in mesh.vertices],
+                                         "NOTHING was changed.")
+        resolved = rng_in or (0.0, max(raw) if max(raw) > 0 else 1.0)
     else:
         lo_v, hi_v = rng_in or _RULE_RANGE["random"]
         gen = random.Random(seed)
@@ -1777,20 +3147,25 @@ def op_set_vertex_color_by_rule(params):
         return 1.0 - v if invert else v
 
     # ---- write ---------------------------------------------------------------------------------------------------
+    # FLOAT_COLOR HOLDS LINEAR VALUES AND FLOAT ONE VALUE, unquantised; BYTE_COLOR keeps its sRGB bytes as before
+    prop, stride = {"BYTE_COLOR": ("color_srgb", 4), "FLOAT_COLOR": ("color", 4), "FLOAT": ("value", 1)}[atype]
     if attr is None:
-        attr = mesh.color_attributes.new(name=name, type="BYTE_COLOR", domain="CORNER")
+        if atype == "FLOAT":
+            attr = mesh.attributes.new(name=name, type="FLOAT", domain=domain)
+        else:
+            attr = mesh.color_attributes.new(name=name, type=atype, domain=domain)
         if attr is None:
             raise MifOpError("color_attributes.new() returned None for '%s' - Blender signals failure that way. "
                              "NOTHING was changed." % name)
         # A NEW ATTRIBUTE STARTS BLACK WITH ALPHA 1, so the channels this call does not write hold 0
         n = len(attr.data)
-        attr.data.foreach_set("color_srgb", [0.0, 0.0, 0.0, 1.0] * n)
+        attr.data.foreach_set(prop, [0.0, 0.0, 0.0, 1.0] * n if stride == 4 else [0.0] * n)
         made = True
     else:
         made = False
     n = len(attr.data)
-    cur = [0.0] * (4 * n)
-    attr.data.foreach_get("color_srgb", cur)
+    cur = [0.0] * (stride * n)
+    attr.data.foreach_get(prop, cur)
     if rule == "adjust":
         import colorsys                                              # noqa: PLC0415
         chans = _CHANNELS[channel]
@@ -1828,10 +3203,10 @@ def op_set_vertex_color_by_rule(params):
             vals = [per_vert[vi] for vi in loop_v]
     else:
         vals = [mapped(x) for x in raw]
-    chans = _CHANNELS[channel]
+    chans = (0,) if stride == 1 else _CHANNELS[channel]
     for i, v in enumerate(vals if rule != "adjust" else ()):
         for c in chans:
-            old = cur[4 * i + c]
+            old = cur[stride * i + c]
             if combine == "replace":
                 new = v
             elif combine == "multiply":
@@ -1842,9 +3217,9 @@ def op_set_vertex_color_by_rule(params):
                 new = min(old, v)
             else:
                 new = min(1.0, old + v)
-            cur[4 * i + c] = new
-    attr.data.foreach_set("color_srgb", cur)
-    if make_active:
+            cur[stride * i + c] = new
+    attr.data.foreach_set(prop, cur)
+    if make_active and atype != "FLOAT":
         mesh.color_attributes.active_color = attr
         try:
             mesh.color_attributes.render_color_index = mesh.color_attributes.find(name)
@@ -1875,23 +3250,25 @@ def op_set_vertex_color_by_rule(params):
                           % (span, distance))
 
     # READ BACK FROM THE ATTRIBUTE, not from what was computed: the store is 8-bit
-    back = [0.0] * (4 * n)
-    attr.data.foreach_get("color_srgb", back)
+    back = [0.0] * (stride * n)
+    attr.data.foreach_get(prop, back)
     stats = {}
     for c in chans:
-        col = back[c::4]
-        stats["RGBA"[c]] = {"min": round(min(col), 4), "max": round(max(col), 4),
+        col = back[c::stride]
+        stats["value" if stride == 1 else "RGBA"[c]] = {"min": round(min(col), 4), "max": round(max(col), 4),
                             "mean": round(sum(col) / len(col), 4),
                             "atLeastHalf": round(sum(1 for x in col if x >= 0.5) / len(col), 4)}
     out = {
         "ok": True, "object": obj.name, "rule": rule, "attribute": name, "made": made, "domain": domain,
-        "dataType": "BYTE_COLOR", "channel": channel, "combine": combine, "invert": invert,
+        "dataType": atype, "channel": None if atype == "FLOAT" else channel, "combine": combine, "invert": invert,
         "range": [round(resolved[0], 6), round(resolved[1], 6)],
         "written": len(vals),
         "readBack": stats,
         "resolutionNote": coarse,
-        "stored": "each byte is value x 255 (sRGB space), what export_mesh's FBX carries and Unreal's VertexColor node "
-                  "reads; Blender's shading and mesh_stats read the same bytes linearized",
+        "stored": ("each byte is value x 255 (sRGB space), what export_mesh's FBX carries and Unreal's VertexColor node "
+                   "reads; Blender's shading and mesh_stats read the same bytes linearized" if atype == "BYTE_COLOR" else
+                   "the value as computed, unquantised (%s on %s) - what a material's Attribute node reads; an FBX "
+                   "carries a BYTE_COLOR attribute as the vertex color, not this" % (atype, domain)),
         "elapsedSeconds": round(time.perf_counter() - started, 2),
     }
     if rule == "cavity":
@@ -1901,6 +3278,15 @@ def op_set_vertex_color_by_rule(params):
                     "elements": len(per_face) if per_face is not None else len(set(comp))})
     if rule in ("up", "height"):
         out["space"] = space
+    if rule == "facing":
+        out["facing"] = {"direction": [round(c, 6) for c in face_dir]}
+    if rule == "noise":
+        out["noise"] = noise_row
+    if rule == "fromMaterial":
+        out["fromMaterial"] = mat_row
+    if rule == "distanceTo":
+        out["distanceTo"] = {"object": params["distanceTo"]["object"], "measuredTo": dist_kind,
+                             "nearest": round(min(raw), 6), "farthest": round(max(raw), 6)}
     if rule == "dirt":
         out["dirt"] = {"blurStrength": blur_s, "blurIterations": blur_n, "cleanAngle": clean_a, "dirtAngle": dirt_a,
                        "dirtOnly": dirt_only, "normalize": normalize,
@@ -2356,7 +3742,7 @@ def op_build_lod_chain(params):
 # create_mesh's. Each part is a closed solid when its ends are closed, and its winding is checked by signed volume.
 
 _LATHE_KEYS = ("name", "profile", "segments", "axis", "caps", "smooth", "uvScale", "location", "rotation", "scale",
-               "collection", "takeOverName", "material", "lightmap")
+               "collection", "takeOverName", "material", "lightmap", "direction", "bone", "closedProfile", "thickness")
 _TUBE_KEYS = ("name", "points", "start", "end", "sag", "samples", "radius", "sides", "closed", "caps", "smooth",
               "uvScale", "location", "rotation", "scale", "collection", "takeOverName", "material", "surface", "lift",
               "step", "hangEnds", "endCaps", "stoppers", "smoothPath", "pathSamples", "ends", "strands", "twist", "lightmap")
@@ -2374,14 +3760,20 @@ def _signed_volume(verts, faces):
     return vol / 6.0
 
 
-def _build_through_create_mesh(params, verts, faces, uvs, smooth, default_name, op):
+def _build_through_create_mesh(params, verts, faces, uvs, smooth, default_name, op, face_mats=None):
+    """face_mats (one material name per face) makes one slot per material, in the order the faces first use them;
+    without it, material fills one slot for every face."""
     from .ops_create import op_create_mesh   # noqa: PLC0415 - create_mesh owns naming and the read-back
     sub = {"name": params.get("name") or default_name, "vertices": verts, "faces": faces, "uvs": {"UVMap": uvs},
            "smooth": bool(smooth)}
     for k in ("location", "rotation", "scale", "collection", "takeOverName"):
         if params.get(k) is not None:
             sub[k] = params[k]
-    if params.get("material") is not None:
+    if face_mats is not None:
+        slots = list(dict.fromkeys(face_mats))
+        sub["materials"] = slots
+        sub["materialIndices"] = [slots.index(m) for m in face_mats]
+    elif params.get("material") is not None:
         sub["materials"] = [params["material"]]
         sub["materialIndices"] = [0] * len(faces)
     out = op_create_mesh(sub)
@@ -2430,6 +3822,115 @@ def _lightmap_reply(obj, want):
             "islands": row.get("islandCount")}
 
 
+def _lathe_frame(params, axis, tail):
+    """(ex, ey, ez, origin or None, frame row): the lathe's axis as X, Y or Z, a world direction [x, y, z], or a bone
+    {armature, bone} (its posed head to tail, ex on the bone's own X so the segments follow its roll, origin its head)."""
+    d, bone = params.get("direction"), params.get("bone")
+    if (d is not None or bone is not None) and params.get("axis") is not None:
+        raise MifOpError("pass axis, direction or bone - one of them sets the lathe's axis. %s" % tail)
+    if d is not None and bone is not None:
+        raise MifOpError("pass direction OR bone, not both. %s" % tail)
+    if bone is not None:
+        if not isinstance(bone, dict) or set(bone) - {"armature", "bone"} or not bone.get("armature") \
+                or not bone.get("bone"):
+            raise MifOpError("bone is {armature, bone}, got %r. %s" % (bone, tail))
+        arm = bpy.data.objects.get(str(bone["armature"]))
+        if arm is None or arm.type != "ARMATURE":
+            raise MifOpError("no armature named %r. %s" % (bone["armature"], tail))
+        pb = arm.pose.bones.get(str(bone["bone"]))
+        if pb is None:
+            raise MifOpError("'%s' has no bone %r. %s" % (arm.name, bone["bone"], tail))
+        head, tl = arm.matrix_world @ pb.head, arm.matrix_world @ pb.tail
+        if (tl - head).length < 1e-9:
+            raise MifOpError("bone %r has no length. %s" % (pb.name, tail))
+        ez = (tl - head).normalized()
+        xb = (arm.matrix_world.to_3x3() @ pb.matrix.to_3x3()) @ Vector((1.0, 0.0, 0.0))
+        ex = xb - ez * xb.dot(ez)
+        ex = ex.normalized() if ex.length > 1e-9 else ez.orthogonal().normalized()
+        ey = ez.cross(ex)
+        return ex, ey, ez, head.copy(), {"axis": "BONE", "armature": arm.name, "bone": pb.name,
+                                         "direction": [round(c, 6) for c in ez], "origin": [round(c, 6) for c in head],
+                                         "length": round((tl - head).length, 6)}
+    if d is not None:
+        if not isinstance(d, (list, tuple)) or len(d) != 3:
+            raise MifOpError("direction is [x, y, z], got %r. %s" % (d, tail))
+        ez = Vector(finite_floats(list(d), "direction"))
+        if ez.length < 1e-9:
+            raise MifOpError("direction has no length. %s" % tail)
+        ez.normalize()
+        ex = ez.orthogonal().normalized()
+        ey = ez.cross(ex)
+        return ex, ey, ez, None, {"axis": "DIRECTION", "direction": [round(c, 6) for c in ez]}
+    ex, ey, ez = (Vector(v) for v in _AXES[axis])
+    return ex, ey, ez, None, {"axis": axis, "direction": [round(c, 6) for c in ez]}
+
+
+def _lathe_wall(prof, t, tail):
+    """(closed profile, wall row): an open profile walled `t` thick - the outer line, then the same line offset by t
+    toward the axis (t > 0; t < 0 away from it; a profile square to the axis, a washer, goes down for t > 0) and walked
+    back, mitred at each bend. A point on the axis stays on it, so a dome's pole stays a pole."""
+    n = len(prof)
+    enorm = []
+    for (r0, h0), (r1, h1) in zip(prof, prof[1:]):
+        dr, dh = r1 - r0, h1 - h0
+        ln = math.hypot(dr, dh)
+        enorm.append((-dh / ln, dr / ln))
+    lengths = [math.dist(a, b) for a, b in zip(prof, prof[1:])]
+    lean = sum(nr * ln for (nr, _nh), ln in zip(enorm, lengths))
+    sign = -1.0 if lean > 1e-9 * sum(lengths) else (1.0 if lean < -1e-9 * sum(lengths) else None)
+    if sign is None:
+        lean_h = sum(nh * ln for (_nr, nh), ln in zip(enorm, lengths))
+        sign = -1.0 if lean_h > 0 else 1.0
+    enorm = [(nr * sign, nh * sign) for nr, nh in enorm]
+    inner = []
+    worst = 1.0
+    for i, (r, h) in enumerate(prof):
+        ns = [enorm[j] for j in (i - 1, i) if 0 <= j < len(enorm)]
+        ar, ah = sum(x for x, _ in ns), sum(y for _, y in ns)
+        al = math.hypot(ar, ah)
+        if al < 1e-9:
+            raise MifOpError("profile point %d folds straight back on itself; a wall cannot be offset there. %s"
+                             % (i, tail))
+        ar, ah = ar / al, ah / al
+        cos_half = max(1e-3, ar * ns[0][0] + ah * ns[0][1])
+        worst = min(worst, cos_half)
+        miter = min(3.0, 1.0 / cos_half)
+        q = [r + ar * t * miter, h + ah * t * miter]
+        if r < 1e-9 and i in (0, n - 1):
+            q[0] = 0.0
+        if q[0] < -1e-9:
+            raise MifOpError("thickness %g pushes the inner wall past the axis at profile point %d (r %g) - thin the "
+                             "wall or move the point out. %s" % (t, i, r, tail))
+        inner.append((max(0.0, q[0]), q[1]))
+    for a, b in zip(inner, inner[1:]):
+        if math.dist(a, b) < 1e-9:
+            raise MifOpError("the inner wall repeats the point %r - thickness folds the profile there. %s" % (a, tail))
+    inward = sum(q[0] - p[0] for p, q in zip(prof, inner)) < 0
+    return prof + list(reversed(inner)), {"thickness": t, "side": "toward the axis" if inward else "away from the axis",
+                                          "innerPoints": [[round(x, 6) for x in p] for p in inner],
+                                          "sharpestMitre": round(min(3.0, 1.0 / worst), 4)}
+
+
+def _lathe_self_crossing(prof):
+    """True when the closed 2-D profile's edges cross (edges that share an end do not count)."""
+    n = len(prof)
+    edges = [(prof[i], prof[(i + 1) % n]) for i in range(n)]
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    for i in range(n):
+        for j in range(i + 2, n):
+            if i == 0 and j == n - 1:
+                continue
+            (p1, p2), (p3, p4) = edges[i], edges[j]
+            d1, d2 = cross(p3, p4, p1), cross(p3, p4, p2)
+            d3, d4 = cross(p1, p2, p3), cross(p1, p2, p4)
+            if ((d1 > 1e-12 and d2 < -1e-12) or (d1 < -1e-12 and d2 > 1e-12)) and \
+                    ((d3 > 1e-12 and d4 < -1e-12) or (d3 < -1e-12 and d4 > 1e-12)):
+                return True
+    return False
+
+
 def op_build_lathe(params):
     """Revolve a profile [[r, h], ...] round an axis into a closed or open solid of revolution - a can, a bottle, a post.
 
@@ -2446,8 +3947,30 @@ def op_build_lathe(params):
     metres per UV unit: u round the circumference at the largest radius, v along the profile. material names an
     existing material for every face. name, location, rotation, scale, collection, takeOverName are create_mesh's.
 
+    A MATERIAL PER PROFILE SEGMENT (FOUND 2026-11-26 by a modelling job): one material per revolve meant a turned part
+    of two materials - a metal band on a wooden handle - took separate revolves joined afterwards. A point may be
+    [r, h, material]: that existing material paints the segment from this point to the next and every one after, until
+    another point names one; segments before the first named point take material. Each material is one slot, in the
+    order the faces first use it. A cap takes its end point's material; with thickness the inner wall takes its outer
+    segment's, and each end's rim its end point's; a closedProfile's closing segment takes the last point's. The reply's
+    profileMaterials gives slots, the material of every revolved segment and of each cap. Refused: a third element
+    that is not a material's name, a material that does not exist, a segment left with none (name one on the first
+    point, or pass material).
+
     Refused before anything exists: fewer than two points, a negative r, two consecutive points on one spot, every
     point on the axis, segments outside 3-512.
+
+    ANY AXIS, A WALL, A LOOP (FOUND 2026-11-18, plate armour along bones): axis took X, Y or Z only, so each limb plate
+    needed an euler worked out by the caller from its bone; and a profile that loops back on itself left a slit, so a
+    walled ring went to caps:false plus a SOLIDIFY that blew a domed plate up with ok:true. direction [x, y, z] revolves
+    round that world direction; bone {armature, bone} round the posed bone, h measured from its head (the part's
+    location unless location is given), angle 0 on the bone's own X so the segments follow its roll. closedProfile
+    true joins the last point back to the first and welds the loop - a ring with a wall, a torus - no caps. thickness
+    (metres) walls an open profile on the lathe itself: the line offset that far toward the axis (negative: away; a
+    washer square to the axis goes down), mitred at every bend, a point on the axis kept there, and the two joined at
+    the ends into one closed shell. The reply's frame says the axis used; wall gives the inner line. Refused: axis with
+    direction or bone, a zero direction, a bone the armature lacks, a closed profile under three points or crossing
+    itself (a wall thicker than the profile's bend), a wall pushed past the axis, caps on a closed profile.
     """
     tail = "NOTHING was created."
     reject_unknown(params, _LATHE_KEYS, "build_lathe")
@@ -2455,11 +3978,18 @@ def op_build_lathe(params):
     raw = params.get("profile")
     if not isinstance(raw, (list, tuple)) or len(raw) < 2:
         raise MifOpError("profile must be two or more [r, h] points. %s" % tail)
-    prof = []
-    for p in raw:
-        if not isinstance(p, (list, tuple)) or len(p) != 2:
-            raise MifOpError("each profile point must be [r, h], got %r. %s" % (p, tail))
-        prof.append(tuple(finite_floats(list(p), "profile")))
+    prof, named = [], []
+    mat_names = {m.name for m in bpy.data.materials}       # once, not a lookup per profile point
+    for i, p in enumerate(raw):
+        if not isinstance(p, (list, tuple)) or len(p) not in (2, 3):
+            raise MifOpError("each profile point must be [r, h] or [r, h, material], got %r. %s" % (p, tail))
+        if len(p) == 3:
+            if not isinstance(p[2], str) or not p[2]:
+                raise MifOpError("profile point %d's third element is a material name, got %r. %s" % (i, p[2], tail))
+            if p[2] not in mat_names:
+                raise MifOpError("no material named %r (profile point %d). %s" % (p[2], i, tail))
+        named.append(p[2] if len(p) == 3 else None)
+        prof.append(tuple(finite_floats(list(p[:2]), "profile")))
     if any(r < 0 for r, _ in prof):
         raise MifOpError("a profile radius is below 0: r is the distance from the axis. %s" % tail)
     for a, b in zip(prof, prof[1:]):
@@ -2480,7 +4010,48 @@ def op_build_lathe(params):
         raise MifOpError("uvScale must be above 0, got %g. %s" % (uv_scale, tail))
     if params.get("material") is not None and params["material"] not in bpy.data.materials:
         raise MifOpError("no material named %r. %s" % (params["material"], tail))
-    ex, ey, ez = (Vector(v) for v in _AXES[axis])
+    carry = None
+    if any(m is not None for m in named):
+        # each point's material: its own name, else the one before it, else material
+        carry, cur = [], params.get("material")
+        for m in named:
+            cur = m if m is not None else cur
+            carry.append(cur)
+        if carry[0] is None:
+            raise MifOpError("profile point 0 names no material and material is not given, so the segments before point "
+                             "%d would have no material - name one on point 0, or pass material. %s"
+                             % (next(i for i, m in enumerate(carry) if m is not None), tail))
+    ex, ey, ez, origin, frame = _lathe_frame(params, axis, tail)
+    if origin is not None and params.get("location") is None:
+        params = dict(params, location=list(origin))
+    closed_prof = take_bool(params, "closedProfile", default=False)
+    thickness = take_float(params, "thickness", default=None)
+    wall = None
+    if thickness is not None:
+        if closed_prof:
+            raise MifOpError("thickness walls an OPEN profile; a closedProfile already has its wall. %s" % tail)
+        if not math.isfinite(thickness) or abs(thickness) < 1e-9:
+            raise MifOpError("thickness must be a non-zero wall in metres, got %r. %s" % (thickness, tail))
+        if carry is not None:
+            # the inner line walks back: its segment k mirrors outer segment n-2-k; each rim takes its end point's
+            n = len(prof)
+            carry = carry + [carry[n - 2 - k] for k in range(n - 1)] + [carry[0]]
+        prof, wall = _lathe_wall(prof, thickness, tail)
+        closed_prof = True
+    if closed_prof:
+        if params.get("caps") is not None and caps:
+            raise MifOpError("caps closes the open ends of a profile; a closed profile has none (caps:false or leave "
+                             "it out). %s" % tail)
+        caps = False
+        if math.dist(prof[0], prof[-1]) < 1e-9:
+            prof = prof[:-1]
+            carry = carry[:-1] if carry is not None else None
+        if len(prof) < 3:
+            raise MifOpError("a closed profile needs three or more distinct points. %s" % tail)
+        if _lathe_self_crossing(prof):
+            raise MifOpError("the closed profile crosses itself%s - the revolved wall would pass through itself. %s"
+                             % (" (thickness %g is more than the profile's bend can take)" % thickness
+                                if thickness is not None else "", tail))
     verts, rows = [], []
     for r, h in prof:
         if r < 1e-9:
@@ -2494,12 +4065,16 @@ def op_build_lathe(params):
             verts.append(list(ex * (r * math.cos(t)) + ey * (r * math.sin(t)) + ez * h))
         rows.append(row)
     circ = 2 * math.pi * max(r for r, _ in prof)
+    loop = prof + [prof[0]] if closed_prof else prof
     along = [0.0]
-    for a, b in zip(prof, prof[1:]):
+    for a, b in zip(loop, loop[1:]):
         along.append(along[-1] + math.dist(a, b))
-    faces, uvs = [], []
-    for j in range(len(rows) - 1):
-        a, b = rows[j], rows[j + 1]
+    faces, uvs, face_mats = [], [], []
+    pairs = list(range(len(rows) - 1)) + ([len(rows) - 1] if closed_prof else [])
+    for pi, j in enumerate(pairs):
+        if carry is not None and pi:
+            face_mats.extend([carry[pairs[pi - 1]]] * (len(faces) - len(face_mats)))
+        a, b = rows[j], rows[(j + 1) % len(rows)]
         v0, v1 = along[j] / uv_scale, along[j + 1] / uv_scale
         for k in range(segs):
             k1 = (k + 1) % segs
@@ -2515,13 +4090,17 @@ def op_build_lathe(params):
             else:
                 faces.append([a[k], a[k1], b[k1], b[k]])
                 uvs.append([[u0, v0], [u1, v0], [u1, v1], [u0, v1]])
+    if carry is not None and pairs:
+        face_mats.extend([carry[pairs[-1]]] * (len(faces) - len(face_mats)))
     capped = []
     if caps:
         for end, row in (("start", rows[0]), ("end", rows[-1])):
             if len(row) > 1:
                 _cap_fan(verts, faces, uvs, list(row), end != "end")
                 capped.append(end)
-    closed = all(len(r) == 1 or caps for r in (rows[0], rows[-1]))
+                if carry is not None:
+                    face_mats.extend([carry[0 if end == "start" else -1]] * (len(faces) - len(face_mats)))
+    closed = closed_prof or all(len(r) == 1 or caps for r in (rows[0], rows[-1]))
     if not faces:
         raise MifOpError("the profile makes no face. %s" % tail)
     vol = _signed_volume(verts, faces)
@@ -2540,11 +4119,16 @@ def op_build_lathe(params):
         faces = [list(reversed(f)) for f in faces]
         uvs = [list(reversed(u)) for u in uvs]
         vol = -vol
-    out = _build_through_create_mesh(params, verts, faces, uvs, smooth, "Lathe", "build_lathe")
+    out = _build_through_create_mesh(params, verts, faces, uvs, smooth, "Lathe", "build_lathe",
+                                     face_mats if carry is not None else None)
+    if carry is not None:
+        out["profileMaterials"] = {"slots": list(dict.fromkeys(face_mats)), "segments": [carry[j] for j in pairs],
+                                   "caps": {end: carry[0 if end == "start" else -1] for end in capped} or None}
     lmr = _lightmap_reply(bpy.data.objects[out["name"]], want_lightmap)
     if lmr is not None:
         out["lightmap"] = lmr
-    out.update({"segments": segs, "axis": axis, "capped": capped, "closed": closed,
+    out.update({"segments": segs, "axis": frame["axis"], "frame": frame, "closedProfile": closed_prof,
+                "thickness": thickness, "wall": wall, "capped": capped, "closed": closed,
                 "outwardCheck": {"signedVolume": round(vol, 9), "closed": closed,
                                  "turnedOver": flipped,
                                  "note": ("one winding over the whole surface, then turned so the %s is positive"
@@ -2630,8 +4214,9 @@ def _tube_tangents_frames(pts, closed):
     return tangents, frames
 
 
-def _tube_sweep(pts, closed, radius, sides, uv_scale, ends):
-    """(verts, faces, uvs, along) of one round tube along pts. ends: FLAT (a fan cap), ROUND (a hemisphere) or OPEN."""
+def _tube_sweep(pts, closed, radius, sides, uv_scale, ends, phase=0.0):
+    """(verts, faces, uvs, along) of one round tube along pts. ends: FLAT (a fan cap), ROUND (a hemisphere) or OPEN.
+    phase turns the ring (radians): four sides at pi/4 is a square bar with its faces on the frame's axes."""
     m = len(pts)
     tangents, frames = _tube_tangents_frames(pts, closed)
     verts, rings = [], []
@@ -2643,7 +4228,7 @@ def _tube_sweep(pts, closed, radius, sides, uv_scale, ends):
             widen = 1.0 / max(c, 0.2)
         ring = []
         for k in range(sides):
-            ang = 2 * math.pi * k / sides
+            ang = 2 * math.pi * k / sides + phase
             off = nx * math.cos(ang) + bx * math.sin(ang)
             # widen only across the bend (the component in the bend's plane)
             if widen != 1.0:
@@ -6010,7 +7595,1064 @@ def op_build_prop(params):
     return out
 
 
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Roblox kits: an offline preview of a kit placed on a part list, a mirrored side mesh, and UVs packed into an atlas cell
+#.
+# ---------------------------------------------------------------------------------------------------------------------
+_KIT_PREVIEW_KEYS = ("files", "boxes", "cameras", "output", "prefix", "resolution", "keepScene", "colorType")
+_MIRROR_SIDE_KEYS = ("object", "name", "normals", "collection")
+_UV_CELL_KEYS = ("object", "cell", "grid", "pixels", "marginPx", "faces", "materialIndex", "fill", "jitter", "wobble",
+                 "seed", "uvMap")
+
+
+def _matrix4(raw, what, tail):
+    if not (isinstance(raw, (list, tuple)) and len(raw) == 4 and all(isinstance(r, (list, tuple)) and len(r) == 4
+                                                                       for r in raw)):
+        raise MifOpError("%s is a 4x4 matrix (four rows of four numbers). %s" % (what, tail))
+    return Matrix([finite_floats(list(r), what) for r in raw])
+
+
+def _rbx_size_of(objs, k):
+    """The box of these mesh objects' world vertices, on Roblox axes and in studs: Roblox (X, Y, Z) = Blender (-x, z, y)
+    times k studs per Blender unit (RB1156). Axis flips do not change a size, so it is (dx, dz, dy) * k."""
+    lo, hi = [math.inf] * 3, [-math.inf] * 3
+    for o in objs:
+        for v in o.data.vertices:
+            w = o.matrix_world @ v.co
+            for a in range(3):
+                lo[a], hi[a] = min(lo[a], w[a]), max(hi[a], w[a])
+    if lo[0] == math.inf:
+        return None
+    d = [hi[a] - lo[a] for a in range(3)]
+    return [d[0] * k, d[2] * k, d[1] * k]
+
+
+def op_kit_preview(params):
+    """Place a kit's exported meshes by matrices the caller computed, draw boxes for parts with no mesh, and render
+    named cameras, in a scene of its own that is removed afterwards (keepScene keeps it to look at).
+
+    files: [{file, studsPerUnit, meshSize [x, y, z] (the file's box on Roblox axes in studs, read from the file by the
+    caller), instances: [{name, matrix 4x4}], color [r, g, b]?}]. Each file is imported once (Blender's FBX importer), its meshes taken
+    at their world transform and their box checked against meshSize (1%): a file that imported at another scale or turn
+    is refused rather than placed wrong. Each instance is a linked copy with matrix_world = matrix.
+    boxes: [{name, matrix 4x4 (a unit cube's), color [r, g, b]?, shape?}]: shape box (default), cylinder (a unit
+    cylinder whose axis is the matrix's local Y, the axis Roblox's part frame calls up - an R15 head stand-in) or sphere
+    (a unit-diameter sphere). cameras: [{name, matrix 4x4, fovDeg?}].
+    output: a folder; each camera renders to <output>/<prefix>_<camera>.png with Workbench (colorType OBJECT - each
+    file's color and each box's - or TEXTURE to see the files' own images, MATERIAL, SINGLE...; default OBJECT) at resolution [w, h] (default 960 x 540). Each PNG is read back (size).
+    """
+    tail = "NOTHING was rendered."
+    reject_unknown(params, _KIT_PREVIEW_KEYS, "kit_preview")
+    files = take(params, "files", default=[], kind=list)
+    boxes = take(params, "boxes", default=[], kind=list)
+    cams = take(params, "cameras", required=True, kind=list)
+    raw_out = take(params, "output", required=True, kind=str)
+    prefix = take(params, "prefix", default="kit", kind=str)
+    res = take(params, "resolution", default=[960, 540], kind=list)
+    keep = take_bool(params, "keepScene", default=False)
+    ctype = take(params, "colorType", default="OBJECT", kind=str)
+    if not files and not boxes:
+        raise MifOpError("files and boxes are both empty: nothing to place. %s" % tail)
+    if not cams:
+        raise MifOpError("cameras is empty: nothing to render. %s" % tail)
+    if not (len(res) == 2 and all(isinstance(v, int) and 16 <= v <= 4096 for v in res)):
+        raise MifOpError("resolution is [width, height], 16-4096 each. %s" % tail)
+    types = [i.identifier for i in bpy.types.View3DShading.bl_rna.properties["color_type"].enum_items]
+    if ctype not in types:
+        raise MifOpError("colorType is one of %s (this build). %s" % (", ".join(types), tail))
+    if not re.match(r"^[A-Za-z0-9_\-]{1,64}$", prefix):
+        raise MifOpError("prefix is 1-64 letters, digits, _ or -. %s" % tail)
+    out_dir = os.path.abspath(bpy.path.abspath(raw_out))
+    os.makedirs(out_dir, exist_ok=True)
+    plan_files = []
+    for i, f in enumerate(files):
+        if not isinstance(f, dict) or set(f) - {"file", "studsPerUnit", "meshSize", "instances", "color"}:
+            raise MifOpError("files[%d] is {file, studsPerUnit, meshSize, instances, color?}. %s" % (i, tail))
+        path = f.get("file")
+        if not isinstance(path, str) or not os.path.isfile(path):
+            raise MifOpError("files[%d].file %r is not a file. %s" % (i, path, tail))
+        k = finite_float(f.get("studsPerUnit", 1.0), "studsPerUnit")
+        ms = finite_floats(list(f.get("meshSize") or []), "meshSize")
+        if len(ms) != 3 or k <= 0:
+            raise MifOpError("files[%d] needs meshSize [x, y, z] and studsPerUnit above 0. %s" % (i, tail))
+        inst = f.get("instances") or []
+        if not isinstance(inst, list) or not inst:
+            raise MifOpError("files[%d].instances is a non-empty list of {name, matrix}. %s" % (i, tail))
+        mats = [(str(x.get("name") or "inst%d" % j), _matrix4(x.get("matrix"), "files[%d].instances[%d].matrix" % (i, j),
+                                                              tail)) for j, x in enumerate(inst) if isinstance(x, dict)]
+        if len(mats) != len(inst):
+            raise MifOpError("files[%d].instances are {name, matrix}. %s" % (i, tail))
+        fcol = finite_floats(list(f.get("color") or [0.8, 0.8, 0.8]), "files.color")[:3]
+        plan_files.append((path, k, ms, mats, fcol))
+    plan_boxes = []
+    for j, b in enumerate(boxes):
+        if not isinstance(b, dict) or set(b) - {"name", "matrix", "color", "shape"}:
+            raise MifOpError("boxes[%d] is {name, matrix, color?, shape?}. %s" % (j, tail))
+        shape = b.get("shape") or "box"
+        if shape not in ("box", "cylinder", "sphere"):
+            raise MifOpError("boxes[%d].shape is box, cylinder or sphere. %s" % (j, tail))
+        col = finite_floats(list(b.get("color") or [0.6, 0.6, 0.6]), "boxes.color")
+        plan_boxes.append((str(b.get("name") or "box%d" % j), _matrix4(b.get("matrix"), "boxes[%d].matrix" % j, tail),
+                           col[:3], shape))
+    plan_cams = []
+    for j, c in enumerate(cams):
+        if not isinstance(c, dict) or set(c) - {"name", "matrix", "fovDeg"}:
+            raise MifOpError("cameras[%d] is {name, matrix, fovDeg?}. %s" % (j, tail))
+        name = str(c.get("name") or "cam%d" % j)
+        if not re.match(r"^[A-Za-z0-9_\-]{1,64}$", name):
+            raise MifOpError("cameras[%d].name is 1-64 letters, digits, _ or -. %s" % (j, tail))
+        fov = finite_float(c.get("fovDeg", 50.0), "fovDeg")
+        fp = os.path.join(out_dir, "%s_%s.png" % (prefix, name))
+        check_output_path(fp, fp, "rendered")          # every output path checked before anything is made
+        plan_cams.append((name, _matrix4(c.get("matrix"), "cameras[%d].matrix" % j, tail), fov))
+
+    before = {kind: set(getattr(bpy.data, kind)) for kind in ("objects", "meshes", "materials", "images", "armatures",
+                                                               "actions", "cameras", "collections", "worlds")}
+    scene = bpy.data.scenes.new("MifKitPreview")
+    made_meshes, file_rows, rendered = [], [], []
+    try:
+        for path, k, ms, mats, fcol in plan_files:
+            have = set(bpy.data.objects)
+            bpy.ops.import_scene.fbx(filepath=path)
+            new = [o for o in bpy.data.objects if o not in have]
+            meshes = [o for o in new if o.type == "MESH"]
+            if not meshes:
+                raise MifOpError("%s imported no mesh. %s" % (path, tail))
+            dg = bpy.context.evaluated_depsgraph_get()
+            baked = []
+            for o in meshes:
+                me = bpy.data.meshes.new_from_object(o.evaluated_get(dg), preserve_all_data_layers=True, depsgraph=dg)
+                me.transform(o.matrix_world)
+                baked.append(me)
+            made_meshes += baked
+            remove_objects(new)
+            probe = [bpy.data.objects.new("probe", me) for me in baked]
+            got = _rbx_size_of(probe, k)
+            remove_objects(probe)
+            if got is None or any(abs(got[a] - ms[a]) > 0.01 * max(ms) + 1e-6 for a in range(3)):
+                raise MifOpError("%s imported with a box of %s studs on Roblox axes at %g studs per unit, and the caller "
+                                 "read %s from the file: the import's scale or turn is not the one the placements assume. "
+                                 "%s" % (path, [round(v, 4) for v in got or []], k, ms, tail))
+            for name, mtx in mats:
+                for n, me in enumerate(baked):
+                    ob = bpy.data.objects.new("MifKitPreviewMesh", me)   # the preview's own name, in its own scene
+                    ob.matrix_world = mtx
+                    ob.color = (fcol[0], fcol[1], fcol[2], 1.0)
+                    scene.collection.objects.link(ob)
+            file_rows.append({"file": path, "meshes": len(baked), "instances": len(mats),
+                              "importedSizeStuds": [round(v, 4) for v in got]})
+        if plan_boxes:
+            prims = {}
+            for shape in sorted({b[3] for b in plan_boxes}):
+                me = bpy.data.meshes.new("MifKitPreviewBox")
+                bm = bmesh.new()
+                if shape == "box":
+                    bmesh.ops.create_cube(bm, size=1.0)
+                elif shape == "sphere":
+                    bmesh.ops.create_uvsphere(bm, u_segments=24, v_segments=12, radius=0.5)
+                else:
+                    # a unit cylinder along Blender Z, turned so its axis is local Y: the matrices carry Roblox's part
+                    # frame, whose up is Y (kit.blender_matrix applies diag(size) in that frame)
+                    bmesh.ops.create_cone(bm, cap_ends=True, segments=32, radius1=0.5, radius2=0.5, depth=1.0,
+                                          matrix=Matrix.Rotation(math.radians(-90.0), 4, "X"))
+                bm.to_mesh(me)
+                bm.free()
+                made_meshes.append(me)
+                prims[shape] = me
+            for name, mtx, col, shape in plan_boxes:
+                ob = bpy.data.objects.new("MifKitPreviewBox", prims[shape])   # the preview's own name, in its own scene
+                ob.matrix_world = mtx
+                ob.color = (col[0], col[1], col[2], 1.0)
+                ob.display_type = "SOLID"
+                scene.collection.objects.link(ob)
+        scene.render.engine = "BLENDER_WORKBENCH"
+        scene.display.shading.light = "STUDIO"
+        scene.display.shading.color_type = ctype
+        scene.render.resolution_x, scene.render.resolution_y = res
+        scene.render.resolution_percentage = 100
+        scene.render.image_settings.file_format = "PNG"
+        scene.world = bpy.data.worlds.new("MifKitPreviewWorld")
+        for name, mtx, fov in plan_cams:
+            # the preview's own names, in a scene of its own that is removed: never a caller's name to clash
+            cd = bpy.data.cameras.new("MifKitPreviewCam")
+            cd.angle = math.radians(fov)
+            cd.clip_end = 100000.0
+            cam = bpy.data.objects.new("MifKitPreviewCam", cd)
+            cam.matrix_world = mtx
+            scene.collection.objects.link(cam)
+            scene.camera = cam
+            fp = os.path.join(out_dir, "%s_%s.png" % (prefix, name))
+            scene.render.filepath = fp
+            bpy.ops.render.render(write_still=True, scene=scene.name)
+            if not os.path.isfile(fp):
+                raise MifOpError("the render of camera %s wrote no file at %s" % (name, fp))
+            img = bpy.data.images.load(fp, check_existing=False)
+            size = list(img.size)
+            bpy.data.images.remove(img)
+            if size != list(res):
+                raise MifOpError("%s reads %s, not the %s asked" % (fp, size, res))
+            rendered.append({"camera": name, "file": fp, "size": size})
+    finally:
+        if not keep:
+            remove_objects(list(scene.objects))
+            bpy.data.scenes.remove(scene)
+            for kind, had in before.items():
+                coll = getattr(bpy.data, kind)
+                for item in list(coll):
+                    # never the Render Result or a compositing viewer: Blender owns them and reuses them on the next
+                    # render; this op only removes what it made
+                    if kind == "images" and getattr(item, "type", "") in ("RENDER_RESULT", "COMPOSITING"):
+                        continue
+                    if item not in had and getattr(item, "users", 0) == 0:
+                        coll.remove(item)
+    return {"files": file_rows, "boxes": len(plan_boxes), "rendered": rendered, "output": out_dir,
+            "sceneKept": scene.name if keep else None,
+            "instances": sum(r["instances"] * r["meshes"] for r in file_rows)}
+
+
+def _mesh_signed_volume(me):
+    """A Mesh datablock's signed volume (bmesh). NAMED APART (FOUND 2026-11-22): it was also called _signed_volume, and
+    defined after the (verts, faces) one, so every two-argument caller in this file raised TypeError - the kit, prop,
+    lathe, eyelet and garment builders among them."""
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    v = bm.calc_volume(signed=True)
+    bm.free()
+    return v
+
+
+def op_mirror_side(params):
+    """Make the other side of a part as its own object: the mesh mirrored across its local X, every face's winding
+    reversed (so it is not inside out), custom split normals cleared and the normals rebuilt from the mirrored shape
+    (normals weighted adds a Weighted Normal modifier, face area, keep sharp; keep copies the source's modifiers, which
+    then rebuild from the new data; smooth or flat set the shading). Roblox has no negative scale, so a left limb is a
+    separate export. name defaults to the source's with _R and _L swapped. Answers both signed volumes
+    (bmesh calc_volume); a mirror whose volume differs in sign from the source's is removed and refused.
+    """
+    tail = "NOTHING was created."
+    reject_unknown(params, _MIRROR_SIDE_KEYS, "mirror_side")
+    src = get_object(take(params, "object", required=True, kind=str), want_mesh=True)
+    name = take(params, "name", default=None, kind=str)
+    normals = take(params, "normals", default="keep", kind=str)
+    if normals not in ("keep", "weighted", "smooth", "flat"):
+        raise MifOpError("normals is keep, weighted, smooth or flat. %s" % tail)
+    if name is None:
+        if src.name.endswith("_R"):
+            name = src.name[:-2] + "_L"
+        elif src.name.endswith("_L"):
+            name = src.name[:-2] + "_R"
+        else:
+            raise MifOpError("%s does not end in _R or _L, so the other side's name is not known: pass name. %s"
+                             % (src.name, tail))
+    if bpy.data.objects.get(name) is not None:
+        raise MifOpError("an object named %s already exists. %s" % (name, tail))
+    coll_name = take(params, "collection", default=None, kind=str)
+    coll = bpy.data.collections.get(coll_name) if coll_name else None
+    if coll_name and coll is None:
+        raise MifOpError("no collection named %s. %s" % (coll_name, tail))
+    vol_src = _mesh_signed_volume(src.data)
+    me = src.data.copy()
+    me.name = name
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    for v in bm.verts:
+        v.co.x = -v.co.x
+    bmesh.ops.reverse_faces(bm, faces=list(bm.faces), flip_multires=True)
+    bm.to_mesh(me)
+    bm.free()
+    ob = bpy.data.objects.new(name, me)
+    ob.matrix_world = src.matrix_world.copy()
+    for c in (([coll] if coll else None) or src.users_collection):
+        c.objects.link(ob)
+    had_custom = bool(getattr(me, "has_custom_normals", False))
+    if had_custom:
+        with bpy.context.temp_override(object=ob, active_object=ob, selected_objects=[ob],
+                                       selected_editable_objects=[ob]):
+            bpy.ops.mesh.customdata_custom_splitnormals_clear()
+    if normals == "keep":
+        for m in src.modifiers:
+            if m.type == "WEIGHTED_NORMAL":
+                nm = ob.modifiers.new(m.name, "WEIGHTED_NORMAL")
+                for prop in ("mode", "weight", "keep_sharp", "use_face_influence", "thresh"):
+                    if hasattr(m, prop):
+                        setattr(nm, prop, getattr(m, prop))
+    elif normals == "weighted":
+        nm = ob.modifiers.new("WeightedNormal", "WEIGHTED_NORMAL")
+        nm.mode, nm.keep_sharp = "FACE_AREA", True
+        for p in me.polygons:
+            p.use_smooth = True
+    else:
+        for p in me.polygons:
+            p.use_smooth = normals == "smooth"
+    vol = _mesh_signed_volume(me)
+    if (vol > 0) != (vol_src > 0) or abs(vol) < 1e-12:
+        remove_objects([ob])
+        bpy.data.meshes.remove(me)
+        raise MifOpError("the mirror's signed volume is %g against the source's %g: its faces would not face the same "
+                         "way. %s" % (vol, vol_src, tail))
+    return {"object": ob.name, "source": src.name, "vertices": len(me.vertices), "faces": len(me.polygons),
+            "signedVolume": round(vol, 9), "sourceSignedVolume": round(vol_src, 9), "customNormalsCleared": had_custom,
+            "normals": normals, "modifiers": [m.type for m in ob.modifiers]}
+
+
+def _cell_inner(cell, grid, pixels, margin):
+    """(u0, v0, u1, v1) of a cell's inner area; cell is [col, row] with row 0 at the image top (mif_roblox/kit.py)."""
+    col, row = cell
+    cw = pixels / float(grid)
+    return ((col * cw + margin) / pixels, 1.0 - ((row + 1) * cw - margin) / pixels,
+            ((col + 1) * cw - margin) / pixels, 1.0 - (row * cw + margin) / pixels)
+
+
+def op_uv_to_cell(params):
+    """Pack faces' UVs into one cell of a palette atlas (a grid x grid image of flat colors, pixels a side), inside its
+    inner area marginPx from each edge so mipmaps do not bleed the neighbours in. Each face keeps its own
+    UV shape (or a planar projection on its own plane when its UVs have no area), scaled to fill (0.1-1) of the inner
+    area, then moved by a seeded random offset of jitter (0-1) of the room left and given a positional wobble (0-0.2)
+    so the cell's baked grime varies face to face. faces (indices) or materialIndex picks the faces; default every face.
+    Every packed UV is read back inside the inner area, or the old UVs are put back and the call refused.
+    """
+    tail = "NOTHING was changed."
+    reject_unknown(params, _UV_CELL_KEYS, "uv_to_cell")
+    ob = get_object(take(params, "object", required=True, kind=str), want_mesh=True)
+    cell = take(params, "cell", required=True, kind=list)
+    grid = take_int(params, "grid", default=16)
+    pixels = take_int(params, "pixels", default=1024)
+    margin = take_float(params, "marginPx", default=20.0)
+    fill = take_float(params, "fill", default=0.6)
+    jitter = take_float(params, "jitter", default=0.5)
+    wobble = take_float(params, "wobble", default=0.0)
+    seed = take_int(params, "seed", default=1)
+    if not (1 <= grid <= 256 and pixels >= grid and 0 <= margin < pixels / grid / 2.0):
+        raise MifOpError("grid is 1-256, pixels at least grid, marginPx under half a cell. %s" % tail)
+    if not (len(cell) == 2 and all(isinstance(v, int) and 0 <= v < grid for v in cell)):
+        raise MifOpError("cell is [col, row] inside the %d-cell grid (row 0 at the image top). %s" % (grid, tail))
+    if not (0.1 <= fill <= 1.0 and 0.0 <= jitter <= 1.0 and 0.0 <= wobble <= 0.2):
+        raise MifOpError("fill is 0.1-1, jitter 0-1, wobble 0-0.2. %s" % tail)
+    me = ob.data
+    uv_name = take(params, "uvMap", default=None, kind=str)
+    faces = take(params, "faces", default=None, kind=list)
+    mat_index = take_int(params, "materialIndex", default=None)
+    layer = me.uv_layers.get(uv_name) if uv_name else me.uv_layers.active
+    if layer is None and (uv_name or me.uv_layers):
+        raise MifOpError("no UV map %r on %s. %s" % (uv_name, ob.name, tail))
+    if faces is not None and mat_index is not None:
+        raise MifOpError("pass faces or materialIndex, not both. %s" % tail)
+    if faces is not None:
+        if not all(isinstance(i, int) and 0 <= i < len(me.polygons) for i in faces):
+            raise MifOpError("faces are indices 0-%d. %s" % (len(me.polygons) - 1, tail))
+        polys = [me.polygons[i] for i in sorted(set(faces))]
+    elif mat_index is not None:
+        polys = [p for p in me.polygons if p.material_index == mat_index]
+    else:
+        polys = list(me.polygons)
+    if not polys:
+        raise MifOpError("no faces chosen: nothing to pack. %s" % tail)
+    made_layer = layer is None
+    if made_layer:
+        layer = me.uv_layers.new(name="UVMap")
+    u0, v0, u1, v1 = _cell_inner(cell, grid, pixels, margin)
+    iw, ih = u1 - u0, v1 - v0
+    rnd_ = random.Random(seed)
+    data = layer.data
+    old = {li: tuple(data[li].uv) for p in polys for li in p.loop_indices}
+    for p in polys:
+        pts = [tuple(data[li].uv) for li in p.loop_indices]
+        us, vs = [q[0] for q in pts], [q[1] for q in pts]
+        if (max(us) - min(us)) * (max(vs) - min(vs)) < 1e-12:
+            n = p.normal
+            ax = Vector((1, 0, 0)) if abs(n.x) < 0.9 else Vector((0, 1, 0))
+            t = n.cross(ax).normalized()
+            b = n.cross(t)
+            pts = [((me.vertices[me.loops[li].vertex_index].co).dot(t), (me.vertices[me.loops[li].vertex_index].co).dot(b))
+                   for li in p.loop_indices]
+            us, vs = [q[0] for q in pts], [q[1] for q in pts]
+        bw, bh = max(max(us) - min(us), 1e-9), max(max(vs) - min(vs), 1e-9)
+        sc = min(iw / bw, ih / bh) * fill
+        room_u, room_v = iw - bw * sc, ih - bh * sc
+        off_u = u0 + room_u / 2.0 + (rnd_.random() - 0.5) * room_u * jitter
+        off_v = v0 + room_v / 2.0 + (rnd_.random() - 0.5) * room_v * jitter
+        for (qu, qv), li in zip(pts, p.loop_indices):
+            u = off_u + (qu - min(us)) * sc
+            v = off_v + (qv - min(vs)) * sc
+            if wobble:
+                co = me.vertices[me.loops[li].vertex_index].co
+                u += math.sin(co.x * 7.1 + co.y * 3.3) * wobble * room_u / 2.0
+                v += math.sin(co.z * 5.7 + co.x * 2.9) * wobble * room_v / 2.0
+            data[li].uv = (min(max(u, u0), u1), min(max(v, v0), v1))
+    bad = [li for p in polys for li in p.loop_indices
+           if not (u0 - 1e-6 <= data[li].uv[0] <= u1 + 1e-6 and v0 - 1e-6 <= data[li].uv[1] <= v1 + 1e-6)]
+    if bad:
+        for li, uv in old.items():
+            data[li].uv = uv
+        raise MifOpError("%d packed UV(s) read back outside the cell's inner area; the old UVs were put back" % len(bad))
+    return {"object": ob.name, "uvMap": layer.name, "uvMapCreated": made_layer, "cell": list(cell), "facesPacked": len(polys),
+            "loopsPacked": len(old), "inner": [round(u0, 6), round(v0, 6), round(u1, 6), round(v1, 6)],
+            "grid": grid, "pixels": pixels, "marginPx": margin, "verified": True}
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Hit targets on a skinned creature, sampled along its bones: each target is the first hit of a ray
+# aimed at a point on a bone, with the chunk it hit and whether that chunk is skinned to the bone.
+# ---------------------------------------------------------------------------------------------------------------------
+_BONE_HITS_KEYS = ("armature", "rows", "chunks", "distance", "studsPerUnit", "output", "prefix", "resolution",
+                   "sphereRadius")
+_RBX = Matrix(((-1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, 1.0, 0.0)))   # Roblox axes <-> Blender axes, its own inverse
+
+
+def _deformed_by(arm):
+    out = []
+    for ob in bpy.data.objects:
+        if ob.type != "MESH":
+            continue
+        if any(m.type == "ARMATURE" and m.object == arm for m in ob.modifiers) or ob.parent == arm:
+            out.append(ob)
+    return sorted(out, key=lambda o: o.name)
+
+
+def op_bone_hit_targets(params):
+    """Sample hit targets on a skinned mesh along its bones. For each row {bone, along (0 head - 1 tail, default 0.5),
+    direction [x, y, z] (the side the ray comes from, on Roblox axes: -Z is the creature's front), name?} a ray starts
+    `distance` out from the point on the bone (posed, in the evaluated scene) and travels back toward it; the first
+    surface it meets among the chunks (default: every mesh the armature deforms) is the target. Each answer: the point
+    in the game's frame (Roblox axes, studsPerUnit studs per Blender unit, default 1), the chunk hit, skinnedToBone
+    (that chunk has weights for the bone), faceWeight (the bone's largest weight on the hit face's vertices), the hit
+    face's dominant bone, and own (the dominant bone is the named one). output renders a check: front and side, a
+    sphere at each point (green own, red not), in a scene of its own that is removed. Read only otherwise."""
+    tail = "NOTHING was changed."
+    reject_unknown(params, _BONE_HITS_KEYS, "bone_hit_targets")
+    arm = get_object(take(params, "armature", required=True, kind=str))
+    if arm.type != "ARMATURE":
+        raise MifOpError("%s is a %s, not an armature. %s" % (arm.name, arm.type, tail))
+    rows = take(params, "rows", required=True, kind=list)
+    if not rows or len(rows) > 500:
+        raise MifOpError("rows is a list of 1-500 {bone, along?, direction, name?}. %s" % tail)
+    names = take(params, "chunks", default=None, kind=list)
+    chunks = [get_object(n) for n in names] if names else _deformed_by(arm)
+    if not chunks or any(c.type != "MESH" for c in chunks):
+        raise MifOpError("no mesh chunks: give chunks, or deform meshes with %s. %s" % (arm.name, tail))
+    k = take_float(params, "studsPerUnit", default=1.0)
+    if not k > 0:
+        raise MifOpError("studsPerUnit is above 0. %s" % tail)
+    dg = bpy.context.evaluated_depsgraph_get()
+    lo, hi = [math.inf] * 3, [-math.inf] * 3
+    trees = []
+    for c in chunks:
+        ev = c.evaluated_get(dg)
+        me = ev.to_mesh()
+        try:
+            verts = [c.matrix_world @ v.co for v in me.vertices]
+            polys = [list(p.vertices) for p in me.polygons]
+            for v in verts:
+                for a in range(3):
+                    lo[a], hi[a] = min(lo[a], v[a]), max(hi[a], v[a])
+            trees.append((c, BVHTree.FromPolygons(verts, polys), polys))
+        finally:
+            ev.to_mesh_clear()
+    span = max(hi[a] - lo[a] for a in range(3))
+    dist = take_float(params, "distance", default=span * 2.0)
+    plan = []
+    for i, r in enumerate(rows):
+        if not isinstance(r, dict) or set(r) - {"bone", "along", "direction", "name"}:
+            raise MifOpError("rows[%d] is {bone, along?, direction, name?}. %s" % (i, tail))
+        pb = arm.pose.bones.get(str(r.get("bone")))
+        if pb is None:
+            raise MifOpError("rows[%d]: %s has no bone %r. %s" % (i, arm.name, r.get("bone"), tail))
+        along = finite_float(r.get("along", 0.5), "along")
+        d = finite_floats(list(r.get("direction") or []), "direction")
+        if len(d) != 3 or Vector(d).length < 1e-9 or not 0.0 <= along <= 1.0:
+            raise MifOpError("rows[%d]: direction is a non-zero [x, y, z] and along 0-1. %s" % (i, tail))
+        plan.append((str(r.get("name") or "%s_%d" % (pb.name, i)), pb, along, (_RBX @ Vector(d)).normalized()))
+    out_rows = []
+    for name, pb, along, dirv in plan:
+        aim = arm.matrix_world @ pb.head.lerp(pb.tail, along)
+        origin = aim + dirv * dist
+        best = None
+        for c, tree, polys in trees:
+            loc, _n, idx, d = tree.ray_cast(origin, -dirv, dist * 2.0)
+            if loc is not None and (best is None or d < best[3]):
+                best = (c, loc, idx, d, polys)
+        row = {"name": name, "bone": pb.name, "along": along, "aim": rnd(list(_RBX @ aim * k)), "hit": best is not None}
+        if best:
+            c, loc, idx, _d, polys = best
+            vg = c.vertex_groups.get(pb.name)
+            face = polys[idx]
+            weights, dom = {}, {}
+            for vi in face:
+                for g in c.data.vertices[vi].groups:
+                    gname = c.vertex_groups[g.group].name
+                    dom[gname] = dom.get(gname, 0.0) + g.weight
+                    if vg is not None and g.group == vg.index:
+                        weights[vi] = g.weight
+            skinned = False
+            if vg is not None:
+                skinned = any(g.group == vg.index and g.weight > 0 for v in c.data.vertices for g in v.groups)
+            dominant = max(dom, key=dom.get) if dom else None
+            row.update(point=rnd(list(_RBX @ loc * k)), chunk=c.name, faceIndex=int(idx), skinnedToBone=skinned,
+                       faceWeight=round(max(weights.values()) if weights else 0.0, 6), dominantBone=dominant,
+                       own=dominant == pb.name, distanceFromBone=round((loc - aim).length * k, 6),
+                       blenderPoint=rnd(list(loc)))
+        out_rows.append(row)
+    result = {"armature": arm.name, "chunks": [c.name for c in chunks], "rows": out_rows,
+              "hits": sum(1 for r in out_rows if r["hit"]), "notOwn": [r["name"] for r in out_rows if r["hit"] and not r["own"]],
+              "missed": [r["name"] for r in out_rows if not r["hit"]], "studsPerUnit": k}
+    raw_out = take(params, "output", default=None, kind=str)
+    if raw_out:
+        prefix = take(params, "prefix", default="hits", kind=str)
+        res = take(params, "resolution", default=[960, 960], kind=list)
+        if not re.match(r"^[A-Za-z0-9_\-]{1,64}$", prefix) or not (len(res) == 2 and all(isinstance(v, int) and 16 <= v <= 4096
+                                                                                       for v in res)):
+            raise MifOpError("prefix is 1-64 letters, digits, _ or -; resolution [w, h] 16-4096. The answer above is "
+                             "complete; nothing was rendered.")
+        rad = take_float(params, "sphereRadius", default=span * 0.02)
+        out_dir = os.path.abspath(bpy.path.abspath(raw_out))
+        for cam in ("front", "side"):          # every output path checked before the render scene is made
+            fp = os.path.join(out_dir, "%s_%s.png" % (prefix, cam))
+            check_output_path(fp, fp, "rendered")
+        os.makedirs(out_dir, exist_ok=True)
+        result["rendered"] = _bone_hits_render(chunks, arm, out_rows, rad, lo, hi, out_dir, prefix, res)
+    return result
+
+
+def _bone_hits_render(chunks, arm, rows, rad, lo, hi, out_dir, prefix, res):
+    before = {kind: set(getattr(bpy.data, kind)) for kind in ("objects", "meshes", "materials", "cameras", "worlds")}
+    scene = bpy.data.scenes.new("MifBoneHits")
+    rendered = []
+    try:
+        scene.collection.objects.link(arm)
+        for c in chunks:
+            scene.collection.objects.link(c)
+        mats = {}
+        for own, col in ((True, (0.1, 0.9, 0.2, 1.0)), (False, (1.0, 0.1, 0.1, 1.0))):
+            m = bpy.data.materials.new("MifBoneHitsOwn" if own else "MifBoneHitsOther")
+            m.diffuse_color = col
+            mats[own] = m
+        sm = bpy.data.meshes.new("MifBoneHitsSphere")
+        bm = bmesh.new()
+        bmesh.ops.create_uvsphere(bm, u_segments=16, v_segments=8, radius=rad)
+        bm.to_mesh(sm)
+        bm.free()
+        for r in rows:
+            if not r["hit"]:
+                continue
+            me = sm.copy()
+            me.materials.append(mats[bool(r["own"])])
+            ob = bpy.data.objects.new("MifBoneHit", me)
+            ob.location = Vector(r["blenderPoint"])
+            scene.collection.objects.link(ob)
+        mid = Vector([(lo[a] + hi[a]) / 2 for a in range(3)])
+        span = max(hi[a] - lo[a] for a in range(3))
+        scene.render.engine = "BLENDER_WORKBENCH"
+        scene.display.shading.light = "STUDIO"
+        scene.display.shading.color_type = "MATERIAL"
+        scene.render.resolution_x, scene.render.resolution_y = res
+        scene.render.resolution_percentage = 100
+        scene.render.image_settings.file_format = "PNG"
+        scene.world = bpy.data.worlds.new("MifBoneHitsWorld")
+        # Roblox front is -Z, which is Blender -Y: the front camera stands at -Y looking +Y
+        for name, off in (("front", Vector((0.0, -1.0, 0.15))), ("side", Vector((1.0, 0.0, 0.15)))):
+            cd = bpy.data.cameras.new("MifBoneHitsCam")
+            cd.angle = math.radians(40.0)
+            cd.clip_end = span * 100.0
+            cam = bpy.data.objects.new("MifBoneHitsCam", cd)
+            cam.location = mid + off.normalized() * span * 1.8
+            cam.rotation_euler = (mid - cam.location).to_track_quat("-Z", "Y").to_euler()
+            scene.collection.objects.link(cam)
+            scene.camera = cam
+            fp = os.path.join(out_dir, "%s_%s.png" % (prefix, name))   # checked by the caller before this scene
+            scene.render.filepath = fp
+            bpy.ops.render.render(write_still=True, scene=scene.name)
+            if not os.path.isfile(fp):
+                raise MifOpError("the render of camera %s wrote no file at %s" % (name, fp))
+            rendered.append({"camera": name, "file": fp})
+    finally:
+        hits = [o for o in scene.objects if o.name.startswith(("MifBoneHit", "MifBoneHitsCam"))]
+        for o in list(scene.objects):
+            if o not in hits:
+                scene.collection.objects.unlink(o)
+        remove_objects(hits)
+        bpy.data.scenes.remove(scene)
+        for kind, had in before.items():
+            coll = getattr(bpy.data, kind)
+            for item in list(coll):
+                if item not in had and getattr(item, "users", 0) == 0:
+                    coll.remove(item)
+    return rendered
+
+# ------------------------------------------------------------------------------------------------------ kit_audit
+_KIT_AUDIT_KEYS = ("objects", "object", "tags", "tagProperty", "tagAttribute", "tagNames", "allow", "ground",
+                   "tileLength", "tileAxis", "report", "tolerance", "coplanar", "planeToleranceCm", "minAreaCm2")
+_AUDIT_FAIL_VERDICTS = ("INTERSECTING", "A_INSIDE_B", "B_INSIDE_A")
+
+
+def _audit_box(obj, depsgraph):
+    """(min, max) of an object's evaluated mesh in world space, or None when it has no vertices."""
+    ev = obj.evaluated_get(depsgraph)
+    me = ev.to_mesh()
+    try:
+        pts = [obj.matrix_world @ v.co for v in me.vertices]
+    finally:
+        ev.to_mesh_clear()
+    if not pts:
+        return None
+    return [min(p[i] for p in pts) for i in range(3)], [max(p[i] for p in pts) for i in range(3)], len(pts)
+
+
+def _split_loose(obj, attr, tag_names):
+    """Temporary objects, one per loose part of obj (world matrix kept), each with its tag: the most common value of the
+    INT face attribute attr mapped through tag_names, else <object>.part<k>."""
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    layer = bm.faces.layers.int.get(attr) if attr else None
+    if attr and layer is None:
+        bm.free()
+        raise MifOpError("'%s' has no INT face attribute '%s' to tag its parts by. NOTHING was audited." % (obj.name, attr))
+    seen, comps = set(), []
+    for f in bm.faces:
+        if f.index in seen:
+            continue
+        stack, comp = [f], []
+        seen.add(f.index)
+        while stack:
+            g = stack.pop()
+            comp.append(g)
+            for v in g.verts:
+                for h in v.link_faces:
+                    if h.index not in seen:
+                        seen.add(h.index)
+                        stack.append(h)
+        comps.append(comp)
+    made = []
+    for k, comp in enumerate(comps):
+        sub = bmesh.new()
+        vm = {}
+        for fc in comp:
+            vs = []
+            for v in fc.verts:
+                if v.index not in vm:
+                    vm[v.index] = sub.verts.new(v.co)
+                vs.append(vm[v.index])
+            sub.faces.new(vs)
+        tag = "%s.part%d" % (obj.name, k + 1)
+        if layer is not None:
+            counts = {}
+            for fc in comp:
+                counts[fc[layer]] = counts.get(fc[layer], 0) + 1
+            val = max(sorted(counts), key=lambda x: counts[x])
+            if isinstance(tag_names, list) and 0 <= val < len(tag_names):
+                tag = str(tag_names[val])
+            elif isinstance(tag_names, dict) and str(val) in tag_names:
+                tag = str(tag_names[str(val)])
+            else:
+                tag = "%s=%d" % (attr, val)
+        me = bpy.data.meshes.new("MifAudit_%s_%d" % (obj.name, k + 1))
+        sub.to_mesh(me)
+        sub.free()
+        o = bpy.data.objects.new(me.name, me)
+        o.matrix_world = obj.matrix_world.copy()
+        bpy.context.scene.collection.objects.link(o)
+        made.append((o, tag))
+    bm.free()
+    return made
+
+
+def op_kit_audit(params):
+    """Every pair of a kit piece's parts tested for shared volume, and its same-plane faces for z-fighting, before upload.
+
+    WHY. A kit piece's primitives that cut into each other (a shutter through a window frame, a post
+    through an eave) pass every per-mesh check - triangles, materials, UVs, watertight - and the Roblox lint skips meshes,
+    so nothing looks inside a mesh. Tiles that carry their end piece at both ends draw two posts where they meet.
+
+    objects: the piece's parts, kept apart (two or more mesh objects); or object: one mesh split here by loose parts into
+    temporary objects (removed afterwards). A part's tag is tags[name], else its custom property tagProperty (default
+    kitTag), else its name; a split part's tag is the most common value of the INT face attribute tagAttribute mapped
+    through tagNames (a list, or {value: tag}), else <object>.part<k>.
+    Every pair whose world boxes meet (within tolerance) goes through objects_overlap (geometry, not boxes): INTERSECTING,
+    A_INSIDE_B and B_INSIDE_A fail; TOUCHING, NEAR and DISJOINT pass. coplanar (default true) runs coplanar_overlaps on all
+    the parts (ground: true puts an occluder plane at the parts' lowest point, a number at that height), and every overlap
+    between two parts fails. allow: [{tags: [a, b], reason}] lets a pair of tags share volume or a plane - each reason
+    required - and every allowed pair is listed with its reason.
+    tileLength (with tileAxis X, Y or Z, default X): a copy of every part offset by one tile is audited against the
+    piece, so an end piece carried at both ends (doubled: a copy's box equal to a part's, within tolerance) fails.
+    report: a .json path the whole answer is written to. clean is true only when nothing fails; ok false names the
+    failures (with the full answer) so a caller's upload step can refuse the piece.
+    """
+    reject_unknown(params, _KIT_AUDIT_KEYS, "kit_audit")
+    from .ops_query import op_coplanar_overlaps, op_objects_overlap
+    tail = "NOTHING was audited."
+    names = take(params, "objects", default=None)
+    single = take(params, "object", default=None)
+    if (names is None) == (single is None):
+        raise MifOpError("give objects (the piece's parts) or object (one mesh, split by loose parts), not both. %s" % tail)
+    tags_in = take(params, "tags", default={}) or {}
+    tag_prop = take(params, "tagProperty", default="kitTag", kind=str)
+    tag_attr = take(params, "tagAttribute", default=None)
+    tag_names = take(params, "tagNames", default=None)
+    allow_in = take(params, "allow", default=[]) or []
+    ground = take(params, "ground", default=False)
+    tile_len = take(params, "tileLength", default=None)
+    tile_axis = take(params, "tileAxis", default="X", kind=str).upper()
+    report = take(params, "report", default=None)
+    tol = take_float(params, "tolerance", default=1e-4)
+    coplanar = take_bool(params, "coplanar", default=True)
+    plane_tol = take(params, "planeToleranceCm", default=None)
+    min_area = take(params, "minAreaCm2", default=None)
+    if not isinstance(tags_in, dict) or not all(isinstance(v, str) and v for v in tags_in.values()):
+        raise MifOpError("tags is {object name: tag}. %s" % tail)
+    if tag_attr is not None and not (isinstance(tag_attr, str) and tag_attr):
+        raise MifOpError("tagAttribute is the name of an INT face attribute. %s" % tail)
+    if tag_names is not None and not isinstance(tag_names, (list, dict)):
+        raise MifOpError("tagNames is a list (attribute value -> tag) or {value: tag}. %s" % tail)
+    allow = {}
+    if not isinstance(allow_in, list):
+        raise MifOpError("allow is a list of {tags: [a, b], reason}. %s" % tail)
+    for i, a in enumerate(allow_in):
+        pair = a.get("tags") if isinstance(a, dict) else None
+        reason = a.get("reason") if isinstance(a, dict) else None
+        if (not isinstance(a, dict) or set(a) - {"tags", "reason"} or not isinstance(pair, list) or len(pair) != 2
+                or not all(isinstance(t, str) and t for t in pair)):
+            raise MifOpError("allow[%d] is {tags: [a, b], reason}. %s" % (i, tail))
+        if not isinstance(reason, str) or not reason.strip():
+            raise MifOpError("allow[%d] (%s, %s) has no reason: every allowed pair says why. %s" % (i, pair[0], pair[1], tail))
+        allow[tuple(sorted(pair))] = reason.strip()
+    if not (isinstance(ground, bool) or (isinstance(ground, (int, float)) and math.isfinite(ground))):
+        raise MifOpError("ground is true (an occluder at the parts' lowest point), a height, or false. %s" % tail)
+    ground_z = None if isinstance(ground, bool) else finite_float(ground, "ground")   # read before anything is made
+    if tile_len is not None:
+        tile_len = finite_float(tile_len, "tileLength")
+        if tile_len <= 0:
+            raise MifOpError("tileLength is above 0. %s" % tail)
+        if tile_axis not in ("X", "Y", "Z"):
+            raise MifOpError("tileAxis is X, Y or Z. %s" % tail)
+    if tol < 0:
+        raise MifOpError("tolerance cannot be negative. %s" % tail)
+    if report is not None:
+        if not isinstance(report, str) or not report.lower().endswith(".json"):
+            raise MifOpError("report is a .json path. %s" % tail)
+        report = os.path.abspath(bpy.path.abspath(report))
+        check_output_path(report, report, "audited")
+
+    temps = []
+    try:
+        if single is not None:
+            src = get_object(single, want_mesh=True)
+            parts = _split_loose(src, tag_attr, tag_names)
+            temps += [o for o, _t in parts]
+        else:
+            if not isinstance(names, list) or len(names) < 2 or not all(isinstance(n, str) and n for n in names):
+                raise MifOpError("objects is a list of two or more mesh object names. %s" % tail)
+            if len(set(names)) != len(names):
+                raise MifOpError("objects names an object twice. %s" % tail)
+            parts = []
+            for n in names:
+                o = get_object(n, want_mesh=True)
+                t = tags_in.get(n)
+                if t is None:
+                    t = o.get(tag_prop) if tag_prop else None
+                parts.append((o, str(t) if isinstance(t, str) and t else o.name))
+        if len(parts) < 2:
+            raise MifOpError("the piece has %d part(s): an all-pairs audit needs two or more. %s" % (len(parts), tail))
+        copies = []
+        if tile_len is not None:
+            off = Vector((tile_len if tile_axis == "X" else 0.0, tile_len if tile_axis == "Y" else 0.0,
+                          tile_len if tile_axis == "Z" else 0.0))
+            for o, t in parts:
+                c = bpy.data.objects.new("%s@tile" % o.name, o.data)
+                c.matrix_world = Matrix.Translation(off) @ o.matrix_world
+                bpy.context.scene.collection.objects.link(c)
+                temps.append(c)
+                copies.append((c, t))
+        bpy.context.view_layer.update()
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        boxes = {}
+        for o, _t in parts + copies:
+            b = _audit_box(o, depsgraph)
+            if b is None:
+                raise MifOpError("'%s' has no vertices. %s" % (o.name, tail))
+            boxes[o.name] = b
+        tag_of = {o.name: t for o, t in parts + copies}
+
+        def meet(a, b):
+            (amin, amax, _n), (bmin, bmax, _m) = boxes[a], boxes[b]
+            return all(amin[i] <= bmax[i] + tol and bmin[i] <= amax[i] + tol for i in range(3))
+
+        pairs = []
+        for i in range(len(parts)):
+            for j in range(i + 1, len(parts)):
+                pairs.append((parts[i][0].name, parts[j][0].name, "piece"))
+        for o, _t in parts:
+            for c, _ct in copies:
+                pairs.append((o.name, c.name, "tile"))
+        failing, allowed, tested = [], [], 0
+        for a, b, where in pairs:
+            if not meet(a, b):
+                continue
+            tested += 1
+            key = tuple(sorted((tag_of[a], tag_of[b])))
+            verdict, why = None, None
+            if where == "tile":
+                (amin, amax, an), (bmin, bmax, bn) = boxes[a], boxes[b]
+                if an == bn and all(abs(amin[k] - bmin[k]) <= max(tol, 1e-5) and abs(amax[k] - bmax[k]) <= max(tol, 1e-5)
+                                    for k in range(3)):
+                    verdict, why = "DOUBLED", "drawn twice where two tiles meet: carry the end piece on one side only (L129)"
+            if verdict is None:
+                r = op_objects_overlap({"a": a, "b": b, "tolerance": tol})
+                verdict = r.get("verdict")
+                if verdict not in _AUDIT_FAIL_VERDICTS:
+                    continue
+                why = "shares volume"
+            row = {"a": a, "b": b, "tags": [tag_of[a], tag_of[b]], "verdict": verdict, "where": where, "why": why}
+            if key in allow:
+                allowed.append(dict(row, reason=allow[key]))
+            else:
+                failing.append(row)
+        same_plane, plane_allowed, cop = [], [], None
+        ground_obj = None
+        if coplanar:
+            occ = []
+            if ground is not False:
+                low = min(bx[0][2] for bx in boxes.values())
+                z = low if ground is True else ground_z
+                lo = [min(bx[0][k] for bx in boxes.values()) for k in range(2)]
+                hi = [max(bx[1][k] for bx in boxes.values()) for k in range(2)]
+                pad = max(hi[0] - lo[0], hi[1] - lo[1], 1.0)
+                gm = bpy.data.meshes.new("MifAuditGround")
+                gm.from_pydata([(lo[0] - pad, lo[1] - pad, z), (hi[0] + pad, lo[1] - pad, z), (hi[0] + pad, hi[1] + pad, z),
+                                (lo[0] - pad, hi[1] + pad, z)], [], [(0, 1, 2, 3)])
+                ground_obj = bpy.data.objects.new("MifAuditGround", gm)
+                bpy.context.scene.collection.objects.link(ground_obj)
+                temps.append(ground_obj)
+                occ = [ground_obj.name]
+            cp = {"objects": [o.name for o, _t in parts + copies], "occluders": occ, "limit": 1000}
+            if plane_tol is not None:
+                cp["planeToleranceCm"] = plane_tol
+            if min_area is not None:
+                cp["minAreaCm2"] = min_area
+            cop = op_coplanar_overlaps(cp)
+            copy_names = {c.name for c, _t in copies}
+            for r in cop.get("overlaps") or []:
+                a, b = r["objects"]
+                if a in copy_names and b in copy_names:
+                    continue                                   # the copy against itself repeats the piece
+                if a == b and a in copy_names:
+                    continue
+                key = tuple(sorted((tag_of.get(a, a), tag_of.get(b, b))))
+                row = {"a": a, "b": b, "tags": [tag_of.get(a, a), tag_of.get(b, b)], "areaCm2": r.get("areaCm2"),
+                       "point": r.get("pointBU"), "normal": r.get("normal"),
+                       "where": "tile" if (a in copy_names or b in copy_names) else "piece"}
+                # one row per pair of parts: how many triangle pairs overlap and the largest one's area (a quad over
+                # a quad is several triangle pairs covering the same patch, so their areas are not summed)
+                sink = plane_allowed if key in allow else same_plane
+                prev = next((x for x in sink if {x.get("a"), x.get("b")} == {a, b}), None)
+                if prev is not None:
+                    prev["overlaps"] += 1
+                    prev["largestCm2"] = max(prev["largestCm2"], r.get("areaCm2") or 0.0)
+                    continue
+                row.pop("areaCm2", None)
+                row["overlaps"], row["largestCm2"] = 1, r.get("areaCm2") or 0.0
+                sink.append(dict(row, reason=allow[key]) if key in allow else row)
+            if cop.get("overlapsTruncated"):
+                same_plane.append({"a": None, "b": None, "truncated": True,
+                                   "why": "%d same-plane overlaps, only the largest 1000 were listed" % cop.get("overlapsTotal")})
+        used_allow = {tuple(sorted(r["tags"])) for r in allowed + plane_allowed}
+        out = {
+            "parts": [{"name": o.name, "tag": t} for o, t in parts],
+            "split": single is not None, "tile": {"length": tile_len, "axis": tile_axis} if tile_len is not None else None,
+            "pairsTotal": len(pairs), "pairsTested": tested, "failing": failing, "allowed": allowed,
+            "samePlane": same_plane, "samePlaneAllowed": plane_allowed,
+            "coplanar": None if cop is None else {k: cop.get(k) for k in ("triangles", "overlapsTotal", "visibleAreaCm2",
+                                                                            "dropped", "occluders")},
+            "allowUnused": [{"tags": list(k), "reason": v} for k, v in sorted(allow.items()) if k not in used_allow],
+            "clean": not failing and not same_plane,
+        }
+    finally:
+        if temps:
+            meshes = [o.data for o in temps if o.data is not None and o.data.name.startswith(("MifAudit",))]
+            remove_objects(temps)
+            for me in meshes:
+                if me.users == 0:
+                    bpy.data.meshes.remove(me)
+    if report:
+        os.makedirs(os.path.dirname(report), exist_ok=True)
+        with open(report, "w", encoding="utf-8") as fh:
+            json.dump(out, fh, indent=1, default=str)
+        out["report"] = report
+    if not out["clean"]:
+        err = MifOpError("%d part pair(s) share volume or are doubled and %d same-plane overlap(s) are not allowed: %s" % (
+            len(failing), len(same_plane), "; ".join("%s x %s %s" % (r["a"], r["b"], r["verdict"]) for r in failing[:4])
+            or "; ".join("%s x %s %.3g cm2" % (r["a"], r["b"], r.get("largestCm2") or 0) for r in same_plane[:4])))
+        err.payload = out
+        raise err
+    return out
+
+
+# ---------------------------------------------------------------------------------------------------- split_plates
+_SPLIT_KEYS = ("object", "axis", "count", "cuts", "overlap", "lip", "name", "keepSource", "leading")
+_SPLIT_AXES = {"X": (1.0, 0.0, 0.0), "Y": (0.0, 1.0, 0.0), "Z": (0.0, 0.0, 1.0)}
+
+
+def _split_piece(src, mw, axis, lo, hi):
+    """A world bmesh of src between the planes t = lo and t = hi along axis, each cut capped: (bm, caps made)."""
+    bm = bmesh.new()
+    bm.from_mesh(src.data)
+    bm.transform(mw)
+    for t, keep_above in ((lo, True), (hi, False)):
+        if t is None:
+            continue
+        geom = bm.verts[:] + bm.edges[:] + bm.faces[:]
+        bmesh.ops.bisect_plane(bm, geom=geom, plane_co=axis * t, plane_no=axis, dist=1e-7,
+                               clear_inner=keep_above, clear_outer=not keep_above)
+    edges = [e for e in bm.edges if e.is_boundary]
+    before = len(bm.faces)
+    if edges:
+        bmesh.ops.holes_fill(bm, edges=edges, sides=0)
+    return bm, len(bm.faces) - before
+
+
+def op_split_plates(params):
+    """Split a closed part along its length into overlapping plates - shingled armour lames, segmented panels - each
+    piece closed and capped, named in order along the axis.
+
+    THE GAP (FOUND 2026-11-18, one build): big armour plates needed splitting into overlapping shingled plates with a
+    lip, and no op sliced a closed mesh into such pieces - bisect_plane cuts and caps one plane at a time and grows
+    nothing - so the build sub-lofted its own stations driver-side.
+
+    object: a mesh, closed. axis: X, Y, Z (world) or a vector [x, y, z]. count (2-64) splits its extent along the axis
+    evenly, or cuts [t, ...] gives the cut positions (world, along the axis, inside the extent). overlap (metres,
+    default 0) - each piece runs overlap / 2 past each inner cut, so neighbours share overlap. lip {height, width}: the
+    leading edge of each piece but the last (its end toward the next piece; leading START makes it the start) is pushed
+    out from the part's own centre line by height, fading to 0 over width (default 2 x overlap) - the edge that rides
+    over the next plate. Each cut is capped (holes filled), so a closed part gives closed pieces; each piece's reply row
+    gives its span along the axis, boundary and non-manifold edge counts and its overlap with the next. name (default the
+    object's) names pieces <name>_01, _02, ... in order; keepSource (default false) keeps the original, else it is
+    removed. Refused, nothing changed: a mesh with no faces, count outside 2-64 with no cuts, both count and cuts, a cut
+    outside the extent or two in the wrong order, overlap below 0 or as long as a piece, a piece that comes out empty.
+    """
+    tail = "NOTHING was changed."
+    reject_unknown(params, _SPLIT_KEYS, "split_plates")
+    src = get_object(take(params, "object", required=True, kind=str), want_mesh=True)
+    if not src.data.polygons:
+        raise MifOpError("'%s' has no faces to split. %s" % (src.name, tail))
+    ax = params.get("axis", "Z")
+    if isinstance(ax, str):
+        if ax.upper() not in _SPLIT_AXES:
+            raise MifOpError("axis is X, Y, Z or [x, y, z], got %r. %s" % (ax, tail))
+        axis = Vector(_SPLIT_AXES[ax.upper()])
+    elif isinstance(ax, (list, tuple)) and len(ax) == 3:
+        axis = Vector(finite_floats(list(ax), "axis"))
+        if axis.length < 1e-9:
+            raise MifOpError("axis has no length. %s" % tail)
+        axis.normalize()
+    else:
+        raise MifOpError("axis is X, Y, Z or [x, y, z], got %r. %s" % (ax, tail))
+    mw = src.matrix_world.copy()
+    world = [mw @ v.co for v in src.data.vertices]
+    ts = [p.dot(axis) for p in world]
+    t0, t1 = min(ts), max(ts)
+    if t1 - t0 < 1e-9:
+        raise MifOpError("'%s' has no extent along the axis. %s" % (src.name, tail))
+    if params.get("count") is not None and params.get("cuts") is not None:
+        raise MifOpError("pass count (even pieces) OR cuts (positions along the axis), not both. %s" % tail)
+    if params.get("cuts") is not None:
+        raw = params["cuts"]
+        if not isinstance(raw, (list, tuple)) or not raw or len(raw) > 63:
+            raise MifOpError("cuts is a list of 1-63 positions along the axis. %s" % tail)
+        cuts = finite_floats(list(raw), "cuts")
+        if any(not t0 < c < t1 for c in cuts) or any(b <= a for a, b in zip(cuts, cuts[1:])):
+            raise MifOpError("cuts must rise along the axis and lie inside the part's extent %.6g to %.6g, got %r. %s"
+                             % (t0, t1, cuts, tail))
+    else:
+        count = take_int(params, "count", default=3)
+        if not 2 <= count <= 64:
+            raise MifOpError("count is 2-64 pieces, got %d. %s" % (count, tail))
+        cuts = [t0 + (t1 - t0) * k / count for k in range(1, count)]
+    bounds = [t0] + list(cuts) + [t1]
+    overlap = take_float(params, "overlap", default=0.0)
+    shortest = min(b - a for a, b in zip(bounds, bounds[1:]))
+    if not math.isfinite(overlap) or overlap < 0 or overlap >= shortest:
+        raise MifOpError("overlap is 0 or more and under the shortest piece (%.6g), got %r. %s" % (shortest, overlap,
+                                                                                                   tail))
+    lip = params.get("lip")
+    lip_h = lip_w = 0.0
+    if lip is not None:
+        if not isinstance(lip, dict) or set(lip) - {"height", "width"} or lip.get("height") is None:
+            raise MifOpError("lip is {height, width} (metres), got %r. %s" % (lip, tail))
+        lip_h = finite_float(lip["height"], "lip.height")
+        lip_w = finite_float(lip.get("width", 2.0 * overlap or shortest / 4.0), "lip.width")
+        if lip_h <= 0 or lip_w <= 0:
+            raise MifOpError("lip.height and lip.width must be above 0. %s" % tail)
+    leading = str(take(params, "leading", default="END", kind=str)).upper()
+    if leading not in ("END", "START"):
+        raise MifOpError("leading is END (each piece's end rides over the next) or START, got %r. %s" % (leading, tail))
+    base_name = take(params, "name", default=src.name, kind=str)
+    keep = take_bool(params, "keepSource", default=False)
+    centre = sum(world, Vector()) / len(world)
+    pieces, made = [], []
+    n = len(bounds) - 1
+    try:
+        for i in range(n):
+            lo = None if i == 0 else bounds[i] - overlap / 2.0
+            hi = None if i == n - 1 else bounds[i + 1] + overlap / 2.0
+            bm, caps = _split_piece(src, mw, axis, lo, hi)
+            if not bm.faces:
+                bm.free()
+                raise MifOpError("piece %d (%.6g to %.6g along the axis) came out empty. %s"
+                                 % (i + 1, lo if lo is not None else t0, hi if hi is not None else t1, tail))
+            lipped = 0
+            if lip_h and i < n - 1 and leading == "END" or lip_h and i > 0 and leading == "START":
+                edge_t = hi if leading == "END" else lo
+                for v in bm.verts:
+                    dist = abs(edge_t - v.co.dot(axis))
+                    if dist >= lip_w:
+                        continue
+                    rel = v.co - centre
+                    rad = rel - axis * rel.dot(axis)
+                    if rad.length < 1e-9:
+                        continue
+                    v.co += rad.normalized() * (lip_h * (1.0 - dist / lip_w) ** 2)
+                    lipped += 1
+            bm.transform(mw.inverted())
+            want = "%s_%02d" % (base_name, i + 1)
+            me = bpy.data.meshes.new(want)
+            bm.to_mesh(me)
+            boundary = sum(1 for e in bm.edges if e.is_boundary)
+            nonman = sum(1 for e in bm.edges if not e.is_manifold and not e.is_boundary)
+            bm.free()
+            for m in src.data.materials:
+                me.materials.append(m)
+            obj = bpy.data.objects.new(want, me)
+            for col in src.users_collection:
+                col.objects.link(obj)
+            obj.matrix_world = mw
+            made.append(obj)
+            pts = [(mw @ v.co).dot(axis) for v in me.vertices]
+            pieces.append({"name": obj.name, "requestedName": want, "nameWasSuffixed": obj.name != want, "index": i + 1, "from": round(min(pts), 6), "to": round(max(pts), 6),
+                           "capsMade": caps, "boundaryEdges": boundary, "nonManifoldEdges": nonman,
+                           "closed": boundary == 0 and nonman == 0, "lipVertices": lipped,
+                           "counts": mesh_counts_of(me)})
+    except Exception:
+        remove_objects(made)
+        raise
+    for a, b in zip(pieces, pieces[1:]):
+        a["overlapWithNext"] = round(a["to"] - b["from"], 6)
+    removed = None
+    if not keep:
+        removed = remove_objects([src])
+    return {"object": params.get("object"), "axis": [round(x, 6) for x in axis], "extent": [round(t0, 6), round(t1, 6)],
+            "cuts": [round(c, 6) for c in cuts], "overlap": overlap,
+            "lip": {"height": lip_h, "width": lip_w, "leading": leading} if lip_h else None,
+            "pieces": pieces, "allClosed": all(p["closed"] for p in pieces), "sourceRemoved": removed}
+
+
+def mesh_counts_of(me):
+    return {"verts": len(me.vertices), "faces": len(me.polygons)}
+
+
 OPS = {
+    "kit_preview": op_kit_preview,
+    "kit_audit": op_kit_audit,
+    "bone_hit_targets": op_bone_hit_targets,
+    "mirror_side": op_mirror_side,
+    "uv_to_cell": op_uv_to_cell,
     "build_prop": op_build_prop,
     "build_vehicle_body": op_build_vehicle_body,
     "build_downspout": op_build_downspout,
@@ -6020,6 +8662,10 @@ OPS = {
     "build_trash_bag": op_build_trash_bag,
     "build_tube": op_build_tube,
     "build_kit_piece": op_build_kit_piece,
+    "build_stairs": op_build_stairs,
+    "build_railing": op_build_railing,
+    "build_sign": op_build_sign,
     "set_vertex_color_by_rule": op_set_vertex_color_by_rule,
     "build_lod_chain": op_build_lod_chain,
+    "split_plates": op_split_plates,
 }

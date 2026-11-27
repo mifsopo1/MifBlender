@@ -46,12 +46,13 @@ except ImportError:                     # pragma: no cover - every Blender 3.6-5
 from .ops_common import remove_objects, MifOpError, finite_float, reject_unknown, take, take_bool, take_float, take_int
 from .ops_create import _created, _link_new, _place, _place_values, _resolve_collection
 from .ops_mesh import op_create_collision_hull, op_uv_unwrap, uv_degeneracy
-from .ops_tree import _materials as _tree_materials, _outline_leaf, _tube
+from .ops_tree import _materials as _tree_materials, _outline_leaf, _tube, bake_card_material, game_lods
 
 # MODULE-LEVEL AND PLAIN LITERALS: parity_check.py resolves an accepted-key expression statically.
 BUILD_ROCK_PARAMS = (
     "name", "kind", "seed", "size", "triangles", "sink", "weathering", "strata", "stoneColor", "stoneColor2",
-    "moss", "collision", "location", "rotation", "collection",
+    "moss", "collision", "location", "rotation", "collection", "noiseAmplitude", "noiseFrequency", "output",
+    "triangleBudget", "bake", "textureFolder", "textureSize", "lods",
 )
 
 _ROCK_NOTES = {
@@ -59,15 +60,43 @@ _ROCK_NOTES = {
     "dimensions": "pass size [length, width, height] in centimeters.",
     "detail": "detail is set by triangles, the count the rock is reduced to (Nanite takes the dense end).",
     "subdivisions": "detail is set by triangles, the count the rock is reduced to.",
-    "noise": "the surface detail comes from the kind and weathering; there is no free noise amplitude to set.",
+    "noise": "pass noiseAmplitude (cm) and noiseFrequency (per meter) for the surface's low undulation; the fine "
+             "detail comes from the kind and weathering.",
+    "amplitude": "pass noiseAmplitude, in centimeters.",
+    "frequency": "pass noiseFrequency, in waves per meter.",
+    "noiseScale": "pass noiseFrequency, in waves per meter (a larger value is smaller lumps).",
     "material": "the rock gets its own procedural stone material; stoneColor, stoneColor2 and moss tune it.",
     "pivot": "the pivot is always the bottom center, with the rock sunk `sink` centimeters below it.",
-    "lod": "no LODs are made: in Unreal a rock is meant for Nanite, and generate_lods covers an engine without it.",
+    "lod": "the default output makes no LODs (in Unreal a rock is meant for Nanite); output gameReady makes them with "
+           "build_lod_chain (lods, default [0.5, 0.25]).",
+    "budget": "output gameReady builds the rock at triangleBudget, by default the top of the usual range for its size "
+              "class - the number mesh_quality gameReady holds it to; triangles is then the dense rock it bakes from.",
     "uv": "two UV layers are always made: UVMap tiles at one meter per unit, UVLightmap is 0-1 without overlaps.",
     "color": "pass stoneColor (and stoneColor2) as [r, g, b], linear 0-1.",
 }
 
 _ROCK_KINDS = ("boulder", "slab", "cliff")
+# ---- output gameReady: the rock at the game budget, the dense rock baked onto it where that measured a gain ----------
+# WHY: the dense rock is a Nanite mesh (30,000 to 120,000 triangles) against the 7,780 or 36,014 mesh_quality gameReady
+# holds a medium or large piece to. Rebuilt at the budget from the same field a rock keeps its shape but loses the fine
+# cracks, and a bake of the dense rock (base color, normal, roughness) brings back what the kind measured to regain.
+# THE BAKE GOES THROUGH UVLightmap: UVMap tiles at a meter a unit, so its islands overlap in 0-1 and a bake through it
+# came out 32-45 off in color with half the detail (2026-11-26).
+_ROCK_OUTPUTS = ("geometry", "gameReady")
+# BAKE BY KIND, from renders of each against its dense rock (2026-11-26, 5.0.1, Cycles 640x480, two views; detail is the
+# render's fine-detail energy - luminance less its 2 px blur - as a share of the dense rock's): a cliff kept 0.57-0.61 of
+# it at the budget and 0.87-1.03 baked, its mean color 8.2 and 5.4 off the dense rock's -> 5.4 and 4.0. A slab baked
+# rendered dark streaks (detail 1.19-1.61, past the dense rock's own): 29% of its baked normal texels faced into the stone,
+# its thin laminae and bedding planes being more than the budget surface can follow, and a shorter reach (a quarter)
+# still left 21% tilted past 60 degrees, so a slab is not baked unless asked. A boulder at the budget stays within 1 cm of
+# its dense rock (99th percentile) and its bake does not hold up close: at 640x480 it took the detail from 0.74-0.78 to
+# 0.84-0.85, at 1280x960 from 0.96-1.01 down to 0.48-0.58 (seeds 1 and 3; the baked maps cannot carry the stone
+# material's finest noise), where the cliff held at both (1280x960, seeds 1 and 3: 0.59-0.71 -> 0.88-1.18, color
+# 5.7-8.8 off -> 4.4-6.4).
+_ROCK_BAKE = {"boulder": False, "slab": False, "cliff": True}
+_ROCK_BAKE_TYPES = ("BASE_COLOR", "NORMAL", "ROUGHNESS")
+_ROCK_DEFAULT_LODS = (0.5, 0.25)
+_ROCK_GAME_KEYS = ("triangleBudget", "bake", "textureFolder", "textureSize", "lods")
 # Per kind: the default size in cm [length, width, height], the triangle budget, the sink as a share of the height,
 # and whether strata show. The budgets sit in the large-mesh range a Nanite rock is built at; pass triangles for less.
 _ROCK_DEFAULTS = {
@@ -77,6 +106,25 @@ _ROCK_DEFAULTS = {
     "cliff": {"size": (800.0, 300.0, 600.0), "triangles": 120000, "sink": 0.03, "strata": True, "weathering": 0.25},
 }
 _MIN_TRIANGLES, _MAX_TRIANGLES = 500, 1000000
+# noiseAmplitude (cm) is at most this share of the rock's shortest side; noiseFrequency (per meter) is in this range.
+# Past a quarter of the shortest side the noise is the shape, not its surface; past 20 per meter its finest octave is a
+# few centimeters, which the grid at a default budget cannot draw.
+_NOISE_AMP_MAX_SHARE = 0.25
+_NOISE_FREQ_RANGE = (0.05, 20.0)
+
+
+def _rock_noise_default(kind, size_m):
+    """The kind's own low undulation - (amplitude in meters, frequency per meter, octaves) - from its size in meters:
+    the values build_rock used before amplitude and frequency could be set, and still uses when they are not."""
+    L, W, H = size_m
+    s = (L * W * H) ** (1.0 / 3.0)
+    if kind == "boulder":
+        return (s * 0.008, 2.5 / s, 2)
+    if kind == "slab":
+        return (H * 0.05, 1.2 / s, 2)
+    return (W * 0.08, 0.9 / min(L, H), 3)
+
+
 _UV_TILE_M = 1.0
 _CHUNK = 400000
 
@@ -198,7 +246,7 @@ class _RockField:
     rock's edges are faceted. An isotropic noise on top was tried first and read as dough, not stone. Carving is the
     concave work: notches and cracks."""
 
-    def __init__(self, kind, size_m, weathering, strata, seed, cell):
+    def __init__(self, kind, size_m, weathering, strata, seed, cell, noise=None):
         self.kind = kind
         self.L, self.W, self.H = size_m
         self.s = (self.L * self.W * self.H) ** (1.0 / 3.0)
@@ -217,6 +265,10 @@ class _RockField:
         self.warp = (0.0, 1.0)
         self.fractures = []       # (cell size per axis, amplitude, slope, seed)
         getattr(self, "_setup_" + kind)()
+        if noise is not None:
+            # THE CALLER'S NOISE replaces the kind's undulation only: it draws nothing from the seed, so the rest of the
+            # rock - planes, chips, strata - is the same rock at any amplitude and frequency
+            self.undulation = (float(noise[0]), float(noise[1]), self.undulation[2])
         self._setup_chips()
 
     # ---- shared pieces ----------------------------------------------------------------------------------------------
@@ -367,7 +419,7 @@ class _RockField:
             d1 = self._ellipsoid_support(n1, a, b, c) * rng.uniform(0.5, 0.68)
             d2 = self._ellipsoid_support(n2, a, b, c) * rng.uniform(0.4, 0.62)
             self.notches.append((n1, d1, n2, d2, self.s * 0.008))
-        self.undulation = (self.s * 0.008, 2.5 / self.s, 2)
+        self.undulation = _rock_noise_default("boulder", (self.L, self.W, self.H))
         self.warp = (self.s * 0.05, 1.5 / self.s)
         self._add_fractures((((self.s * 0.3,) * 3, self.s * 0.008, 3.0), ((self.s * 0.11,) * 3, self.s * 0.003, 3.0)))
 
@@ -420,7 +472,7 @@ class _RockField:
             ang = rng.uniform(0.0, math.pi)
             return np.array((math.cos(ang), math.sin(ang), rng.uniform(-0.1, 0.1)))
         self._add_cracks(rng.randint(1, 2), vertical, self.s * 0.006, self.H * 0.45)
-        self.undulation = (self.H * 0.05, 1.2 / self.s, 2)
+        self.undulation = _rock_noise_default("slab", (self.L, self.W, self.H))
         self.warp = (self.s * 0.02, 1.4 / self.s)
         self._setup_laminae(self.H * rng.uniform(0.09, 0.16))
         self._add_fractures((((self.s * 0.28, self.s * 0.28, self.H * 0.5), self.H * 0.03, 2.0),
@@ -506,7 +558,7 @@ class _RockField:
             n /= np.linalg.norm(n)
             self.planes.append((n, 0.5 * L * rng.uniform(0.9, 1.0), 0.04 * D))
         self._stack_planes()
-        self.undulation = (D * 0.08, 0.9 / min(L, H), 3)
+        self.undulation = _rock_noise_default("cliff", (L, D, H))
         self.warp = (min(L, H) * 0.05, 1.3 / min(L, H))
         self.groove = (max(0.018 * min(L, H), 2.5 * self.cell), 0.05 * D + 2.0 * self.cell)
         # BROKEN FACES: tall cells a meter or so across and smaller ones in them, so a block's face is not one sheet with
@@ -1264,6 +1316,143 @@ def _rock_grid(field, size_m, cell):
     return F, lo
 
 
+def _rock_game_plan(params, output, kind, name, size, triangles):
+    """output gameReady's own values, every one checked before anything is made. Returns the plan _rock_game_ready
+    builds from."""
+    from .ops_mesh import _CONV_TRIS, _conv_size_class                   # noqa: PLC0415
+    bake = take_bool(params, "bake", default=_ROCK_BAKE[kind])
+    size_class = _conv_size_class(max(size))
+    if params.get("triangleBudget") is None:
+        budget = _CONV_TRIS[size_class][1]
+        how = {"from": "sizeClass", "sizeClass": size_class, "longestSideCm": round(max(size), 1)}
+    else:
+        budget = take_int(params, "triangleBudget")
+        how = {"from": "given"}
+        if not _MIN_TRIANGLES <= budget <= _MAX_TRIANGLES:
+            raise MifOpError("triangleBudget is %d; it must be %d to %d. NOTHING was created."
+                             % (budget, _MIN_TRIANGLES, _MAX_TRIANGLES))
+    if budget >= triangles:
+        raise MifOpError("output gameReady builds the rock at triangleBudget (%d) and bakes it from the dense rock built at "
+                         "triangles (%d), so triangles must be the larger - raise triangles or lower triangleBudget. "
+                         "NOTHING was created." % (budget, triangles))
+    folder, tex_size = None, 2048
+    if bake:
+        from .ops_gamebake import _folder                                   # noqa: PLC0415
+        if params.get("textureFolder") is None:
+            raise MifOpError("output gameReady bakes this %s to textures in textureFolder - pass a folder, or bake false "
+                             "for the budget rock alone. NOTHING was created." % kind)
+        folder = _folder({"folder": take(params, "textureFolder", kind=str)}, "NOTHING was created.")
+        tex_size = take_int(params, "textureSize", default=2048)
+        if tex_size not in (256, 512, 1024, 2048, 4096):
+            raise MifOpError("textureSize is %d; it is the baked maps' side, a power of two from 256 to 4096. NOTHING "
+                             "was created." % tex_size)
+    else:
+        unused = [k for k in ("textureFolder", "textureSize") if params.get(k) is not None]
+        if unused:
+            raise MifOpError("bake is false, so no texture is written and %s has nothing to do - leave it out, or bake "
+                             "true. NOTHING was created." % " and ".join(unused))
+    lods = game_lods(params, _ROCK_DEFAULT_LODS)
+    if len(name) > 52:
+        raise MifOpError("name is %d characters; output gameReady bakes from <name>_BakeSource, so it can be at most 52 "
+                         "(Blender keeps 63). NOTHING was created." % len(name))
+    if bpy.data.objects.get(name + "_BakeSource") is not None:
+        raise MifOpError("an object named '%s_BakeSource' already exists; output gameReady builds the dense rock under "
+                         "that name - remove it or pick another name. NOTHING was created." % name)
+    if bake and bpy.data.materials.get(name + "_Baked") is not None:
+        raise MifOpError("a material named '%s_Baked' already exists; the baked material takes that name - pick another "
+                         "name. NOTHING was created." % name)
+    return {"name": name, "kind": kind, "bake": bake, "bakeAsked": params.get("bake") is not None, "budget": budget,
+            "budgetFrom": how, "dense": triangles, "folder": folder, "size": tex_size, "lods": lods}
+
+
+def _remove_rock(obj):
+    """An object build_rock made, its mesh and every material only it held."""
+    if obj is None or obj.name not in bpy.data.objects:
+        return
+    me = obj.data
+    mats = [m for m in me.materials if m is not None]
+    remove_objects([obj])
+    if me.users == 0:
+        bpy.data.meshes.remove(me)
+    for m in mats:
+        if m.users == 0:
+            bpy.data.materials.remove(m)
+
+
+def _rock_bake_reach(low, dense):
+    """How far the dense surface lies from the budget one, both ways (each vertex to the other mesh's nearest point; the
+    two objects share one transform, so their local coordinates compare): the 99.9th percentile of either, a quarter
+    over, and 2 mm. The bake's rays start that far out along the budget surface and travel twice that."""
+    from mathutils.bvhtree import BVHTree                                   # noqa: PLC0415
+    worst = 0.0
+    for a, b in ((low.data, dense.data), (dense.data, low.data)):
+        tree = BVHTree.FromPolygons([v.co for v in b.vertices], [tuple(p.vertices) for p in b.polygons])
+        d = np.array([tree.find_nearest(v.co)[3] for v in a.vertices], float)
+        worst = max(worst, float(np.percentile(d, 99.9)))
+    return 1.25 * worst + 0.002
+
+
+def _rock_game_ready(params, game, started):
+    """output gameReady: the rock rebuilt at the budget from the same field (output geometry, triangles the budget), then,
+    where `bake`, the dense rock built beside it under <name>_BakeSource, baked onto its UVLightmap layer (base color,
+    normal, roughness, through bake_card_material) and removed. The baked material replaces the stone one. LODs by
+    build_lod_chain last. A failed bake removes the budget rock too, so a refused call leaves nothing behind."""
+    skip = set(_ROCK_GAME_KEYS) | {"output", "triangles", "name"}
+    base = {k: v for k, v in params.items() if k not in skip}
+    name = game["name"]
+    out = op_build_rock(dict(base, name=name, triangles=game["budget"]))
+    low = bpy.data.objects[out["name"]]
+    hull = bpy.data.objects.get((out.get("collisionHull") or {}).get("object") or "")
+    block = {"denseTriangles": game["dense"], "baked": game["bake"], "triangleBudgetFrom": game["budgetFrom"]}
+    if game["bake"]:
+        dense, mat = None, None
+        try:
+            src = op_build_rock(dict(base, name=name + "_BakeSource", triangles=game["dense"], collision=False))
+            dense = bpy.data.objects[src["name"]]
+            block["denseTriangles"] = src.get("triangles")
+            reach = _rock_bake_reach(low, dense)
+            stone = [m for m in low.data.materials if m is not None]
+            mat, files = bake_card_material(low, [dense], game["folder"], "T_%s_{suffix}" % name, game["size"],
+                                            game["size"], reach, 2.0 * reach, name + "_Baked", margin=16,
+                                            types=list(_ROCK_BAKE_TYPES), alpha=False, uv_layer="UVLightmap")
+            low.data.materials[0] = mat
+            for m in stone:
+                if m.users == 0:
+                    bpy.data.materials.remove(m)
+        finally:
+            _remove_rock(dense)
+            if mat is None:
+                _remove_rock(hull)
+                _remove_rock(low)
+        # the bake made UVLightmap the active layer; UVMap is the first again, as the geometry output leaves it
+        low.data.uv_layers.active = low.data.uv_layers["UVMap"]
+        out["material"] = mat.name
+        block.update({"material": mat.name, "bakeReachCm": round(reach * 100.0, 2),
+                      "textures": {"files": files, "size": [game["size"], game["size"]], "folder": game["folder"],
+                                   "uvLayer": "UVLightmap",
+                                   "note": "baked through UVLightmap, the 0-1 layer without overlaps; the material "
+                                           "reads them there (UV channel 1 in an engine)"}})
+    else:
+        block["note"] = ("no bake (%s). The material is the procedural stone preview, which an engine does not "
+                         "receive - UVMap tiles for a tiling rock texture and Col carries the cavity, exposure and "
+                         "ground masks" % ("bake false" if game["bakeAsked"] else "a %s's bake measured no gain that "
+                                           "holds; bake true makes one" % game["kind"]))
+    from .ops_mesh import triangle_budget_for_size                         # noqa: PLC0415
+    lod_reply = None
+    if game["lods"]:
+        from .ops_kit import op_build_lod_chain                             # noqa: PLC0415
+        lod_reply = op_build_lod_chain({"object": low.name, "ratios": game["lods"]})
+    n = sum(len(p.vertices) - 2 for p in low.data.polygons)
+    budget = triangle_budget_for_size(low) or {}
+    out["output"] = "gameReady"
+    out["gameReady"] = dict(block, triangles=n, triangleBudget=game["budget"], budget=budget,
+                            withinBudget=n <= game["budget"],
+                            lods=(lod_reply or {}).get("lods"), lodGroup=(lod_reply or {}).get("group"),
+                            check={"call": "mesh_quality", "args": {"object": low.name, "gameReady": True}})
+    out["elapsedSeconds"] = round(time.perf_counter() - started, 2)
+    return out
+
+
 def op_build_rock(params):
     """Build one rock - a boulder, a slab or a cliff face - as ONE mesh object with one stone material, its pivot at
     the bottom center with the rock sunk slightly below it, in the size asked for. The same seed and parameters give
@@ -1281,12 +1470,32 @@ def op_build_rock(params):
                             height for a boulder, 8% for a slab, 3% for a cliff; 0 to half the height
       weathering (0-1)      0 fresh-broken, sharp edges; 1 worn and rounded. Default boulder 0.2, slab 0.2, cliff 0.25
       strata (bool)         layers and bedding planes; default on for slab and cliff, off for boulder
+      noiseAmplitude (cm)   how far the surface's low undulation moves it, 0 (none) to a quarter of the shortest side.
+                            Default the kind's own, from its size: boulder 0.8% of the cube root of its volume (0.88
+                            cm at the default size), slab 5% of its height, cliff 8% of its depth
+      noiseFrequency (/m)   that undulation's waves per meter, 0.05 to 20 (larger is smaller lumps). Default the kind's
+                            own: boulder 2.5, slab 1.2 over the cube root of its volume; cliff 0.9 over the smaller of
+                            its length and height. The reply reads both back as noiseAmplitudeCm and
+                            noiseFrequencyPerM, with noiseDefault saying which were the kind's
       stoneColor, stoneColor2 ([r,g,b] linear 0-1)   the stone's two tones
       moss (0-1)            moss on up-facing exposed faces in the preview material; default 0
       collision (bool)      a UCX_<name>_00 convex hull; default on
       location ([x,y,z] or {x,y,z})   in METERS (Blender units), not centimeters like size and sink
       rotation ([x,y,z] or {x,y,z})   in RADIANS, XYZ Euler
       collection
+      output (str)          geometry (default): the rock as above. gameReady: the rock rebuilt from the same field at
+                            triangleBudget, a game's count, and - for a cliff, or any kind with bake - the dense rock
+                            (built at triangles) baked onto it: base color, normal and roughness through UVLightmap,
+                            wired into <name>_Baked, which replaces <name>_Stone. The reply's gameReady block says what
+                            was made
+      triangleBudget (int)  gameReady only: LOD0's triangles, 500 to 1000000 and under triangles; default the top of the
+                            usual range for the rock's size class, the number mesh_quality gameReady holds it to
+      bake (bool)           gameReady only: bake the dense rock onto the budget one; default true for a cliff, false
+                            for a boulder and a slab (measured, _ROCK_BAKE: a cliff regains most of the detail the
+                            budget lost, a boulder nothing that holds at a closer look, and a slab bakes streaked)
+      textureFolder (str)   gameReady with a bake, required there: where T_<name>_BC / _N / _R.png are written
+      textureSize (int)     gameReady with a bake: the maps' side, a power of two from 256 to 4096, default 2048
+      lods (list)           gameReady only: build_lod_chain's ratios, default [0.5, 0.25]; [] for none
     UNITS, read off the code (2026-10-03, a short film): size and sink are centimeters (divided by 100 before
     anything is built); location and rotation go to the object as given, through ops_create._place_values - meters
     and radians.
@@ -1321,11 +1530,36 @@ def op_build_rock(params):
         raise MifOpError("weathering is %g; it must be 0 (fresh-broken) to 1 (worn round). NOTHING was created."
                          % weathering)
     strata = take_bool(params, "strata", default=cfg["strata"])
+    size_m = tuple(v / 100.0 for v in size)
+    noise_amp_m, noise_freq, _octaves = _rock_noise_default(kind, size_m)
+    noise_default = {"amplitude": params.get("noiseAmplitude") is None, "frequency": params.get("noiseFrequency") is None}
+    amp_max = _NOISE_AMP_MAX_SHARE * min(size)
+    noise_amp_cm = take_float(params, "noiseAmplitude", default=noise_amp_m * 100.0)
+    if not 0.0 <= noise_amp_cm <= amp_max:
+        raise MifOpError("noiseAmplitude is %g cm; it must be 0 to a quarter of the shortest side (%g cm). NOTHING was "
+                         "created." % (noise_amp_cm, amp_max))
+    noise_freq = take_float(params, "noiseFrequency", default=noise_freq)
+    if not _NOISE_FREQ_RANGE[0] <= noise_freq <= _NOISE_FREQ_RANGE[1]:
+        raise MifOpError("noiseFrequency is %g per meter; it must be %g to %g. NOTHING was created."
+                         % ((noise_freq,) + _NOISE_FREQ_RANGE))
+    # the default amplitude goes to the field as the meters it was computed in, not through centimeters and back
+    noise = (noise_amp_m if noise_default["amplitude"] else noise_amp_cm / 100.0, noise_freq)
     color = _color3(params, "stoneColor", (0.085, 0.08, 0.072))
     color2 = _color3(params, "stoneColor2", (0.23, 0.215, 0.19))
     moss = take_float(params, "moss", default=0.0)
     if not 0.0 <= moss <= 1.0:
         raise MifOpError("moss is %g; it must be 0 to 1. NOTHING was created." % moss)
+    output = take(params, "output", default="geometry", kind=str)
+    if output not in _ROCK_OUTPUTS:
+        raise MifOpError("output must be one of %s, got '%s'. NOTHING was created." % (", ".join(_ROCK_OUTPUTS), output))
+    game = _rock_game_plan(params, output, kind, name, size, triangles) if output == "gameReady" else None
+    if game is None:
+        game_only = [k for k in _ROCK_GAME_KEYS if params.get(k) is not None]
+        if game_only:
+            raise MifOpError("%s %s output gameReady's; pass output gameReady with %s, or leave %s out. NOTHING was "
+                             "created." % (", ".join(game_only), "is" if len(game_only) == 1 else "are",
+                                           "it" if len(game_only) == 1 else "them",
+                                           "it" if len(game_only) == 1 else "them"))
     try:
         placed = _place_values(params)
     except MifOpError as exc:
@@ -1333,8 +1567,9 @@ def op_build_rock(params):
     coll = _resolve_collection(params)
     if np is None:
         raise MifOpError("this Blender's Python has no numpy, which build_rock builds with. NOTHING was created.")
+    if game is not None:
+        return _rock_game_ready(params, game, started)
 
-    size_m = tuple(v / 100.0 for v in size)
     # ---- the grid: fine enough that the mesh is about three times the budget before it is reduced ----------------
     L, W, H = size_m
     area = 2.0 * (L * W + L * H + W * H) * (0.8 if kind == "boulder" else 1.1)
@@ -1342,7 +1577,7 @@ def op_build_rock(params):
     # memory: no more than about 8 million grid nodes (only the band near the surface is evaluated)
     while (1.25 * L / cell + 9) * (1.25 * W / cell + 9) * (1.25 * H / cell + 9) > 6.0e6:
         cell *= 1.1
-    field = _RockField(kind, size_m, weathering, strata, seed, cell)
+    field = _RockField(kind, size_m, weathering, strata, seed, cell, noise)
     F, lo = _rock_grid(field, size_m, cell)
     verts, quads = _surface_nets(_unambiguous(F, cell), lo, cell)
     del F
@@ -1395,6 +1630,8 @@ def op_build_rock(params):
         "sizeCm": [round(float(v) * 100.0, 2) for v in (final.max(axis=0) - final.min(axis=0))],
         "sinkCm": round(float(-final[:, 2].min()) * 100.0, 2),
         "weathering": weathering, "strata": strata,
+        "noiseAmplitudeCm": field.undulation[0] * 100.0, "noiseFrequencyPerM": field.undulation[1],
+        "noiseOctaves": field.undulation[2], "noiseDefault": noise_default,
         "vertices": len(mesh.vertices), "faces": len(mesh.polygons), "triangles": tris,
         "material": mat.name,
         "uvLayers": [u.name for u in mesh.uv_layers], "uvNote": uv_note,
@@ -1411,6 +1648,7 @@ def op_build_rock(params):
         "pivot": "the bottom center, at the object's origin, Z up; the rock reaches sinkCm below it",
         "cellCm": round(cell * 100.0, 3),
         "cleanup": dict(dropped, sliversOpened=slivers_cleared, foldsEased=folds_eased),
+        "output": output,
         "elapsedSeconds": round(time.perf_counter() - started, 2),
     })
     return out
@@ -1422,7 +1660,8 @@ def op_build_rock(params):
 
 BUILD_PLANT_PARAMS = (
     "name", "kind", "seed", "height", "width", "count", "bare", "weeds", "weedMix", "flowers", "length", "ends", "shag",
-    "leafLength", "leafColor", "leafColor2", "location", "rotation", "collection",
+    "leafLength", "leafColor", "leafColor2", "location", "rotation", "collection", "output", "textureFolder",
+    "textureSize", "slices", "lods",
 )
 
 _PLANT_NOTES = {
@@ -1436,9 +1675,11 @@ _PLANT_NOTES = {
     "tileSize": "for turf, width is the tile's side in centimeters.",
     "species": "kinds are forms (grass, fern, plant, bush, turf, hedge), not species; height, width, count and the colors make "
                "the species.",
-    "texture": "every blade and leaf is geometry, so there is no texture and no opacity mask; color comes from "
-               "leafColor, leafColor2 and the per-blade value in vertex color R.",
-    "cards": "alpha cards are not made: every blade and leaf is geometry, which Nanite carries.",
+    "texture": "the default output is geometry, with no texture and no opacity mask - color comes from leafColor, "
+               "leafColor2 and the per-blade value in vertex color R; output gameReady bakes the plant to textures "
+               "(base color, normal, alpha) in textureFolder.",
+    "cards": "output gameReady makes alpha cards: slices through the plant, each baked from the real blades and "
+             "leaves around it; the default output is geometry, which Nanite carries.",
     "tree": "trees are build_tree's.",
     "barkColor": "only a bush has stems; they take a bark tone derived from the leaf colors.",
     "clover": "lawn weeds are turf's: weeds is the share of the tile they cover and weedMix [clover, plantain, "
@@ -2762,6 +3003,99 @@ def _plant_hedge(geo, rng, H, Ln, Wd, count, ends, shag, leaf_len, report):
     return n_face + shoot_leaves
 
 
+# ---- output gameReady: slice cards baked from the real plant -------------------------------------------------------
+# WHY: at its defaults a bush is 29,796 triangles, a turf tile 15,000 and a metre of hedge 174,051, each
+# against the 7,780 mesh_quality gameReady holds a medium piece to. A game draws ground cover as alpha cards. These are
+# SLICES: upright quads across the plant along X and along Y, one slab apart, and one lying flat near the top, each baked
+# (bake_texture_set, high to low) from the blades and leaves inside its own slab only - a ray leaves the card half a slab
+# out and travels one slab - so every card shows what grows around it, and the set reads as the plant from any side. On
+# turf and a hedge the cards keep the piece's tile: they sit at the same offsets from every edge, so pieces still meet.
+_PLANT_OUTPUTS = ("geometry", "gameReady")
+# Upright cards across the longer side, by kind - the counts that rendered nearest the geometry (2026-11-26, 5.0.1,
+# Cycles, two views; coverage is the cards' pixels over the geometry's): a bush at 4 covered 1.00 and 1.15 with a mean
+# color 19.9 and 21.0 off, at 6 1.02 and 1.26 and 28.6 off; a turf tile at 12 covered 1.01 and 1.18 (8: 1.11 and 1.27,
+# 16: 0.73 and 0.93); a hedge at 4 matched the geometry's silhouette at IoU 0.86 in both views.
+_PLANT_SLICES = {"grass": 4, "fern": 4, "plant": 4, "bush": 4, "turf": 12, "hedge": 4}
+
+
+def _plant_cards(dense, kind, verts, tile, length, name, coll, folder, size, slices):
+    """Replace the dense plant `dense` (at the origin, unplaced) by its slice cards: build the cards, bake them from it,
+    remove it and its materials. Returns (cards object, gameReady block)."""
+    lo, hi = verts.min(axis=0), verts.max(axis=0)
+    x0, x1, y0, y1 = float(lo[0]), float(hi[0]), float(lo[1]), float(hi[1])
+    if kind == "turf":
+        x0, x1, y0, y1 = -0.5 * tile, 0.5 * tile, -0.5 * tile, 0.5 * tile
+    elif kind == "hedge":
+        x0, x1 = -0.5 * length, 0.5 * length
+    z0, z1 = min(0.0, float(lo[2])), float(hi[2])
+    dx, dy, dz = x1 - x0, y1 - y0, z1 - z0
+    step = max(dx, dy) / slices
+    nx, ny = max(1, int(round(dx / step))), max(1, int(round(dy / step)))
+    slab = max(dx / nx, dy / ny)
+    zt = max(z0 + 0.002, z1 - 0.5 * slab)
+    quads = [((x0 + (i + 0.5) * dx / nx, y0, z0), (x0 + (i + 0.5) * dx / nx, y1, z0),
+              (x0 + (i + 0.5) * dx / nx, y1, z1), (x0 + (i + 0.5) * dx / nx, y0, z1)) for i in range(nx)]
+    quads += [((x1, y0 + (j + 0.5) * dy / ny, z0), (x0, y0 + (j + 0.5) * dy / ny, z0),
+               (x0, y0 + (j + 0.5) * dy / ny, z1), (x1, y0 + (j + 0.5) * dy / ny, z1)) for j in range(ny)]
+    quads.append(((x0, y0, zt), (x1, y0, zt), (x1, y1, zt), (x0, y1, zt)))
+    k = len(quads)
+    cols = int(math.ceil(math.sqrt(k)))
+    rows = int(math.ceil(k / float(cols)))
+    width = int(size)
+    height = int(max(64, 2 ** round(math.log2(max(1.0, size * rows / float(cols))))))
+    pad = 2.0
+    uvs, vcol = [], []
+    for c in range(k):
+        u0, v0 = (c % cols) / float(cols), (c // cols) / float(rows)
+        du, dv = 1.0 / cols, 1.0 / rows
+        iu, iv = pad / width, pad / height
+        uvs += [(u0 + iu, v0 + iv), (u0 + du - iu, v0 + iv), (u0 + du - iu, v0 + dv - iv), (u0 + iu, v0 + dv - iv)]
+    flat = np.array([p for q in quads for p in q], float)
+    me = bpy.data.meshes.new(name + "_Cards")
+    me.from_pydata(flat.tolist(), [], [tuple(range(4 * c, 4 * c + 4)) for c in range(k)])
+    me.uv_layers.new(name="UVMap").data.foreach_set("uv", np.array(uvs, np.float32).ravel())
+    # the same color attribute the geometry carries: R 0.5, G the wind weight (0 at the foot, 1 at the top), B 0, A 1
+    g = np.clip((flat[:, 2] - z0) / max(dz, 1e-9), 0.0, 1.0)
+    for z in g:
+        vcol.append((0.5, float(z), 0.0, 1.0))
+    me.color_attributes.new(name="Col", type="BYTE_COLOR", domain="CORNER").data.foreach_set(
+        "color_srgb", np.array(vcol, np.float32).ravel())
+    me.update()
+    dense.name = name + "_CardSource"
+    dense.data.name = name + "_CardSource"
+    cards = bpy.data.objects.new(name, me)
+    if cards.name != name:
+        remove_objects([cards])
+        bpy.data.meshes.remove(me)
+        raise MifOpError("an object named '%s' still holds the name. NOTHING was created." % name)
+    me.name = name
+    coll.objects.link(cards)
+    dense_mats = [m for m in dense.data.materials if m is not None]
+    dense_tris = len(dense.data.polygons)
+    mat = None
+    try:
+        mat, files = bake_card_material(cards, [dense], folder, "T_%s_LeafCard_{suffix}" % name, width, height,
+                                        0.5 * slab + 1e-4, slab + 2e-4, name + "_LeafCards", margin=4, normal=False)
+    finally:
+        # THE GEOMETRY GOES EITHER WAY: baked into the cards, or - when the bake refused - with the cards too, so a
+        # failed call leaves nothing behind
+        dmesh = dense.data
+        remove_objects([dense])
+        bpy.data.meshes.remove(dmesh)
+        for m in dense_mats:
+            if m.users == 0:
+                bpy.data.materials.remove(m)
+        if mat is None:
+            remove_objects([cards])
+            bpy.data.meshes.remove(me)
+    me.materials.append(mat)
+    block = {"denseTriangles": dense_tris, "cards": {"upright": nx + ny, "alongX": ny, "acrossX": nx, "flat": 1,
+                                                     "slabCm": round(slab * 100.0, 2), "flatAtCm": round(zt * 100.0, 2)},
+             "material": mat.name, "textures": {"files": files, "size": [width, height], "folder": folder,
+                                                "atlas": [cols, rows]}}
+    return cards, block
+
+
 def op_build_plant(params):
     """Build one piece of ground cover - a grass tuft, a fern, a broadleaf plant, a bush, a tile of lawn or a piece of
     clipped hedge - as ONE mesh object of
@@ -2803,6 +3137,17 @@ def op_build_plant(params):
                             leaves along the foot); vertex color A is how open each corner lies (an occlusion)
       leafColor, leafColor2 ([r,g,b] linear 0-1)   the two greens vertex color R picks between
       location, rotation ([x,y,z] or {x,y,z}), collection
+      output (str)          geometry (default): real geometry blades and leaves, as above. gameReady: the plant as
+                            slice cards - upright quads across it along X and along Y, a slab apart, and one lying
+                            flat, each baked by bake_texture_set from the real blades and leaves in its slab (base
+                            color, normal, alpha in one atlas); the geometry is built, baked and removed
+      textureFolder (str)   gameReady only, required there: where T_<name>_LeafCard_BC / _N / _A.png are written
+      textureSize (int)     gameReady only: the atlas width, a power of two from 256 to 4096, default 1024
+      slices (int)          gameReady only: upright cards across the plant's longer side, 1 to 16; default 12 for
+                            turf and 4 for the rest; the shorter side gets as many as fit at the same spacing
+      lods (list)           gameReady only: build_lod_chain's ratios, default [] - the cards are already a few dozen
+                            triangles, and a decimate takes whole cards: a bush's LOD at 0.5 covered 0.65 of the
+                            geometry's pixels where its cards covered 0.97
     """
     reject_unknown(params, BUILD_PLANT_PARAMS, "build_plant", _PLANT_NOTES)
     started = time.perf_counter()
@@ -2881,6 +3226,38 @@ def op_build_plant(params):
         raise MifOpError("flowers is %g; it is the share of the weeds in flower, 0 to 1. NOTHING was created." % flowers)
     if flowers > 0.0 and mix[0] <= 0.0 and mix[2] <= 0.0:
         raise MifOpError("flowers are the clover's and the dandelions'; this weedMix has neither. NOTHING was created.")
+    output = take(params, "output", default="geometry", kind=str)
+    if output not in _PLANT_OUTPUTS:
+        raise MifOpError("output must be one of %s, got '%s'. NOTHING was created." % (", ".join(_PLANT_OUTPUTS), output))
+    game = output == "gameReady"
+    game_only = [k for k in ("textureFolder", "textureSize", "slices", "lods") if params.get(k) is not None]
+    if game_only and not game:
+        raise MifOpError("%s %s output gameReady's; pass output gameReady with %s, or leave %s out. NOTHING was created."
+                         % (", ".join(game_only), "is" if len(game_only) == 1 else "are",
+                            "it" if len(game_only) == 1 else "them", "it" if len(game_only) == 1 else "them"))
+    tex_folder, tex_size, slices, lods = None, 1024, _PLANT_SLICES[kind], []
+    if game:
+        from .ops_gamebake import _folder                                   # noqa: PLC0415
+        if params.get("textureFolder") is None:
+            raise MifOpError("output gameReady writes its card textures to textureFolder - pass a folder. NOTHING was "
+                             "created.")
+        tex_folder = _folder({"folder": take(params, "textureFolder", kind=str)}, "NOTHING was created.")
+        tex_size = take_int(params, "textureSize", default=1024)
+        if tex_size not in (256, 512, 1024, 2048, 4096):
+            raise MifOpError("textureSize is %d; it is the atlas width, a power of two from 256 to 4096. NOTHING was "
+                             "created." % tex_size)
+        slices = take_int(params, "slices", default=_PLANT_SLICES[kind])
+        if not 1 <= slices <= 16:
+            raise MifOpError("slices is %d; a plant takes 1 to 16 upright cards across its longer side. NOTHING was "
+                             "created." % slices)
+        lods = game_lods(params, ())
+        if len(name) > 54:
+            raise MifOpError("name is %d characters; output gameReady makes <name>_CardSource and <name>_LODGroup, so "
+                             "it can be at most 54 (Blender keeps 63). NOTHING was created." % len(name))
+        for taken in (name + "_LeafCards",):
+            if bpy.data.materials.get(taken) is not None:
+                raise MifOpError("a material named '%s' already exists; the card material takes that name - pick "
+                                 "another name. NOTHING was created." % taken)
     color = _color3(params, "leafColor", cfg["colors"][0])
     color2 = _color3(params, "leafColor2", cfg["colors"][1])
     try:
@@ -2945,7 +3322,8 @@ def op_build_plant(params):
 
     obj = bpy.data.objects.new(name, mesh)
     _link_new(obj, coll)
-    _place(obj, placed)
+    if not game:
+        _place(obj, placed)
     # THE SAME MATERIALS build_tree makes, so a plant previews the way a tree's leaves do
     bark_color = tuple(0.5 * a + 0.1 for a in (0.3, 0.2, 0.12))
     bark_m, leaf_m = _tree_materials(obj.name, bark_color, color, color2)
@@ -3012,6 +3390,31 @@ def op_build_plant(params):
                                    "grows, reaching over the tile's edge as blades do: tiles still meet at any quarter "
                                    "turn")
             out["weedsGrown"] = weed_report
+    out["output"] = output
+    if game:
+        # THE REPLY ABOVE DESCRIBES THE GEOMETRY THE CARDS ARE BAKED FROM (its size, its sink, its counts); what follows
+        # replaces it by the cards, which take its name, its collection and the placement asked for
+        from .ops_mesh import triangle_budget_for_size                     # noqa: PLC0415
+        obj, game_block = _plant_cards(obj, kind, verts, width / 100.0, length / 100.0, name, coll, tex_folder,
+                                       tex_size, slices)
+        _place(obj, placed)
+        lod_reply = None
+        if lods:
+            from .ops_kit import op_build_lod_chain                         # noqa: PLC0415
+            lod_reply = op_build_lod_chain({"object": obj.name, "ratios": lods})
+        out.update(_created(obj, coll, "MESH", "build_plant", name))
+        n = 2 * len(obj.data.polygons)
+        budget = triangle_budget_for_size(obj) or {}
+        out.update({"vertices": len(obj.data.vertices), "faces": len(obj.data.polygons),
+                    "triangles": {"stems": 0, "leaves": n, "total": n},
+                    "materialSlots": [m.name for m in obj.data.materials],
+                    "uvMap": {"name": "UVMap", "leaves": "each card has its own cell of the atlas, upright cards in "
+                                                         "order across X then across Y, the flat one last"}})
+        out["gameReady"] = dict(game_block, triangles=n, triangleBudget=budget.get("triangleBudget"), budget=budget,
+                                withinBudget=n <= (budget.get("triangleBudget") or 0),
+                                lods=(lod_reply or {}).get("lods"), lodGroup=(lod_reply or {}).get("group"),
+                                check={"call": "mesh_quality", "args": {"object": obj.name, "gameReady": True}})
+        out["elapsedSeconds"] = round(time.perf_counter() - started, 2)
     return out
 
 

@@ -2007,8 +2007,8 @@ def op_set_node_property(params):
 
     AND ITS INPUT SOCKETS WERE STILL WRITE-ONCE, until 2026-09-20. This op wrote PROPERTIES only and
     refused `inputs`, pointing at the creating op - so a Noise Texture's Scale, a Bump's Strength and
-    Distance, a Mix Shader's Factor could be set when the node was made and never again. The ledger
-    recorded what that cost (docs/22 SD45): a plaster variant "cannot re-tune" PeelBump's Strength and
+    Distance, a Mix Shader's Factor could be set when the node was made and never again. The the internal notes
+    recorded what that cost: a plaster variant "cannot re-tune" PeelBump's Strength and
     Distance, because "set_node_property cannot write - it writes PROPERTIES only", and the relief was
     left as it was for want of a call. `inputs` resolves and converts exactly as add_group_node's does
     (_input_socket, _coerce_input - one implementation, not two), is applied AFTER `properties` because
@@ -3489,7 +3489,7 @@ def op_set_compositing(params):
     # turned compositing ON and got a success report. This op WRITES, which is what makes it worth
     # more than a tidy-up.
     #
-    # Found 2026-09-08 by tools/audit_blender_raw_bool.py on its first run, after the same shape was
+    # Found 2026-09-08 by a dev test on its first run, after the same shape was
     # found by hand in select_faces and twice in set_shading. The version matrix's sentinel fuzz
     # could not have caught this one: it only probes parameters a payload SENDS, and useCompositing
     # is not in any payload.

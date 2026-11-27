@@ -11,7 +11,7 @@ the wrong answer for three specific reasons rather than on principle:
   * IT IS AN ARBITRARY-CODE-EXECUTION SWITCH. The addon preference is literally labelled that, and
     a user who turns it off loses every light and camera call with it. A typed op keeps working.
   * IT IS ABSENT WHEN THE ADDON IS IMPORTED RATHER THAN INSTALLED. _prefs() returns None off
-    sys.path, so run_python refuses - which is why run_blender_suites.py carries explicit code to
+    sys.path, so run_python refuses - which is why the suite runner carries explicit code to
     force the hatch open before its suites run.
   * IT REPORTS NOTHING. reject_unknown catches a misspelled key at the door; exec fails somewhere
     obscure at runtime. And a typed op can read its postcondition back, which is the discipline the
@@ -46,7 +46,7 @@ _LIGHT_KEYS = {
 }
 # collection is the CREATE call's alone: where a new light is linked. set_light changes one that exists and never
 # moves it, so _SET_LIGHT_KEYS builds on _LIGHT_KEYS without it (see _SET_IN_COLLECTION_NOTE).
-_CREATE_LIGHT_KEYS = set(_LIGHT_KEYS) | {"collection"}
+_CREATE_LIGHT_KEYS = set(_LIGHT_KEYS) | {"collection", "lookAt"}
 
 _CAMERA_KEYS = {
     "name", "location", "rotation", "lens", "focalLength", "sensorWidth",
@@ -195,7 +195,7 @@ def _check_light_temperature(params):
     "NOTHING was changed". Seven properties had changed.
 
     Splitting the refusals out means _apply_light_props can ask all of them first and write nothing
-    until they all pass. audit_mutate_then_deny.py found it; it reported seven pairs across
+    until they all pass. a dev test found it; it reported seven pairs across
     _apply_light_props and op_set_light, which is how many writes sat above the one refusal.
 
     Returns (temp, want_temp), both None when the caller asked for neither.
@@ -296,7 +296,7 @@ def _apply_light_props(data, plan, params, checked):
     "is there work to do" - so dropping it changes nothing and is what makes the two bodies the
     same code rather than merely similar.
 
-    Guarded by test_light_op_parity.py, which sets every shared key through BOTH ops and requires
+    Guarded by a dev test, which sets every shared key through BOTH ops and requires
     the datablocks to come out identical. It was scored against a deliberate break before being
     believed.
     """
@@ -548,6 +548,27 @@ def op_create_light_probe(params):
     return out
 
 
+def _light_look_at(params, verb):
+    """create_light / set_light lookAt: the world point, or None. Refused with rotation - two answers to one question."""
+    if "lookAt" not in params:
+        return None
+    if "rotation" in params:
+        raise MifOpError("pass lookAt OR rotation, not both - they are two answers to the same question (which way the "
+                         "light faces). NOTHING was %s." % verb)
+    return _vec3(params, "lookAt", (0.0, 0.0, 0.0), verb)
+
+
+def _aim_error_degrees(obj, point):
+    """The angle between a light's world -Z and the direction to `point`, measured off matrix_world after the write."""
+    bpy.context.view_layer.update()
+    frm = obj.matrix_world.to_translation()
+    to = mathutils.Vector(point) - frm
+    if to.length == 0.0:
+        return None
+    fwd = obj.matrix_world.to_quaternion() @ mathutils.Vector((0.0, 0.0, -1.0))
+    return round(math.degrees(fwd.angle(to.normalized())), 4)
+
+
 def op_create_light(params):
     """Create a light. Returns what the light ACTUALLY is, not what was asked for.
 
@@ -562,6 +583,8 @@ def op_create_light(params):
       size / sizeY / shape   AREA only
       spotAngle / spotBlend  SPOT only, spotAngle in RADIANS
       angle (float)          SUN only, angular diameter in radians
+      lookAt [x,y,z]         aim the light's -Z at a world point INSTEAD of rotation (refused together), the aim
+                             create_camera derives; aimErrorDegrees measures it after the write
     """
     reject_unknown(params, _CREATE_LIGHT_KEYS, "create_light")
     from .ops_create import _resolve_collection   # noqa: PLC0415 - the one resolver every create op uses
@@ -584,7 +607,11 @@ def op_create_light(params):
     # PARSED BEFORE ANYTHING EXISTS. These used to be read after the light was created AND linked,
     # so a malformed vector left a light in the scene and said "NOTHING was created".
     want_loc = _vec3(params, "location", (0.0, 0.0, 0.0))
-    want_rot = _vec3(params, "rotation", (0.0, 0.0, 0.0))
+    # LOOKAT, AS CREATE_CAMERA TAKES IT (FOUND 2026-11-18): a light points down its local -Z, so without it every light
+    # pointed straight down and was aimed through a create_empty + aim_object. A new light has no parent: world angles.
+    look_point = _light_look_at(params, "created")
+    want_rot = (_look_at_euler(want_loc, look_point) if look_point is not None
+                else _vec3(params, "rotation", (0.0, 0.0, 0.0)))
     # AND EVERY OTHER PROPERTY, in the same place and for the same reason. The hoist above covered
     # two keys and left seven parsing inside _apply_light_props, which runs after the light is
     # created AND linked - so a bad energy or radius left a light behind under "NOTHING was
@@ -635,6 +662,9 @@ def op_create_light(params):
         # left the caller nothing to test - so a retry after a timeout got Light.001 with prose
         # about it. requestedName and nameWasSuffixed are the answerable form.
         out["inertUnderThisEngine"], out["engineNote"] = _light_factor_engine_note(params)
+        if look_point is not None:
+            out["lookAt"] = rnd(list(look_point))
+            out["aimErrorDegrees"] = _aim_error_degrees(obj, look_point)
         out["requestedName"] = wanted
         out["nameWasSuffixed"] = obj.name != wanted
         out["nameNote"] = ("Blender renames on collision rather than failing, so `name` is what the "
@@ -649,7 +679,7 @@ def op_create_light(params):
 # NOT collection. It is where create_light LINKS a new light, and set_light never read it: while it sat in
 # _LIGHT_KEYS, it passed set_light's reject_unknown and the light stayed where it was under ok:true (FOUND 2026-11-15 by
 # param_reach - no MCP tool sent it). Refused with the route instead (_SET_IN_COLLECTION_NOTE).
-_SET_LIGHT_KEYS = set(_LIGHT_KEYS) | {"object", "light", "energyScale", "stops"}
+_SET_LIGHT_KEYS = set(_LIGHT_KEYS) | {"object", "light", "energyScale", "stops", "lookAt"}
 _SET_IN_COLLECTION_NOTE = {"collection": "collection is where a create call links a NEW object; this call changes one "
                                          "that exists and never moves it. Move it with link_objects (move=true takes it "
                                          "out of the collections it was in). NOTHING was changed."}
@@ -725,6 +755,8 @@ def op_set_light(params):
                                    light's rotation_mode reads - as given in an Euler mode, converted from an XYZ
                                    Euler for QUATERNION or AXIS_ANGLE (every glTF import). rotationWrittenTo names
                                    the property; before/after read the world rotation.
+      lookAt [x,y,z]               aim the light's -Z at a world point instead of rotation (refused together), from the
+                                   location this call ends with and out of a parent's space - as set_camera aims
 
     Every refusal fires before any write. A caller who names one bad key gets a light in exactly
     the state it was in before the call.
@@ -783,6 +815,16 @@ def op_set_light(params):
     # what a QUATERNION light (every glTF import) does not read. See ops_common.write_rotation.
     set_rot = _vec3(params, "rotation", rotation_euler_values(obj), "changed") \
         if "rotation" in params else None
+    # LOOKAT, AS SET_CAMERA RESOLVES IT: from the location this call ends with, in world space, and written out of a
+    # parent's space (ops_common.basis_space) - see set_camera.
+    look_point = _light_look_at(params, "changed")
+    look_rot = look_space = None
+    if look_point is not None:
+        bpy.context.view_layer.update()
+        look_space = basis_space(obj)
+        final_loc = set_loc if set_loc is not None else tuple(obj.location)
+        look_from = tuple(look_space @ mathutils.Vector(final_loc)) if look_space is not None else final_loc
+        look_rot = _look_at_euler(look_from, look_point)
     # AND THE PROPERTY BLOCK, for exactly the reason the comment above gives. _apply_light_props
     # parses as well as writes, so every take_float in it can refuse - and since 2026-09-08 it also
     # refuses a `color` that is not a sequence by name. Calling the plan here means all of that
@@ -815,7 +857,9 @@ def op_set_light(params):
     if set_loc is not None:
         obj.location = set_loc
     rot_written = None
-    if set_rot is not None:
+    if look_rot is not None:
+        rot_written = write_orientation(obj, look_rot, look_space)
+    elif set_rot is not None:
         # INTO THE PROPERTY THE MODE READS. This was `obj.rotation_euler = set_rot` whatever the mode, so a QUATERNION
         # light - every glTF import - answered ok with changedFields [] and did not turn (5.2.1, 2026-09-28).
         rot_written = write_rotation(obj, set_rot)
@@ -844,6 +888,8 @@ def op_set_light(params):
         "rotationWrittenTo": rot_written,
         "rotationModeNote": mode_note,
         "energyFactor": round(factor, 6) if factor is not None else None,
+        "lookAt": rnd(list(look_point)) if look_point is not None else None,
+        "aimErrorDegrees": _aim_error_degrees(obj, look_point) if look_point is not None else None,
     }
 
 
@@ -909,7 +955,7 @@ def _camera_focus_and_fov_plan(params, camera_type, verb):
     Both ops had their _vec3 parses hoisted above the commit that same morning for exactly this
     reason. This helper was ADDED after that, below the commit, and reintroduced the shape the hoist
     had just removed - which is the argument for auditing the property rather than remembering it.
-    Found by tools/audit_mutate_then_deny.py; see its docstring.
+    Found by a dev test; see its docstring.
 
     camera_type is passed in rather than read off the datablock so this can run before one exists:
     create_camera knows it as `effective_type`, set_camera as the requested type or the current one.
@@ -1613,7 +1659,9 @@ def op_aim_object(params):
     params:
       object (str, required)   what to aim
       target (str)             an object to aim AT - its world-space origin
-      lookAt {x,y,z}           a point to aim at. Exactly one of target/lookAt.
+      lookAt {x,y,z}           a point to aim at
+      direction [x,y,z]        aim local -Z ALONG a direction rather than at a point (2026-11-25: eyes, claws and horns
+                               were aimed by inventing a point). Exactly one of target, lookAt or direction.
 
     Blender aims down LOCAL -Z for lights and cameras alike, which is the convention _look_at_euler
     derives - and got wrong by exactly pi in its first version, aiming 166 degrees off while
@@ -1625,7 +1673,7 @@ def op_aim_object(params):
     (rotationWrittenTo), converted out of its parent's space for a child. rotationEuler in the answer is
     the WORLD rotation.
     """
-    reject_unknown(params, ("object", "name", "target", "lookAt"), "aim_object")
+    reject_unknown(params, ("object", "name", "target", "lookAt", "direction"), "aim_object")
     want = take(params, "object", "name", default=None, kind=str)
     if not want:
         raise MifOpError("'object' is required - what to aim. NOTHING was changed.")
@@ -1635,10 +1683,12 @@ def op_aim_object(params):
 
     target_name = take(params, "target", default=None, kind=str)
     has_point = "lookAt" in params
-    if bool(target_name) == bool(has_point):
-        raise MifOpError("pass exactly one of target (an object) or lookAt (a point) - %s. "
+    direction = params.get("direction")
+    given = [k for k, v in (("target", target_name), ("lookAt", has_point), ("direction", direction is not None)) if v]
+    if len(given) != 1:
+        raise MifOpError("pass exactly one of target (an object), lookAt (a point) or direction (a vector) - %s. "
                          "NOTHING was changed."
-                         % ("both were given" if target_name else "neither was given"))
+                         % ("%s were given" % " and ".join(given) if given else "neither was given"))
     # THE DEPSGRAPH CURRENT before any matrix_world is read - the target's, this object's and its parent's.
     bpy.context.view_layer.update()
     if target_name:
@@ -1648,10 +1698,15 @@ def op_aim_object(params):
         if tgt is obj:
             raise MifOpError("'%s' cannot be aimed at itself. NOTHING was changed." % want)
         point = tuple(tgt.matrix_world.to_translation())
-    else:
+    elif direction is None:
         point = _vec3(params, "lookAt", (0.0, 0.0, 0.0))
 
     frm = tuple(obj.matrix_world.to_translation())
+    if direction is not None:
+        d = _vec3(params, "direction", (0.0, 0.0, 0.0))
+        if not any(d):
+            raise MifOpError("direction is a vector that is not zero. NOTHING was changed.")
+        point = (frm[0] + d[0], frm[1] + d[1], frm[2] + d[2])
     # THE ORIENTATION, INTO THE PROPERTY THE MODE READS (ops_common.write_orientation). This wrote rotation_euler whatever
     # the mode, so a QUATERNION object - every glTF import - never turned, and the measurement below refused the op's
     # own write: 9.46 deg off, measured on 5.2.1 with a glTF camera (2026-09-28, RD118). An object in another Euler order

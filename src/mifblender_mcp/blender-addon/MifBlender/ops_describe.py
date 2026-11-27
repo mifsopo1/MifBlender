@@ -54,6 +54,7 @@ dead defensive code, this paragraph is the evidence for deleting it.
 """
 import ast
 import inspect
+import re
 import sys
 
 from .ops_common import MifOpError, reject_unknown
@@ -252,7 +253,7 @@ def op_describe_op(params):
     # MCP tool sends, and three spellings for one value would have put two entries in a baseline
     # whose whole job is to stay near zero.
     reject_unknown(
-        params, ("op",), "describe_op",
+        params, ("op", "nodeType"), "describe_op",
         notes={
             # Dogfooding: describe_op's own refusals carry notes, for the same reason every other
             # op's do. An op that explains other ops badly explains nothing.
@@ -265,6 +266,8 @@ def op_describe_op(params):
             "verbose": "the whole record is returned every time - there is no short form",
         })
 
+    if params.get("nodeType") is not None:
+        return _describe_node_type(params["nodeType"], params.get("op"))
     name = params.get("op")
     if not isinstance(name, str) or not name.strip():
         raise MifOpError("op is required. `ping` lists every op.")
@@ -303,7 +306,7 @@ def op_describe_op(params):
         out["askedAs"] = asked
         out["spellingNote"] = ("'%s' is the tool's name; the add-on op is '%s'. bl_batch takes either in an entry's op."
                                % (asked, name))
-    # WHAT UNDO DOES WITH IT (1.3, docs/31_WORKFLOWS.md), from ops_undo's own sets - the ones server.py pushes steps by - so a
+    # WHAT UNDO DOES WITH IT, from ops_undo's own sets - the ones server.py pushes steps by - so a
     # workflow's dry run can say before anything runs whether a step can be rolled back, without a second copy of the list.
     from . import ops_undo                                          # runtime: ops_undo imports bpy at module level
     if name in ops_undo.UNDO_OPS:
@@ -342,6 +345,16 @@ def op_describe_op(params):
     accepted = _resolve(call.args[1] if len(call.args) > 1 else None, module)
     if isinstance(accepted, (set, frozenset, tuple, list)):
         out["acceptedKeys"] = sorted(str(k) for k in accepted)
+        # TYPE, UNIT AND DEFAULT PER KEY (2026-11-25), parsed from the handler's own params block, so it cannot drift
+        # from the text a reader of the source sees. Found 2026-11-18 by three builds: acceptedKeys gave names alone, and
+        # voxelSize's unit, uv_pack's margin and autoSmoothAngle's degrees were learned by reading ops_*.py or by sending
+        # calls. A key the block does not document is NAMED (paramsUndocumented) rather than given an invented type.
+        rows, missing = _param_rows(doc or "", out["acceptedKeys"])
+        rows, missing = _code_rows(tree, fn.__name__, rows, missing)
+        out["params"] = rows
+        out["paramsUndocumented"] = missing or None
+        out["paramsNote"] = ("type, unit and default as the handler's docstring states them; null where it does not say. "
+                             "Keys in paramsUndocumented have no line there - read the refusals, or send the call.")
     else:
         # NAME THE FRAGMENT. "not a literal or a module-level constant" is true and unactionable;
         # the caller cannot tell whether the op takes nothing, takes everything, or has a list this
@@ -364,6 +377,213 @@ def op_describe_op(params):
         out["commonMistakes"] = []
 
     return out
+
+
+_PARAM_HEAD = re.compile(r"^\s*(params|parameters|args|keys)\s*:\s*$", re.I)
+# "key (type) meaning", "key / alias (type) meaning", "key [x,y,z] meaning", "key {a, b} meaning", "key: meaning"
+_PARAM_LINE = re.compile(r"^(\s+)([A-Za-z_][\w]*(?:\s*/\s*[A-Za-z_][\w]*)*)\s*"
+                         r"(\((?P<paren>(?:[^()]|\([^()]*\))*)\)|(?P<shape>[\[{].*?[\]}])(?=\s{2,}|$))?\s*:?"
+                         r"(?:\s+(?P<rest>\S.*))?$")
+_UNITS = ((r"radians", "radians"), (r"\brad\b", "radians"), (r"degrees", "degrees"), (r"\bdeg\b", "degrees"),
+          (r"\bGB\b", "GB"), (r"\bseconds?\b", "seconds"), (r"\bms\b", "milliseconds"), (r"pixels?|\bpx\b", "pixels"),
+          (r"\bUV units?\b|\bUV space\b", "UV units"), (r"\bfraction\b", "fraction"), (r"\bpercent\b|%", "percent"),
+          (r"\bmeters?\b|\bmetres?\b|\d\s?m\b", "meters"), (r"\bmm\b", "millimeters"),
+          (r"\bBU\b|\bobject space\b|\bmesh'?s? units\b", "mesh units"))
+# Matched case-sensitively: an abbreviation that is a word in lower case elsewhere.
+_UNITS_CASED = ("GB", "meters", "milliseconds", "mesh units")
+_TYPE_WORDS = {"str": "string", "string": "string", "float": "number", "int": "integer", "bool": "boolean",
+               "list": "list", "dict": "object", "object": "object", "number": "number", "name": "string"}
+
+
+def _param_block(doc):
+    """[(keys, paren, shape, text)] from a handler docstring's params: block (continuation lines joined)."""
+    lines = doc.splitlines()
+    start = next((i for i, ln in enumerate(lines) if _PARAM_HEAD.match(ln)), None)
+    if start is None:
+        return []
+    out, indent = [], None
+    for ln in lines[start + 1:]:
+        if not ln.strip():
+            if out:
+                out[-1][3].append("")
+            continue
+        lead = len(ln) - len(ln.lstrip())
+        m = _PARAM_LINE.match(ln)
+        if indent is None:
+            if not m:
+                break
+            indent = lead
+        if lead < indent:
+            break
+        if lead == indent and m:
+            keys = [k.strip() for k in m.group(2).split("/")]
+            out.append((keys, m.group("paren"), m.group("shape"), [(m.group("rest") or "").strip()]))
+        elif out and lead > indent:
+            out[-1][3].append(ln.strip())
+        elif lead == indent:
+            break
+    return [(k, p, s, " ".join(t for t in txt if t).strip()) for k, p, s, txt in out]
+
+
+def _param_type(paren, shape, text):
+    if shape:
+        return "vector" if re.match(r"^\[\s*x", shape) else ("list" if shape.startswith("[") else "object")
+    if paren:
+        core = re.split(r",\s*(?:default|required|optional)\b", paren.strip(), flags=re.I)[0].strip()
+        head = re.split(r"[,\s]", core, maxsplit=1)[0].lower()
+        base = re.sub(r"\[.*", "", head)
+        if "|" in core:
+            return core
+        return _TYPE_WORDS.get(base, core)
+    return None
+
+
+def _param_default(paren, text):
+    for src in (paren or "", text):
+        m = re.search(r"\bdefault(?:s to|:)?\s+([^,;)\s]+)", src, re.I)
+        if m:
+            v = m.group(1).rstrip(".")
+            low = v.lower()
+            if low in ("true", "on"):
+                return True
+            if low in ("false", "off"):
+                return False
+            if low in ("none", "null"):
+                return None
+            try:
+                return int(v) if re.match(r"^-?\d+$", v) else float(v)
+            except ValueError:
+                # A VALUE, NOT A WORD: a quoted string or an UPPER_CASE enum identifier. "default the mesh's own" is a
+                # phrase, and a phrase is not a default a caller could send.
+                if re.match(r"^([\"'][^\"']*[\"']|[A-Z][A-Z0-9_]+)$", v):
+                    return v.strip("\"'")
+                return None
+    return None
+
+
+def _param_unit(text):
+    """The unit the meaning names FIRST ("DEGREES. ... every other angle is radians" is degrees)."""
+    best = None
+    for pat, unit in _UNITS:
+        m = re.search(pat, text, 0 if unit in _UNITS_CASED else re.I)
+        if m and (best is None or m.start() < best[0]):
+            best = (m.start(), unit)
+    return best[1] if best else None
+
+
+def _param_rows(doc, accepted):
+    """([{key, aliases, type, unit, default, required, meaning}], [accepted keys the block does not document])."""
+    rows, seen = [], set()
+    for keys, paren, shape, text in _param_block(doc):
+        hit = [k for k in keys if k in accepted]
+        if not hit:
+            continue
+        seen.update(hit)
+        meaning = text if len(text) <= 400 else text[:397] + "..."
+        rows.append({"key": hit[0], "aliases": hit[1:] or None, "type": _param_type(paren, shape, text),
+                     "unit": _param_unit(text), "default": _param_default(paren, text),
+                     "required": bool(re.search(r"\brequired\b", (paren or "") + " " + text[:40], re.I)),
+                     "meaning": meaning})
+    # PROSE, WHERE THERE IS NO BLOCK LINE: many handlers say "voxelSize (object space; default the mesh's own)" in a
+    # sentence. The sentence around the key's first mention gives the unit and default it states, marked source prose.
+    flat = " ".join(doc.split())
+    for k in accepted:
+        if k in seen:
+            continue
+        # ONLY A KEY THE SENTENCE EXPLAINS: followed by a parenthetical, or by "is" / "=" - not one of a list of names
+        # ("fixPoles, preserveVolume, ..."), whose neighbour text says nothing about it.
+        m = re.search(r"(?<![\w.])%s\b(?:\s*\((?P<p>[^)]{1,160})\)|\s+(?:is|=)\s+(?P<t>[^.;]{1,160}))"
+                      % re.escape(k), flat)
+        if not m:
+            continue
+        paren, text = m.group("p"), (m.group("t") or "").strip()
+        window = (paren or text).strip()
+        seen.add(k)
+        typed = re.match(r"^(str|string|float|int|bool|list|dict|number)\b\s*(?:[,|)]|$)", (paren or "").strip(), re.I)
+        rows.append({"key": k, "aliases": None, "type": _param_type(paren, None, window) if typed else None,
+                     "unit": _param_unit(window), "default": _param_default(None, window), "required": False,
+                     "meaning": window[:300], "source": "prose"})
+    for r in rows:
+        if isinstance(r.get("default"), str):
+            r["default"] = r["default"].strip("\"'")
+        r.setdefault("source", "params block")
+    return rows, [k for k in accepted if k not in seen]
+
+
+_TAKE_TYPES = {"take_float": "number", "take_int": "integer", "take_bool": "boolean", "finite_float": "number"}
+_KIND_TYPES = {"str": "string", "int": "integer", "float": "number", "bool": "boolean", "list": "list", "dict": "object"}
+
+
+def _code_rows(tree, fn_name, rows, missing):
+    """The handler's own reads: take_float / take_int / take_bool / take(kind=...) of a key, with a literal default -
+    the type and default the CODE uses, filled in where the docstring did not say, and a row (source code) for a key
+    the docstring never mentions. uv_pack's margin (take_float, default 0.02) is one."""
+    fn = next((n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == fn_name), None)
+    if fn is None:
+        return rows, missing
+    reads = {}
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Call):
+            continue
+        name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+        if name not in ("take", "take_float", "take_int", "take_bool"):
+            continue
+        keys = [a.value for a in node.args[1:] if isinstance(a, ast.Constant) and isinstance(a.value, str)]
+        if not keys:
+            continue
+        typ = _TAKE_TYPES.get(name)
+        default, has_default = None, False
+        for kw in node.keywords:
+            if kw.arg == "kind" and isinstance(kw.value, ast.Name):
+                typ = _KIND_TYPES.get(kw.value.id, typ)
+            if kw.arg == "default":
+                try:
+                    default, has_default = ast.literal_eval(kw.value), True
+                except (ValueError, SyntaxError):
+                    pass
+        for k in keys:
+            reads.setdefault(k, (typ, default, has_default))
+    by_key = {r["key"]: r for r in rows}
+    for k, (typ, default, has_default) in reads.items():
+        r = by_key.get(k)
+        if r is not None:
+            if r.get("type") is None and typ:
+                r["type"] = typ
+            if r.get("default") is None and has_default and default is not None:
+                r["default"] = default
+        elif k in missing and (typ or has_default):
+            rows.append({"key": k, "aliases": None, "type": typ, "unit": None,
+                         "default": default if has_default else None, "required": False, "meaning": None,
+                         "source": "code"})
+            missing = [m for m in missing if m != k]
+    return rows, missing
+
+
+def _describe_node_type(node_type, op=None):
+    """describe_op {nodeType}: a node type's own enum properties and their items, from Blender's RNA - wave_type,
+    rings_direction, data_type, blend_type - so a node property is not learned from a refusal."""
+    import bpy                                                     # noqa: PLC0415
+    if not isinstance(node_type, str) or not node_type.strip():
+        raise MifOpError("nodeType is a node type's identifier, e.g. ShaderNodeTexWave.")
+    cls = getattr(bpy.types, node_type.strip(), None)
+    if cls is None or not hasattr(cls, "bl_rna") or not issubclass(cls, bpy.types.Node):
+        raise MifOpError("'%s' is not a node type on Blender %s (an identifier such as ShaderNodeTexWave, "
+                         "GeometryNodeSetPosition)." % (node_type, bpy.app.version_string))
+    base = {p.identifier for p in bpy.types.Node.bl_rna.properties}
+    props = []
+    for p in cls.bl_rna.properties:
+        if p.identifier in base or p.identifier == "rna_type":
+            continue
+        row = {"property": p.identifier, "type": p.type, "readOnly": bool(p.is_readonly)}
+        if p.type == "ENUM":
+            row["items"] = [i.identifier for i in p.enum_items]
+            row["default"] = p.default if not getattr(p, "is_enum_flag", False) else sorted(p.default_flag)
+        elif p.type in ("INT", "FLOAT", "BOOLEAN") and getattr(p, "array_length", 0) == 0:
+            row["default"] = p.default
+        props.append(row)
+    return {"ok": True, "nodeType": cls.__name__, "op": op, "properties": props,
+            "note": "the node's own RNA properties on this build, enum items in Blender's identifiers - what "
+                    "set_node_property and add_procedural_texture's properties take."}
 
 
 OPS = {

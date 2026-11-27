@@ -25,6 +25,11 @@ import re
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CATALOG_FILE = os.path.join(os.path.dirname(HERE), "uefn_catalog.json")
+# The longest request line the listener reads, and the host refuses to send one longer. asyncio's default stream limit
+# is 64 KiB, and a line over it raised inside readline and dropped the connection with no reply - the host saw "not
+# JSON (0 bytes)" (measured offline 2026-11-22: 60,000 characters read, 70,000 raised). A whole .verse file travels
+# JSON-escaped in one line, so the old limit sat below 64 KiB of Verse. One constant, read by both sides.
+REQUEST_LINE_LIMIT = 16 << 20
 VECTOR_SETS = [("x", "y", "z"), ("pitch", "yaw", "roll"), ("x", "y"), ("x", "y", "z", "w"), ("r", "g", "b", "a")]
 READ_VERBS = ("Get", "List", "Find", "Is", "Has", "Can", "Describe", "Read", "Search", "Capture", "Trace", "Count",
               "Query", "get_", "list_", "find_", "is_", "has_", "describe_", "read_", "search_", "grep_", "query_",
@@ -44,9 +49,61 @@ DENY_TOOLS = {
     "ValkyrieFortniteToolset.SessionToolset.StartSession":
         "uefn_session start owns this: it records the client and waits for Easy Anti-Cheat",
     "ValkyrieFortniteToolset.SessionToolset.StopSession": "uefn_session end owns this: it closes only our client",
+    # M5 (2026-11-22): a skill is a stored instruction set that Epic's in-editor assistant and other agents read later,
+    # so a write here plants instructions in the person's project. Epic's own description: call these ONLY after
+    # explicit direction or permission from the user.
+    "ToolsetRegistry.AgentSkillToolset.CreateSkill":
+        "a skill is stored instructions other agents read later; Epic says only with the user's explicit permission, "
+        "so the person writes skills in UEFN",
+    "ToolsetRegistry.AgentSkillToolset.UpdateSkill":
+        "a skill is stored instructions other agents read later; Epic says only with the user's explicit permission, "
+        "so the person writes skills in UEFN",
 }
-# Case-sensitive on the CamelCase tool name, so Prefab is not Fab.
-DENY_WORDS = re.compile(r"Publish|(^|[a-z])Fab($|[A-Z])|Emporium|Licen[cs]e|Purchase|Account|Login|Logout")
+# The deny words, matched on the tool's short name split into words - CamelCase and snake_case alike, case-blind (L10:
+# the old CamelCase-only pattern would pass a future publish_island or login_user). Whole words, so Prefab is not Fab.
+DENY_WORD_PREFIXES = ("publish", "emporium", "licence", "license", "purchase", "account", "login", "logout")
+DENY_WORD_EXACT = ("fab", "fabs")
+# Writes that destroy, discard or persist (M4): uefn_call runs one only with confirm naming the tool. A word list on the
+# short name's FIRST word, plus the tools whose names do not say it. "clear" joined 2026-11-23: ClearParameters drops a
+# material instance's overrides, ClearSamples and ClearWidgetLifetimeLog discard what was collected, and the sequencer's
+# clear_*_condition remove a condition - each rode as a plain write.
+DESTRUCTIVE_VERBS = ("delete", "destroy", "remove", "reload", "load", "save", "apply", "break", "reset", "generate",
+                     "replace", "clear")
+DESTRUCTIVE_TOOLS = {
+    # Its first word is "create", but it opens the new level in place of the one open, as LoadLevel does - the audit of
+    # 2026-11-22 named the two together, and only LoadLevel was caught by the verb list.
+    "EditorToolset.LevelToolset.CreateLevel":
+        "CreateLevel opens a new level in place of the one open in the editor, as LoadLevel does",
+}
+# Writes a verb catches that destroy nothing, each with why. clear_selection deselects Control Rig controls in the
+# sequencer: no data in the level or an asset changes, and asking confirm for it trains a caller to pass confirm by rote.
+NOT_DESTRUCTIVE = {
+    "animation_toolset.toolsets.controlrig_sequencer.SequencerControlRigTools.clear_selection":
+        "deselects Control Rig controls; nothing in the level or an asset changes",
+}
+# Reads that hand over more than the level: what the person sees, or text about them (M6).
+SENSITIVE_TOOLS = {
+    "EditorToolset.EditorAppToolset.CaptureEditorImage": "returns the whole editor window as the person sees it",
+    "AIAssistantEditor.AIAssistantToolset.GetProjectContext": "returns a userContext string about the person",
+}
+
+
+def name_words(short):
+    """A tool's short name as lower-case words: GetFabListing -> get, fab, listing; publish_island -> publish, island."""
+    return [w.lower() for w in re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+", short or "")]
+
+
+def destructive_reason(full, row):
+    if not isinstance(row, dict) or row.get("mode") != "write":
+        return None
+    if full in DESTRUCTIVE_TOOLS:
+        return DESTRUCTIVE_TOOLS[full]
+    if full in NOT_DESTRUCTIVE:
+        return None
+    words = name_words(full.rsplit(".", 1)[-1])
+    if words and words[0] in DESTRUCTIVE_VERBS:
+        return ("%s destroys, discards or saves (%s)" % (full.rsplit(".", 1)[-1], words[0]))
+    return None
 
 
 class Invalid(Exception):
@@ -55,13 +112,36 @@ class Invalid(Exception):
 
 # ---------------------------------------------------------------- catalog
 _CACHE = {}
+# THE CATALOG IN USE (2026-11-25). None is the shipped uefn_catalog.json. select() points it at a per-build catalog that
+# uefn_refresh_catalog wrote under <state dir>/catalogs when the shipped one is for another UEFN build, so writes resume
+# without a hand step; the shipped catalog stays the default whenever it matches.
+ACTIVE = {"path": None}
+CATALOG_DIR_NAME = "catalogs"
+
+
+def active_path():
+    return ACTIVE["path"] or CATALOG_FILE
 
 
 def load(path=None):
-    path = path or CATALOG_FILE
+    """The catalog, with the rules in THIS module laid over every row as it loads: deny (a rule added here holds even
+    for a catalog generated before it), destructive and sensitive. A catalog that is not the shipped one also has its
+    mode re-derived from Epic's annotation here, so a per-build file can never mark a write as a read."""
+    path = path or active_path()
     if path not in _CACHE:
         with open(path, encoding="utf-8") as fh:
-            _CACHE[path] = json.load(fh)
+            cat = json.load(fh)
+        tools = cat.get("tools") if isinstance(cat, dict) else None
+        shipped = os.path.normcase(os.path.abspath(path)) == os.path.normcase(os.path.abspath(CATALOG_FILE))
+        if isinstance(tools, dict):
+            for full, row in tools.items():
+                if isinstance(row, dict):
+                    if not shipped:
+                        row["mode"] = corrected_mode(full, row.get("annotated"))
+                    row["deny"] = row.get("deny") or deny_reason(full)
+                    row["destructive"] = destructive_reason(full, row)
+                    row["sensitive"] = SENSITIVE_TOOLS.get(full)
+        _CACHE[path] = cat
     return _CACHE[path]
 
 
@@ -80,6 +160,47 @@ def build_of(text):
     return (rel.group(1) if rel else None, cl.group(1) if cl else None)
 
 
+_ENGINE = re.compile(r"^\d+\.\d+\.\d+-(\d+)\+(.+)$")
+
+
+def stamp_of(running_engine):
+    """The catalog stamp for a running build: 6.0.0-60458657+++Fortnite+Release-43.10 gives
+    ++Fortnite+Release-43.10-CL-60458657 (the form gen_catalog.py --uefn takes). None when the build does not read."""
+    m = _ENGINE.match(running_engine if isinstance(running_engine, str) else "")
+    if not m or None in build_of(running_engine):
+        return None
+    return "%s-CL-%s" % (m.group(2), m.group(1))
+
+
+def per_build_file(state_dir, running_engine):
+    """Where uefn_refresh_catalog writes the catalog for this build, or None when the build does not read."""
+    rel, cl = build_of(running_engine)
+    if not state_dir or rel is None or cl is None:
+        return None
+    return os.path.join(state_dir, CATALOG_DIR_NAME, "uefn_catalog_%s-CL-%s.json" % (rel, cl))
+
+
+def select(running_engine, state_dir):
+    """Point ACTIVE at the catalog for the running build: the shipped one when it matches, else the per-build one
+    refresh wrote, when that exists and matches; otherwise the shipped one (and writes stay refused). Answers which."""
+    ACTIVE["path"] = None
+    shipped = reachable(running_engine, CATALOG_FILE)
+    out = {"catalog": "shipped", "file": CATALOG_FILE, "state": shipped.get("state"), "why": shipped.get("why")}
+    if shipped.get("state") == "ok":
+        return out
+    f = per_build_file(state_dir, running_engine)
+    if f and os.path.isfile(f):
+        _CACHE.pop(f, None)
+        got = reachable(running_engine, f)
+        if got.get("state") == "ok":
+            ACTIVE["path"] = f
+            return {"catalog": "per-build", "file": f, "state": "ok", "why": None}
+        out["perBuild"] = {"file": f, "state": got.get("state"), "why": got.get("why")}
+    else:
+        out["perBuild"] = {"file": f, "state": "missing", "why": "no per-build catalog: call uefn_refresh_catalog"}
+    return out
+
+
 def reachable(running_engine, path=None):
     """How many of Epic's UEFN tools uefn_call reaches, from the catalog actually loaded - the panel's EPIC TOOLS stat
     and the listener's ping. A number only when the catalog loaded AND is stamped with the build that is running:
@@ -94,7 +215,7 @@ def reachable(running_engine, path=None):
         if not isinstance(tools, dict) or not tools:
             raise ValueError("it lists no tools")
     except (OSError, ValueError, KeyError, TypeError) as e:
-        out.update(state="missing", why="the catalog %s did not load: %s" % (path or CATALOG_FILE, e))
+        out.update(state="missing", why="the catalog %s did not load: %s" % (path or active_path(), e))
         return out
     denied = sum(1 for r in tools.values() if isinstance(r, dict) and r.get("deny"))
     out.update(catalogued=len(tools), denied=denied, catalogBuild=cat.get("uefn"))
@@ -105,7 +226,7 @@ def reachable(running_engine, path=None):
         out.update(state="unknown", why="the running UEFN build cannot be read from %r" % out["runningBuild"])
     elif have != want:
         out.update(state="mismatch", why="the catalog is for UEFN %s CL %s and UEFN %s CL %s is running; regenerate "
-                                         "it with gen_catalog.py --live" % (have + want))
+                                         "it with uefn_refresh_catalog" % (have + want))
     else:
         out.update(state="ok", count=len(tools) - denied)
     return out
@@ -135,7 +256,8 @@ def deny_reason(full):
             return why
     if full in DENY_TOOLS:
         return DENY_TOOLS[full]
-    if DENY_WORDS.search(full.rsplit(".", 1)[-1]):
+    words = name_words(full.rsplit(".", 1)[-1])
+    if any(w.startswith(DENY_WORD_PREFIXES) or w in DENY_WORD_EXACT for w in words):
         return "publishing, Fab, licences and accounts are the person's"
     return None
 

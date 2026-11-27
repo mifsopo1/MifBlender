@@ -1243,7 +1243,7 @@ def op_generate_rigify_rig(params):
     names, the IK/FK switch properties, uiScript, uiRegistered, autoRunAllowed; on a regenerate erased [bone names] and
     backup; on a generator failure ok false with the parsed {bone, text}, partial true and what was left behind.
 
-    dryRun is also the BULK PREVIEW (docs/15 section 5) for a NEW rig: the name the rig will get, and a previewId that
+    dryRun is also the BULK PREVIEW for a NEW rig: the name the rig will get, and a previewId that
     {previewId} alone commits - planned again, refused on any difference, read back, and everything the generation made
     removed on a mismatch. A regenerate cannot be previewed (see _plan_generate_rigify_rig).
     """
@@ -1611,7 +1611,7 @@ def op_rigify_snap(params):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# THE BULK PREVIEW of generate_rigify_rig (ops_preview.py; docs/15 section 5, 2026-10-09). What a NEW rig will be called is
+# THE BULK PREVIEW of generate_rigify_rig. What a NEW rig will be called is
 # the generator's own rule (rigify/generate.py: rigify_rig_basename, else metarig -> rig, META -> RIG, else RIG-<name>),
 # made unique as Blender makes any object name; the rig's bones are the generator's and are not known before it runs, so
 # the change is the metarig's target rig, read back by name. The inverse removes every data-block the generation made -

@@ -839,9 +839,9 @@ def op_set_frame_range(params):
 
     # PREVIEW RANGE, which overrides the scene range for PLAYBACK (and viewport renders - RNA's own words) when it is on,
     # and NOT for a render. This comment said a scene with one enabled "renders the preview range" until 2026-09-28, and
-    # rendersFrames below reported the preview pair to match (docs/22 B26's review note). MEASURED 2026-09-28 on 3.6.23,
+    # rendersFrames below reported the preview pair to match. MEASURED 2026-09-28 on 3.6.23,
     # 4.2.17 and 5.2.1, plain bpy, scene 1..6 with preview 3..4 on: render.render(animation=True), `blender -b file -a` and
-    # render_animation's own `-s 1 -e 6 -a` all wrote frames 1-6 (tools/probe_preview_range_render.py; docs/22 B253).
+    # render_animation's own `-s 1 -e 6 -a` all wrote frames 1-6.
     if want_pv_start is not None or want_pv_end is not None:
         # ws / we and their order were settled above, before anything was written.
         # ENABLE THE FLAG BEFORE WRITING THE PAIR. This is NOT the same bug as the main range's, and
@@ -3233,6 +3233,20 @@ def op_add_driver(params):
                 var.targets[0].rotation_mode = vspec["rotationMode"]
     if dtype == "SCRIPTED":
         drv.expression = expression
+        # A PYTHON EXPRESSION IS BEHIND THE GATE (FOUND 2026-11-22). Blender evaluates a "simple" expression (arithmetic,
+        # the variables, a few math functions) itself, and anything else as Python on the next depsgraph update when
+        # Auto Run Python Scripts is on - a route to running code with Allow run_python off. Checked before the first
+        # evaluation below; a refused driver is taken off again, so nothing is left behind.
+        if getattr(drv, "is_simple_expression", True) is False:
+            from .ops_scene import _prefs, RUN_PYTHON_HELP   # noqa: PLC0415
+            if not getattr(_prefs(), "allow_run_python", False):
+                try:
+                    owner.driver_remove(dpath) if index is None else owner.driver_remove(dpath, int(index))
+                except (RuntimeError, TypeError, ValueError):
+                    pass
+                raise MifOpError("expression %r is not one Blender evaluates by itself, so it would run as Python, and "
+                                 "Allow run_python is off. Use arithmetic on the variables (var * 2 + 1, min(a, b), sin(var)) "
+                                 "or a SUM/AVERAGE/MIN/MAX driver. %s NOTHING was added." % (expression, RUN_PYTHON_HELP))
     if curve_pts is not None:
         # THE GENERATOR GOES FIRST: a new driver curve carries a Generator modifier that maps value to value, and
         # keyframes beside it are overridden by it, so a response curve needs it removed.
@@ -3781,7 +3795,7 @@ def op_set_action(params):
     if new_name is not None:
         asked = str(new_name)
         # An Action is an ID, so naming it over one that exists can rename the OTHER action
-        # on 3.6 - see ops_common.assign_id_name and ledger B12. renamed_to below reads the
+        # on 3.6 - see ops_common.assign_id_name and the internal notes. renamed_to below reads the
         # name back either way, so the caller's report is unchanged; what changes is that no
         # action the caller never mentioned is touched.
         assign_id_name(act, asked, bpy.data.actions)

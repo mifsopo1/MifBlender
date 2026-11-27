@@ -5007,7 +5007,9 @@ def op_transfer_by_uv(params):
 # --------------------------------------------------------------------------------------------- loft_garment
 
 _LOFT_KEYS = ("body", "armature", "rings", "segments", "ease", "offset", "edgeLength", "evaluated", "name",
-              "collection", "takeOverName", "garment", "easeTable", "axis", "center", "limb")
+              "collection", "takeOverName", "garment", "easeTable", "axis", "center", "limb", "maxWidthRatio",
+              "limbClip")
+_RIM_KEYS = {"roll", "flare", "thickness"}
 
 # MEASURED EASE TABLES, by garment and body region: a ring's ease (garment perimeter / body perimeter - 1 in the plane
 # square to the bone, loft_garment's own measure) read off a professionally made garment on the body it was fitted to,
@@ -5428,6 +5430,179 @@ def _lg_row(pb, at, c, e, o, body_pts, ring):
             "ratio": round(gp / bp, 6) if bp > 0 else None}
 
 
+def _lg_rims(raw, tail):
+    """[(ring index, {roll, flare, thickness})] from rings[k].rim - on the first or the last ring only (the open ends)."""
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out = []
+    for k, r in enumerate(raw):
+        if not isinstance(r, dict) or r.get("rim") is None:
+            continue
+        rim = r["rim"]
+        if not isinstance(rim, dict) or not rim or set(rim) - _RIM_KEYS:
+            raise MifOpError("rings[%d].rim is {roll, flare, thickness} (metres), got %r. %s" % (k, rim, tail))
+        if k not in (0, len(raw) - 1):
+            raise MifOpError("rings[%d].rim: a rim finishes an open end, so it goes on the first or the last ring. %s"
+                             % (k, tail))
+        vals = {}
+        for key in ("roll", "flare", "thickness"):
+            if rim.get(key) is not None:
+                v = finite_float(rim[key], "rings[%d].rim.%s" % (k, key))
+                if v < 0 or (key != "flare" and v == 0):
+                    raise MifOpError("rings[%d].rim.%s must be above 0 (metres), got %r. %s" % (k, key, v, tail))
+                vals[key] = v
+        out.append((k, vals))
+    thick = {v.get("thickness") for _k, v in out if v.get("thickness") is not None}
+    if len(thick) > 1:
+        raise MifOpError("the two rims give different thicknesses %s - a garment's wall is one thickness. %s"
+                         % (sorted(thick), tail))
+    return out
+
+
+def _lg_limb_width(bm, arm, pb, at, c, n, ux, angles, e, o, ring, body_pts, max_ratio, clip, k, tail, isect):
+    """A ring far wider than its own limb is a section through the body beside it - the torso at a shoulder, the hip at
+    a thigh's head. The limb's width is its section at 0.5 and 0.75 along the same bone (the narrower); past
+    maxWidthRatio x it the ring is refused, or with limbClip each ray is held to limbClip x the limb's own ray."""
+    refs = []
+    for at_r in (0.5, 0.75):
+        c2, n2, ux2 = _lg_frame(arm, pb, at_r, tail)
+        _r2, pts2, miss2 = _lg_cast(_lg_section(bm, c2, n2), c2, n2, ux2, angles, 0.0, 0.0, isect)
+        if not miss2:
+            lens = [(p - c2).length for p in pts2]
+            refs.append((sum(lens) / len(lens), lens, at_r))
+    if not refs:
+        return ring, body_pts, None
+    ref_mean, ref_lens, ref_at = min(refs, key=lambda t: t[0])
+    lens = [(p - c).length for p in body_pts]
+    mean = sum(lens) / len(lens)
+    ratio = mean / ref_mean if ref_mean > 1e-9 else 1.0
+    row = {"limbRadius": round(ref_mean, 6), "ringRadius": round(mean, 6), "ratio": round(ratio, 4),
+           "measuredAt": ref_at, "raysClipped": 0}
+    if clip is not None:
+        dirs = [(p - c).normalized() for p in body_pts]
+        new_ring, new_body, clipped = [], [], 0
+        for d, ln, rl in zip(dirs, lens, ref_lens):
+            if ln > clip * rl:
+                ln = clip * rl
+                clipped += 1
+            new_body.append(c + d * ln)
+            new_ring.append(c + d * (ln * (1.0 + e) + o))
+        row["raysClipped"] = clipped
+        row["limbClip"] = clip
+        return new_ring, new_body, row
+    if max_ratio and ratio > max_ratio:
+        raise MifOpError("ring %d (bone '%s' at %g) is %.2f x as wide as the limb (%.4f m against %.4f m at %g along "
+                         "the bone, maxWidthRatio %g) - its plane cuts the body beside the limb. Move the ring further "
+                         "along the bone, pass limbClip (e.g. 1.3) to hold each ray to the limb's own, or "
+                         "maxWidthRatio 0 to take the section as it is. %s"
+                         % (k, pb.name, at, ratio, mean, ref_mean, ref_at, max_ratio, tail))
+    return ring, body_pts, row
+
+
+def _lg_apply_rims(full, rims, step, tail):
+    """(rows, inner rows or None, reply rows): each rim's flare (the end ring pushed out, blended over four rows) and
+    roll (a half-turn lip curled outward, radius roll) at its end; with a thickness, the inner wall's rows - each body
+    row offset toward its centre, each lip row away from the lip's own centre - for a closed shell."""
+    if not rims:
+        return full, None, []
+    full = [list(r) for r in full]
+    thick = next((v["thickness"] for _k, v in rims if v.get("thickness")), None)
+    ends = {}
+    for k, v in rims:
+        ends["first" if k == 0 else "last"] = (k, v)
+    reply = []
+    pre, post = [], []
+    lip_centres = {}
+    for end, (ring_k, v) in ends.items():
+        idx, nb = (0, 1) if end == "first" else (len(full) - 1, len(full) - 2)
+        cen = sum(full[idx], Vector()) / len(full[idx])
+        d = cen - sum(full[nb], Vector()) / len(full[nb])
+        if d.length < 1e-9:
+            raise MifOpError("the %s ring sits on its neighbour - no direction to finish the rim along. %s" % (end, tail))
+        d.normalize()
+        fl = v.get("flare", 0.0)
+        if fl:
+            reach = 4.0 * step
+            order = range(len(full)) if end == "first" else range(len(full) - 1, -1, -1)
+            for j in order:
+                cj = sum(full[j], Vector()) / len(full[j])
+                dist = abs((cj - cen).dot(d))
+                if dist > reach:
+                    break
+                w = (1.0 - dist / reach) ** 2
+                full[j] = [p + (p - cj - d * (p - cj).dot(d)).normalized() * (fl * w) for p in full[j]]
+        endrow = full[idx]
+        cen = sum(endrow, Vector()) / len(endrow)
+        radial = [(p - cen - d * (p - cen).dot(d)).normalized() for p in endrow]
+        lip = []
+        rl = v.get("roll", 0.0)
+        if rl:
+            nst = 6
+            for st in range(1, nst + 1):
+                th = math.pi * st / nst
+                lip.append([p + rd * (rl * (1.0 - math.cos(th))) + d * (rl * math.sin(th))
+                            for p, rd in zip(endrow, radial)])
+            lip_centres[end] = ([p + rd * rl for p, rd in zip(endrow, radial)], rl)
+        if end == "first":
+            pre = list(reversed(lip))
+        else:
+            post = lip
+        reach_out = max((p - cen - d * (p - cen).dot(d)).length for p in (lip[-1] if lip else endrow))
+        reply.append({"end": end, "ring": ring_k, "flare": fl, "roll": rl,
+                      "thickness": v.get("thickness"), "lipRows": len(lip), "outerRadius": round(reach_out, 6)})
+    rows = pre + full + post
+    if not thick:
+        return rows, None, reply
+    inner = []
+    n_pre = len(pre)
+    for j, row in enumerate(rows):
+        if j < n_pre or j >= n_pre + len(full):
+            end = "first" if j < n_pre else "last"
+            centres, rl = lip_centres[end]
+            inner.append([p + (p - q) / rl * thick for p, q in zip(row, centres)])
+            continue
+        cj = sum(row, Vector()) / len(row)
+        inner.append([p - (p - cj).normalized() * thick for p in row])
+    for r in reply:
+        r["innerWall"] = True
+    return rows, inner, reply
+
+
+def _lg_inner_shell(inner, verts, faces, uvs, segments, circ, vpos):
+    """Add the inner wall (wound the other way) and the two bands joining it to the outer one at the open ends, so the
+    garment is one closed shell; the inner wall's UVs sit beyond the outer's in v."""
+    base = len(verts)
+    for row in inner:
+        verts.extend(list(p) for p in row)
+    gap = vpos[-1] + 0.05
+    rows = len(inner)
+    for r in range(rows - 1):
+        for s in range(segments):
+            s2 = (s + 1) % segments
+            a = base + r * segments
+            b = base + (r + 1) * segments
+            faces.append([a + s, b + s, b + s2, a + s2])
+            u0, u1 = circ * s / segments, circ * (s + 1) / segments
+            uvs.append([[u0, gap + vpos[r]], [u0, gap + vpos[r + 1]], [u1, gap + vpos[r + 1]], [u1, gap + vpos[r]]])
+    last = rows - 1
+    for s in range(segments):
+        s2 = (s + 1) % segments
+        faces.append([s, base + s, base + s2, s2])
+        uvs.append([[0.0, -0.02], [0.0, -0.04], [0.01, -0.04], [0.01, -0.02]])
+        o1, i1 = last * segments, base + last * segments
+        faces.append([o1 + s, o1 + s2, i1 + s2, i1 + s])
+        uvs.append([[0.0, gap * 2 + 0.02], [0.01, gap * 2 + 0.02], [0.01, gap * 2 + 0.04], [0.0, gap * 2 + 0.04]])
+    vol = 0.0
+    for f in faces:
+        a = Vector(verts[f[0]])
+        for k in range(1, len(f) - 1):
+            vol += a.dot(Vector(verts[f[k]]).cross(Vector(verts[f[k + 1]])))
+    if vol < 0:
+        for i, f in enumerate(faces):
+            faces[i] = list(reversed(f))
+            uvs[i] = list(reversed(uvs[i]))
+
+
 def op_loft_garment(params):
     """Loft a garment tube round a body through rings placed at its bones - a sleeve, a trouser leg, a torso - each
     ring the body's own cross-section there, eased out.
@@ -5445,6 +5620,17 @@ def op_loft_garment(params):
     units. Reply per ring: the bone, its centre, the body's perimeter there and the garment's (their ratio is 1 + ease
     when offset is 0), and rays that missed. Refused: a ray from a ring missing the body (the ring is outside it), fewer
     than two rings, a bone not on the armature, segments outside 3-512, ease at or under -1, over 500,000 faces.
+
+    A RING BESIDE A JOINT, AND RIMS (2026-11-25; FOUND 2026-11-18): rings near a joint (a thigh at 0.08, an upper arm at
+    0.12) took the hip's or torso's whole section - a 0.49 m thigh plate - because the plane square to the bone there
+    cuts the body beside the limb. Each bone ring is now measured against its own limb (the narrower section at 0.5 and
+    0.75 along the same bone): past maxWidthRatio (default 2; 0 turns it off) x the limb it is refused, and limbClip
+    (1 or more) instead holds each ray to that many times the limb's own ray at that angle; the ring's reply row gives
+    limbWidth {limbRadius, ringRadius, ratio, raysClipped}. rings[k].rim {roll, flare, thickness} on the first or last
+    ring finishes that open end: flare pushes the end out (blended over four rows), roll curls a half-turn lip outward
+    of that radius, thickness gives the garment an inner wall that far in and joins the two at both ends - one closed
+    shell; the reply's rims say each end's outer radius. Refused: a rim on a middle ring, two rims with different
+    thicknesses, a rim value not above 0.
     """
     reject_unknown(params, _LOFT_KEYS, "loft_garment")
     tail = "NOTHING was created."
@@ -5466,7 +5652,19 @@ def op_loft_garment(params):
         raise MifOpError("ease must be above -1 and offset finite. %s" % tail)
     if el is not None and not (math.isfinite(el) and el > 0):
         raise MifOpError("edgeLength must be above 0, got %r. %s" % (el, tail))
-    rings = _lg_rings(params.get("rings"), arm, tail, params=params)
+    raw_rings = params.get("rings")
+    rims = _lg_rims(raw_rings, tail)
+    if isinstance(raw_rings, (list, tuple)):
+        raw_rings = [{k: v for k, v in r.items() if k != "rim"} if isinstance(r, dict) else r for r in raw_rings]
+    rings = _lg_rings(raw_rings, arm, tail, params=params)
+    max_ratio = take_float(params, "maxWidthRatio", default=2.0)
+    clip = take_float(params, "limbClip", default=None)
+    if not math.isfinite(max_ratio) or (max_ratio != 0 and max_ratio < 1.0):
+        raise MifOpError("maxWidthRatio is 1 or more (a ring's width over its limb's), or 0 to turn the check off, got "
+                         "%r. %s" % (max_ratio, tail))
+    if clip is not None and not (math.isfinite(clip) and clip >= 1.0):
+        raise MifOpError("limbClip is 1 or more (each ray held to that many times the limb's own), got %r. %s"
+                         % (clip, tail))
     from mathutils.geometry import intersect_line_line_2d   # noqa: PLC0415 - after the refusals (offline stub)
     bm = evaluated_world(body, evaluated=evaluated)
     try:
@@ -5482,8 +5680,14 @@ def op_loft_garment(params):
             if missed:
                 raise MifOpError("ring %d (bone '%s' at %g): %d of %d rays met no body surface - the bone there is not "
                                  "inside '%s'. %s" % (k, pb.name, at, missed, segments, body.name, tail))
+            width = None
+            if not isinstance(pb, _Place) and (max_ratio or clip):
+                ring, body_pts, width = _lg_limb_width(bm, arm, pb, at, c, n, ux, angles, e, o, ring, body_pts,
+                                                       max_ratio, clip, k, tail, intersect_line_line_2d)
             built.append(ring)
             rows.append(_lg_row(pb, at, c, e, o, body_pts, ring))
+            if width is not None:
+                rows[-1]["limbWidth"] = width
     finally:
         bm.free()
     ring_edge = sum(sum((r[i] - r[i - 1]).length for i in range(segments)) / segments for r in built) / len(built)
@@ -5494,7 +5698,8 @@ def op_loft_garment(params):
         nrow = max(1, int(round(gap / step)))
         for t in range(1, nrow + 1):
             full.append([p.lerp(q, t / nrow) for p, q in zip(a, b)])
-    nfaces = (len(full) - 1) * segments
+    full, inner, rim_rows = _lg_apply_rims(full, rims, step, tail)
+    nfaces = (len(full) - 1) * segments * (2 if inner else 1) + (2 * segments if inner else 0)
     if nfaces > 500000:
         raise MifOpError("the loft would hold %d faces (over 500,000) - raise edgeLength. %s" % (nfaces, tail))
     verts = [list(p) for row in full for p in row]
@@ -5509,6 +5714,8 @@ def op_loft_garment(params):
             faces.append([r * segments + s, r * segments + s2, (r + 1) * segments + s2, (r + 1) * segments + s])
             u0, u1 = circ * s / segments, circ * (s + 1) / segments
             uvs.append([[u0, vpos[r]], [u1, vpos[r]], [u1, vpos[r + 1]], [u0, vpos[r + 1]]])
+    if inner:
+        _lg_inner_shell(inner, verts, faces, uvs, segments, circ, vpos)
     from .ops_create import op_create_mesh   # noqa: PLC0415 - create_mesh owns naming and the read-back
     sub = {"name": params.get("name") or body.name + "_loft", "vertices": verts, "faces": faces, "uvs": {"UVMap": uvs}}
     for kk in _PLACE_KEYS[1:]:
@@ -5520,6 +5727,8 @@ def op_loft_garment(params):
     out["rows"] = len(full)
     out["segments"] = segments
     out["edgeLength"] = round(step, 6)
+    if rim_rows:
+        out["rims"] = rim_rows
     table = _lg_ease_table(params, tail)
     if table is not None:
         out["easeTable"] = table
@@ -5862,7 +6071,11 @@ def op_attach_sleeve(params):
 # --------------------------------------------------------------------------------------------- displace_by_rule
 
 _DISPLACE_KEYS = ("object", "rules", "name")
-_DR_TYPES = ("SEAM", "STITCH", "WEAVE", "KNIT")
+_DR_TYPES = ("SEAM", "STITCH", "WEAVE", "KNIT", "BARK", "WOOD_END_GRAIN")
+_DR_WOOD = {"BARK": {"type", "direction", "follow", "crackWidth", "depth", "plateSize", "crossBreak", "seed",
+                     "profile"},
+            "WOOD_END_GRAIN": {"type", "pith", "axis", "faceAngle", "ringSpacing", "ringVariation", "ringDepth",
+                               "checks", "checkDepth", "checkWidth", "seed", "profile"}}
 _DR_PATTERNS = {"WEAVE": ("PLAIN", "TWILL"), "KNIT": ("RIB",)}
 _DR_SURFACE_KEYS = {"type", "pattern", "period", "depth", "uvMap"}
 _DR_EDGES = ("BOUNDARY", "UV_SEAMS", "SHARP")
@@ -5936,9 +6149,217 @@ def _dr_pattern(pat, u, v, p):
     return math.cos(w * u)
 
 
+def _dr_vec(raw, label, tail):
+    if not isinstance(raw, (list, tuple)) or len(raw) != 3:
+        raise MifOpError("%s is [x, y, z], got %r. %s" % (label, raw, tail))
+    return Vector(finite_floats(list(raw), label))
+
+
+def _dr_wood_rule(k, r, kind, tail):
+    """BARK {direction | follow, crackWidth, depth, plateSize, crossBreak, seed, profile} and WOOD_END_GRAIN {pith,
+    axis, faceAngle, ringSpacing, ringVariation, ringDepth, checks, checkDepth, checkWidth, seed, profile}, checked."""
+    keys = _DR_WOOD[kind]
+    if set(r) - keys:
+        raise MifOpError("rules[%d] (%s) takes %s, got %r. %s" % (k, kind, ", ".join(sorted(keys)), sorted(r), tail))
+    out = {"type": kind, "profile": str(r.get("profile", "ROUND")).upper(), "seed": r.get("seed", 1)}
+    if out["profile"] not in _DR_PROFILES:
+        raise MifOpError("rules[%d].profile must be one of %s. %s" % (k, ", ".join(_DR_PROFILES), tail))
+    if isinstance(out["seed"], bool) or not isinstance(out["seed"], int):
+        raise MifOpError("rules[%d].seed is a whole number. %s" % (k, tail))
+
+    def num(key, default=None, positive=True):
+        if r.get(key) is None:
+            if default is None:
+                raise MifOpError("rules[%d].%s is required for %s (world units). %s" % (k, key, kind, tail))
+            return default
+        v = finite_float(r[key], "rules[%d].%s" % (k, key))
+        if positive and not v > 0:
+            raise MifOpError("rules[%d].%s must be above 0, got %r. %s" % (k, key, v, tail))
+        return v
+    if kind == "BARK":
+        if (r.get("direction") is None) == (r.get("follow") is None):
+            raise MifOpError("rules[%d] (BARK) takes direction [x,y,z] (one axis) OR follow (a curve, armature or "
+                             "edge-only mesh whose segments the cracks run along). %s" % (k, tail))
+        if r.get("direction") is not None:
+            d = _dr_vec(r["direction"], "rules[%d].direction" % k, tail)
+            if d.length < 1e-9:
+                raise MifOpError("rules[%d].direction has no length. %s" % (k, tail))
+            out["direction"] = d.normalized()
+        else:
+            if not isinstance(r["follow"], str) or bpy.data.objects.get(r["follow"]) is None:
+                raise MifOpError("rules[%d].follow: no object named %r. %s" % (k, r["follow"], tail))
+            out["follow"] = r["follow"]
+        out["depth"] = num("depth", positive=False)
+        out["plateSize"] = num("plateSize")
+        out["crackWidth"] = num("crackWidth", out["plateSize"] * 0.15)
+        out["crossBreak"] = num("crossBreak", 0.35)
+        if out["crossBreak"] > 1.0:
+            raise MifOpError("rules[%d].crossBreak is 0-1 (plate width over plate length), got %r. %s"
+                             % (k, out["crossBreak"], tail))
+        if out["crackWidth"] >= out["plateSize"]:
+            raise MifOpError("rules[%d].crackWidth %g is not under plateSize %g - the cracks would be the whole bark. %s"
+                             % (k, out["crackWidth"], out["plateSize"], tail))
+        out["width"] = out["crackWidth"]
+        return out
+    out["pith"] = None if r.get("pith") is None else _dr_vec(r["pith"], "rules[%d].pith" % k, tail)
+    ax = _dr_vec(r.get("axis", [0, 0, 1]), "rules[%d].axis" % k, tail)
+    if ax.length < 1e-9:
+        raise MifOpError("rules[%d].axis has no length. %s" % (k, tail))
+    out["axis"] = ax.normalized()
+    out["faceAngle"] = num("faceAngle", 30.0)
+    if out["faceAngle"] >= 90.0:
+        raise MifOpError("rules[%d].faceAngle is the end face's spread in degrees, under 90, got %r. %s"
+                         % (k, out["faceAngle"], tail))
+    out["ringSpacing"] = num("ringSpacing")
+    out["ringDepth"] = num("ringDepth", positive=False)
+    out["ringVariation"] = num("ringVariation", 0.3, positive=False)
+    if not 0.0 <= out["ringVariation"] <= 1.0:
+        raise MifOpError("rules[%d].ringVariation is 0-1 (a share of the ring spacing). %s" % (k, tail))
+    checks = r.get("checks", 0)
+    if isinstance(checks, bool) or not isinstance(checks, int) or not 0 <= checks <= 64:
+        raise MifOpError("rules[%d].checks is a count of radial cracks, 0-64, got %r. %s" % (k, checks, tail))
+    out["checks"] = checks
+    out["checkDepth"] = num("checkDepth", 0.0 if not checks else None, positive=False)
+    out["checkWidth"] = num("checkWidth", out["ringSpacing"] * 0.5)
+    out["width"] = out["ringSpacing"] * 0.3
+    return out
+
+
+def _dr_flow(bm, rule, shift, normals):
+    """Per vertex the unit crack direction on the surface (the flow with the normal taken out), or None where the flow
+    runs into the surface: one world direction, or the nearest segments of a curve / armature / edge skeleton, blended."""
+    from mathutils.kdtree import KDTree   # noqa: PLC0415
+    from .ops_kit import _vc_segments_of   # noqa: PLC0415 - the same skeleton reader as set_vertex_color_by_rule
+    if "direction" in rule:
+        fl = [rule["direction"]] * len(bm.verts)
+    else:
+        tgt = bpy.data.objects[rule["follow"]]
+        segs = _vc_segments_of(tgt, "NOTHING was changed.")
+        segs = [(a - shift, b - shift) for a, b in (segs or []) if (b - a).length > 1e-9]
+        if not segs:
+            raise MifOpError("follow '%s' has no bones, curve or edges to follow (a mesh with faces is not a skeleton). "
+                             "NOTHING was changed." % tgt.name)
+        pts = []
+        for i, (a, b) in enumerate(segs):
+            n = max(1, int((b - a).length / max(1e-4, sum((y - x).length for x, y in segs) / 4000.0)))
+            pts.extend((a.lerp(b, t / n), i) for t in range(n + 1))
+        kd = KDTree(len(pts))
+        for j, (p, _i) in enumerate(pts):
+            kd.insert(p, j)
+        kd.balance()
+        fl = []
+        for v in bm.verts:
+            best = {}
+            for co, j, d in kd.find_n(v.co, 12):
+                i = pts[j][1]
+                if i not in best or d < best[i]:
+                    best[i] = d
+            near = sorted(best.items(), key=lambda kv: kv[1])[:2]
+            ref = (segs[near[0][0]][1] - segs[near[0][0]][0]).normalized()
+            acc = Vector()
+            for i, d in near:
+                sd = (segs[i][1] - segs[i][0]).normalized()
+                acc += (sd if sd.dot(ref) >= 0 else -sd) / max(d, 1e-6) ** 2
+            fl.append(acc.normalized() if acc.length > 1e-12 else ref)
+    out = []
+    for f, n in zip(fl, normals):
+        t = f - n * f.dot(n)
+        out.append(t.normalized() if t.length > 0.2 else None)
+    return out
+
+
+def _dr_bark(bm, rule, shift, normals):
+    """Cracks along the flow: Voronoi plates squashed along it (crossBreak: width over length), a groove `crackWidth`
+    wide on each plate border, depth along the normal. (verticesMoved, deepest, intoSurface) - intoSurface counts the
+    vertices where the flow runs into the surface (a cut face across a trunk), which are left."""
+    from mathutils import noise as mnoise   # noqa: PLC0415
+    import random as _random                 # noqa: PLC0415
+    gen = _random.Random(rule["seed"])
+    off = Vector((gen.uniform(-500, 500), gen.uniform(-500, 500), gen.uniform(-500, 500)))
+    flow = _dr_flow(bm, rule, shift, normals)
+    size, c = rule["plateSize"], rule["crossBreak"]
+    half = rule["crackWidth"] / 2.0
+    moved, deepest, into = 0, 0.0, 0
+    for v in bm.verts:
+        f = flow[v.index]
+        if f is None:
+            into += 1
+            continue
+        p = v.co
+        q = (p + f * (p.dot(f) * (c - 1.0))) / size + off
+        _dists, pts = mnoise.voronoi(q, distance_metric="DISTANCE")
+        s1, s2 = Vector(pts[0]), Vector(pts[1])
+        u = s2 - s1
+        if u.length < 1e-12:
+            continue
+        dist = abs((q - (s1 + s2) / 2.0).dot(u.normalized())) * size
+        share = _dr_profile(rule["profile"], dist / half)
+        if share < 1e-6:
+            continue
+        v.co -= normals[v.index] * (rule["depth"] * share)
+        moved += 1
+        deepest = max(deepest, abs(rule["depth"] * share))
+    return moved, deepest, into
+
+
+def _dr_end_grain(bm, rule, shift, normals):
+    """Growth rings and radial checks on the faces turned to `axis`: rings `ringSpacing` apart round the pith, wobbled
+    by ringVariation, each a groove ringDepth deep; `checks` radial cracks from the rim in, wedge-shaped (checkWidth at
+    the rim), checkDepth deep. (verticesMoved, deepest, endFaceVertices, pith, outer radius, check angles)."""
+    from mathutils import noise as mnoise   # noqa: PLC0415
+    import random as _random                 # noqa: PLC0415
+    ax = rule["axis"]
+    cos_lim = math.cos(math.radians(rule["faceAngle"]))
+    face = [v for v in bm.verts if normals[v.index].dot(ax) >= cos_lim]
+    if not face:
+        raise MifOpError("WOOD_END_GRAIN: no vertex faces within %g degrees of the axis %s - no end face to cut. "
+                         "NOTHING was changed." % (rule["faceAngle"], [round(x, 4) for x in ax]))
+    pith = (rule["pith"] - shift) if rule["pith"] is not None else sum((v.co for v in face), Vector()) / len(face)
+    e1 = ax.orthogonal().normalized()
+    e2 = ax.cross(e1)
+    gen = _random.Random(rule["seed"])
+    off = Vector((gen.uniform(-500, 500), gen.uniform(-500, 500), gen.uniform(-500, 500)))
+    polar = []
+    for v in face:
+        w = v.co - pith
+        x, y = w.dot(e1), w.dot(e2)
+        polar.append((v, math.hypot(x, y), math.atan2(y, x)))
+    outer = max(r for _v, r, _a in polar) or 1.0
+    checks = [(gen.uniform(-math.pi, math.pi), outer * gen.uniform(0.35, 0.9)) for _ in range(rule["checks"])]
+    sp, var = rule["ringSpacing"], rule["ringVariation"]
+    moved, deepest = 0, 0.0
+    for v, r, a in polar:
+        wob = var * sp * mnoise.noise(Vector((math.cos(a) * 1.7, math.sin(a) * 1.7, r / (4.0 * sp))) + off)
+        ph = (r + wob) / sp
+        g = abs(ph - round(ph))
+        h = rule["ringDepth"] * _dr_profile(rule["profile"], g / 0.15) if r > 0.25 * sp else 0.0
+        for ca, length in checks:
+            start = outer - length
+            if r < start:
+                continue
+            da = (a - ca + math.pi) % (2.0 * math.pi) - math.pi
+            if abs(da) >= math.pi / 2.0:
+                continue
+            grow = (r - start) / max(length, 1e-9)
+            w2 = 0.5 * rule["checkWidth"] * grow
+            lat = r * math.sin(abs(da))
+            if w2 > 1e-9 and lat < w2:
+                h += rule["checkDepth"] * grow * _dr_profile(rule["profile"], lat / w2)
+        if abs(h) < 1e-12:
+            continue
+        v.co -= normals[v.index] * h
+        moved += 1
+        deepest = max(deepest, abs(h))
+    return moved, deepest, len(face), pith + shift, outer, [
+        {"direction": [round(x, 6) for x in (e1 * math.cos(ca) + e2 * math.sin(ca))], "length": round(ln, 6)}
+        for ca, ln in checks]
+
+
 def _dr_rule(k, r, tail):
     if isinstance(r, dict) and str(r.get("type", "")).upper() in _DR_PATTERNS:
         return _dr_surface_rule(k, r, str(r["type"]).upper(), tail)
+    if isinstance(r, dict) and str(r.get("type", "")).upper() in _DR_WOOD:
+        return _dr_wood_rule(k, r, str(r["type"]).upper(), tail)
     if not isinstance(r, dict) or set(r) - _DR_RULE_KEYS:
         raise MifOpError("rules[%d] takes %s, got %r. %s" % (k, ", ".join(sorted(_DR_RULE_KEYS)), r, tail))
     kind = str(r.get("type", "")).upper()
@@ -6057,6 +6478,18 @@ def op_displace_by_rule(params):
     vertex takes its first corner's): WEAVE PLAIN sin(2 pi u / period) x sin(2 pi v / period), a checker of bumps;
     WEAVE TWILL sin(2 pi (u + v) / period), diagonal ridges; KNIT RIB cos(2 pi u / period), columns down v. Positive
     depth raises the peaks. Refused: no UV map, period not above 0, a pattern the type lacks.
+
+    WOOD (2026-11-25; FOUND 2026-11-18 on a stump whose bark and cut face were computed in numpy): {type BARK, direction
+    [x,y,z] | follow (a curve, armature or edge-only mesh), plateSize, crackWidth (default 0.15 plateSize), depth,
+    crossBreak (0-1, default 0.35: plate width over length), seed, profile} cracks the bark along a flow - one world
+    direction, or at each vertex the nearest two segments of the skeleton blended, the normal taken out - as Voronoi
+    plates squashed along it with a groove on every plate border; a vertex where the flow runs into the surface (a cut
+    face across the trunk) is left and counted (flowIntoSurface). {type WOOD_END_GRAIN, pith [x,y,z] (default the end
+    face's centre), axis (default [0,0,1]), faceAngle (degrees, default 30: which vertices are the end face), ringSpacing,
+    ringVariation (0-1 of a spacing, default 0.3), ringDepth, checks (0-64 radial cracks from the rim in), checkDepth,
+    checkWidth (at the rim, default half a spacing), seed, profile} cuts growth rings round the pith and wedge-shaped
+    checks on the faces turned to axis. Refused: direction and follow both or neither, a follow that is not there or has
+    no segments, crackWidth not under plateSize, crossBreak over 1, no vertex facing the axis, checks without checkDepth.
     """
     reject_unknown(params, _DISPLACE_KEYS, "displace_by_rule")
     tail = "NOTHING was changed."
@@ -6096,6 +6529,20 @@ def op_displace_by_rule(params):
         tree.balance()
         report = []
         for k, r in enumerate(rules):
+            if r["type"] == "BARK":
+                moved, deepest, into = _dr_bark(bm, r, shift, normals)
+                report.append({"type": "BARK", "verticesMoved": moved, "deepest": round(deepest, 9),
+                               "flowIntoSurface": into, "plateSize": r["plateSize"], "crackWidth": r["crackWidth"],
+                               "crossBreak": r["crossBreak"], "flow": r.get("follow") or
+                               [round(x, 6) for x in r["direction"]]})
+                continue
+            if r["type"] == "WOOD_END_GRAIN":
+                moved, deepest, nface, pith, outer, cracks = _dr_end_grain(bm, r, shift, normals)
+                report.append({"type": "WOOD_END_GRAIN", "verticesMoved": moved, "deepest": round(deepest, 9),
+                               "endFaceVertices": nface, "pith": [round(x, 6) for x in pith],
+                               "outerRadius": round(outer, 6), "rings": int(outer / r["ringSpacing"]),
+                               "checks": cracks})
+                continue
             if r["type"] in _DR_PATTERNS:
                 moved, deepest, seams = 0, 0.0, 0
                 for v in bm.verts:
@@ -8584,7 +9031,7 @@ def _body_pts(body):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# THE BULK PREVIEWS (ops_preview.py; docs/15 section 5, 2026-10-09). fit_mesh moves objects, so its plan is the fit's own
+# THE BULK PREVIEWS. fit_mesh moves objects, so its plan is the fit's own
 # transform on each world matrix - the object, every object it carries and every child that follows it - read back and
 # put back as transform_objects' are. The garment ops write a mesh and plan on a scratch copy (ops_preview.mesh_spec).
 # ---------------------------------------------------------------------------------------------------------------------
@@ -8627,6 +9074,406 @@ def _preview_specs():
 
 PREVIEW = _preview_specs()
 
+# --------------------------------------------------------------------------------------------- conform_sheet
+_CONFORM_KEYS = ("object", "mode", "axis", "radius", "body", "offset", "pin", "name")
+
+
+def _sheet_frame(world):
+    """(centre, unit normal) of the panel's best-fit plane: the smallest-variance direction of its points."""
+    import numpy as np   # noqa: PLC0415 - bundled with every Blender this add-on runs on
+    a = np.array([tuple(p) for p in world], dtype=float)
+    c = a.mean(axis=0)
+    _w, v = np.linalg.eigh(np.cov((a - c).T))
+    return Vector(c.tolist()), Vector(v[:, 0].tolist()).normalized()
+
+
+def _sheet_pin(pin, tail):
+    """pin {group | near [x,y,z], radius, falloff}, its shape checked; None when there is none."""
+    if pin is None:
+        return None
+    if not isinstance(pin, dict) or set(pin) - {"group", "near", "radius", "falloff"} or             (pin.get("group") is None) == (pin.get("near") is None):
+        raise MifOpError("pin is {group | near [x,y,z], radius, falloff} - a vertex group or a point, one of them; got "
+                         "%r. %s" % (pin, tail))
+    return pin
+
+
+def op_conform_sheet(params):
+    """Bend a flat panel round an axis, or wrap it onto a body at an offset, keeping its UVs and its thickness - a wing
+    membrane folded round a bone, a plate wrapped onto a chest - with a falloff from a pinned edge.
+
+    THE GAP (FOUND 2026-11-18, one build): folded wing membranes had no op - the build made a slab with
+    mesh_from_outline, read it with read_mesh_data, wrapped it round a cylinder in its own code and wrote it back with
+    set_mesh_vertices. wrap_to_target fits a surface's own vertices onto another (a template onto a scan) and holds
+    pinned ones still; this keeps a panel's thickness and blends the bend in from a pin.
+
+    The panel's best-fit plane gives each vertex flat coordinates and a height h off its mid-plane (a slab's two faces
+    at +-half its thickness). mode BEND (axis {point, direction} in world; radius, default the axis's distance to the
+    panel's centre): each vertex's distance across the panel, square to the axis, becomes an arc of that radius, its
+    height a change in radius - a cylinder's bend, isometric on the mid-plane. mode WRAP (body, a mesh; offset, the
+    mid-plane's gap from the body, default 0): each vertex's mid-plane point goes to the nearest point of the body's
+    surface, then out along its normal by offset + h. pin {group (a vertex group) | near [x,y,z] with radius (default
+    a twentieth of the panel's span), falloff (metres, default a quarter of the span)}: the pinned vertices stay, and
+    the rest move in by a smoothstep of their flat distance to them over falloff. Faces, edges and UVs are unchanged;
+    name writes a copy instead. Reply: verticesMoved, pinned, the edge-length change (mean and worst relative), and
+    for BEND the radius each vertex lands at, for WRAP each fully-moved vertex's distance to the body. Refused, nothing
+    changed: an unknown mode, BEND without axis or with a panel that does not face it (its normal more than 25 degrees
+    off the radius to it), WRAP without body or onto the panel itself, a pin that holds nothing, radius not above 0,
+    shape keys.
+    """
+    reject_unknown(params, _CONFORM_KEYS, "conform_sheet")
+    tail = "NOTHING was changed."
+    src = get_object(take(params, "object", required=True, kind=str), want_mesh=True)
+    mode = str(take(params, "mode", default="BEND", kind=str)).upper()
+    if mode not in ("BEND", "WRAP"):
+        raise MifOpError("mode is BEND (round an axis) or WRAP (onto a body), got %r. %s" % (mode, tail))
+    for key, owner in (("axis", "BEND"), ("radius", "BEND"), ("body", "WRAP"), ("offset", "WRAP")):
+        if params.get(key) is not None and mode != owner:
+            raise MifOpError("'%s' is read by mode %s only; mode is %s. %s" % (key, owner, mode, tail))
+    pin = _sheet_pin(params.get("pin"), tail)
+    name = take(params, "name", default=None, kind=str)
+    from mathutils.bvhtree import BVHTree   # noqa: PLC0415 - after the refusals (offline stub)
+    from mathutils.kdtree import KDTree     # noqa: PLC0415
+    bm, shift = _world_edit(src, "conform_sheet")
+    try:
+        bm.verts.ensure_lookup_table()
+        if not len(bm.verts) or not len(bm.faces):
+            raise MifOpError("'%s' has no faces. %s" % (src.name, tail))
+        world = [v.co + shift for v in bm.verts]
+        c, n0 = _sheet_frame(world)
+        span = max((p - c).length for p in world) * 2.0
+        # ---- pin weights
+        w = [1.0] * len(world)
+        pinned = 0
+        if pin is not None:
+            if pin.get("group") is not None:
+                vg = src.vertex_groups.get(str(pin["group"]))
+                if vg is None:
+                    raise MifOpError("pin.group: '%s' has no vertex group %r. %s" % (src.name, pin["group"], tail))
+                layer = bm.verts.layers.deform.active
+                held = [i for i, v in enumerate(bm.verts) if layer is not None and v[layer].get(vg.index, 0.0) > 0.0]
+            else:
+                near = Vector(finite_floats(list(pin["near"]), "pin.near")) if isinstance(pin["near"], (list, tuple)) \
+                    and len(pin["near"]) == 3 else None
+                if near is None:
+                    raise MifOpError("pin.near is [x, y, z] (world). %s" % tail)
+                rad = finite_float(pin.get("radius", span / 20.0), "pin.radius")
+                held = [i for i, p in enumerate(world) if (p - near).length <= rad]
+            if not held:
+                raise MifOpError("pin holds no vertex of '%s'. %s" % (src.name, tail))
+            fall = finite_float(pin.get("falloff", span / 4.0), "pin.falloff")
+            if fall < 0:
+                raise MifOpError("pin.falloff is 0 or more (metres). %s" % tail)
+            kd = KDTree(len(held))
+            for j, i in enumerate(held):
+                kd.insert(world[i] - n0 * (world[i] - c).dot(n0), j)
+            kd.balance()
+            hs = set(held)
+            for i, p in enumerate(world):
+                if i in hs:
+                    w[i] = 0.0
+                    continue
+                d = kd.find(p - n0 * (p - c).dot(n0))[2]
+                x = 1.0 if fall <= 0 else min(1.0, d / fall)
+                w[i] = x * x * (3.0 - 2.0 * x)
+            pinned = len(held)
+        # ---- the conformed position of each vertex
+        new = []
+        reply = {}
+        if mode == "BEND":
+            ax = params.get("axis")
+            if not isinstance(ax, dict) or set(ax) - {"point", "direction"} or ax.get("point") is None \
+                    or ax.get("direction") is None:
+                raise MifOpError("BEND needs axis {point [x,y,z], direction [x,y,z]} (world). %s" % tail)
+            P = Vector(finite_floats(list(ax["point"]), "axis.point"))
+            d = Vector(finite_floats(list(ax["direction"]), "axis.direction"))
+            if d.length < 1e-9:
+                raise MifOpError("axis.direction has no length. %s" % tail)
+            d.normalize()
+            rel = c - P
+            e1 = rel - d * rel.dot(d)
+            if e1.length < 1e-9:
+                raise MifOpError("the panel's centre is on the axis - nothing to bend round. %s" % tail)
+            dist = e1.length
+            e1.normalize()
+            if abs(n0.dot(e1)) < math.cos(math.radians(25.0)):
+                raise MifOpError("the panel does not face the axis: its normal is %.0f degrees off the radius to it - a "
+                                 "BEND rolls a panel lying square to that radius. %s"
+                                 % (math.degrees(math.acos(min(1.0, abs(n0.dot(e1))))), tail))
+            n0 = n0 if n0.dot(e1) > 0 else -n0
+            e2 = d.cross(e1)
+            radius = take_float(params, "radius", default=dist)
+            if not radius > 0:
+                raise MifOpError("radius must be above 0, got %r. %s" % (radius, tail))
+            for p in world:
+                a = (p - P).dot(d)
+                s_ = (p - c).dot(e2)
+                h = (p - c).dot(n0)
+                th = s_ / radius
+                q = P + d * a + (e1 * math.cos(th) + e2 * math.sin(th)) * (radius + h)
+                new.append(q)
+            reply = {"axis": {"point": [round(x, 6) for x in P], "direction": [round(x, 6) for x in d]},
+                     "radius": round(radius, 6), "arcDegrees": None}
+            ss = [(p - c).dot(e2) for p in world]
+            reply["arcDegrees"] = round(math.degrees((max(ss) - min(ss)) / radius), 3)
+        else:
+            body = get_object(take(params, "body", required=True, kind=str), want_mesh=True)
+            if body is src:
+                raise MifOpError("body is the panel itself; name the mesh to wrap onto. %s" % tail)
+            offset = take_float(params, "offset", default=0.0)
+            if not math.isfinite(offset):
+                raise MifOpError("offset must be finite. %s" % tail)
+            bb = evaluated_world(body)
+            try:
+                tree = BVHTree.FromBMesh(bb)
+            finally:
+                bb.free()
+            bc = sum((Vector(b) for b in body.bound_box), Vector()) / 8.0
+            bc = body.matrix_world @ bc
+            n0 = n0 if n0.dot(c - bc) > 0 else -n0
+            for p in world:
+                h = (p - c).dot(n0)
+                mid = p - n0 * h
+                loc, nrm, _i, _d = tree.find_nearest(mid)
+                if loc is None:
+                    new.append(p.copy())
+                    continue
+                if nrm.dot(mid - loc) < 0 and (mid - loc).length > 1e-9:
+                    nrm = -nrm
+                new.append(loc + nrm.normalized() * (offset + h))
+            reply = {"body": body.name, "offset": offset}
+        moved = 0
+        for v, p, q, wt in zip(bm.verts, world, new, w):
+            if wt <= 0.0:
+                continue
+            v.co = p.lerp(q, wt) - shift
+            moved += 1
+        # ---- read back
+        after = [v.co + shift for v in bm.verts]
+        rel = []
+        for e in bm.edges:
+            a, b = e.verts
+            l0 = (world[a.index] - world[b.index]).length
+            if l0 > 1e-12:
+                rel.append(abs((after[a.index] - after[b.index]).length / l0 - 1.0))
+        reply["edgeLengthChange"] = {"mean": round(sum(rel) / len(rel), 6) if rel else 0.0,
+                                     "worst": round(max(rel), 6) if rel else 0.0}
+        full = [i for i, wt in enumerate(w) if wt >= 1.0]
+        if mode == "BEND":
+            rr = [((after[i] - P) - d * (after[i] - P).dot(d)).length for i in full]
+            reply["landedRadius"] = {"min": round(min(rr), 6), "max": round(max(rr), 6)} if rr else None
+        else:
+            dd = [tree.find_nearest(after[i])[3] for i in full]
+            reply["distanceToBody"] = {"min": round(min(dd), 6), "mean": round(sum(dd) / len(dd), 6),
+                                       "max": round(max(dd), 6)} if dd else None
+        hh = [(p - c).dot(n0) for p in world]
+        reply["panelThickness"] = round(max(hh) - min(hh), 6)
+        target = src
+        if name is not None:
+            me = src.data.copy()
+            target = bpy.data.objects.new(name, me)
+            for col in src.users_collection:
+                col.objects.link(target)
+            target.matrix_world = src.matrix_world.copy()
+        _write_world(bm, target, shift)
+    finally:
+        bm.free()
+    out = {"object": target.name, "source": src.name, "copied": name is not None, "mode": mode,
+           "requestedName": name, "nameWasSuffixed": name is not None and target.name != name,
+           "verticesMoved": moved, "pinned": pinned, "counts": mesh_counts(target)}
+    out.update(reply)
+    out.update(shared_data_note(target))
+    return out
+
+
+# --------------------------------------------------------------------------------------------- cell_pattern
+_CELL_KEYS = ("object", "spacing", "grooveWidth", "grooveDepth", "bevel", "tilt", "seed", "attribute",
+              "valueAttribute", "name")
+
+
+def _cell_spacing(spec, src, bm, tail):
+    """Per vertex the cell spacing: a number, or {group, inside, outside} - inside where the group's weight is 1,
+    outside where it is 0 (or the vertex is not in it), blended between."""
+    if isinstance(spec, (int, float)) and not isinstance(spec, bool):
+        v = finite_float(spec, "spacing")
+        if v <= 0:
+            raise MifOpError("spacing must be above 0 (metres between cell centres). %s" % tail)
+        return [v] * len(bm.verts), v
+    if not isinstance(spec, dict) or set(spec) - {"group", "inside", "outside"} or spec.get("group") is None \
+            or spec.get("inside") is None or spec.get("outside") is None:
+        raise MifOpError("spacing is metres, or {group, inside, outside} (metres in and out of a vertex group); got %r. "
+                         "%s" % (spec, tail))
+    vg = src.vertex_groups.get(str(spec["group"]))
+    if vg is None:
+        raise MifOpError("spacing.group: '%s' has no vertex group %r. %s" % (src.name, spec["group"], tail))
+    a, b = finite_float(spec["inside"], "spacing.inside"), finite_float(spec["outside"], "spacing.outside")
+    if a <= 0 or b <= 0:
+        raise MifOpError("spacing.inside and spacing.outside must be above 0. %s" % tail)
+    layer = bm.verts.layers.deform.active
+    out = []
+    for v in bm.verts:
+        w = v[layer].get(vg.index, 0.0) if layer is not None else 0.0
+        out.append(b + (a - b) * max(0.0, min(1.0, w)))
+    return out, min(a, b)
+
+
+def op_cell_pattern(params):
+    """Crisp cells and scales on a dense mesh: seeds spread over the surface, a groove on every border between two
+    cells, a bevel up to a flat top, a shingle tilt, and a per-cell id and value the material can read.
+
+    THE GAP (FOUND 2026-11-18, round 3, one build): no op wrote a cell pattern onto a sculpt. A legacy VORONOI F2-F1
+    texture on a DISPLACE modifier gave pyramids that read as felt at full-body distance, so the build computed cells per
+    vertex in numpy (seeds on the surface, distance to the bisector, a groove and bevel profile) and drove a texture-less
+    DISPLACE through a vertex group.
+
+    spacing (metres between cell centres, or {group, inside, outside} - a vertex group's weight blends the two) places
+    seeds on the vertices by Poisson-disk sampling (no two closer than 0.85 x the spacing there; seed shuffles). Each
+    vertex belongs to its nearest seed; its distance to the border is its distance to the bisecting plane of its two
+    nearest seeds. Profile across the border: a flat groove grooveWidth wide and grooveDepth deep, a straight bevel
+    (default a quarter of the spacing... capped at a third) up to the cell's flat top, each vertex moved along its
+    normal. tilt {direction [x,y,z], amount (metres)} raises each cell along the direction, -amount/2 at its back to
+    +amount/2 at its front - a shingle. attribute (default cell_id, INT on points) holds each vertex's cell and
+    valueAttribute (default cell_value, FLOAT on points) a 0-1 random per cell, so the colour can follow the same cells.
+    name writes a copy. Reply: cells, the expected count for the area (area / (0.866 x spacing^2), hexagonal), the mean
+    cell area, verticesInGroove, deepest, and the attributes. Refused, nothing changed: spacing not above 0 or a group
+    that is not there, grooveWidth under the mesh's median edge (the groove would fall between vertices) or wider than
+    half the spacing, grooveDepth missing, a bevel below 0, tilt without a direction, shape keys.
+    """
+    reject_unknown(params, _CELL_KEYS, "cell_pattern")
+    tail = "NOTHING was changed."
+    src = get_object(take(params, "object", required=True, kind=str), want_mesh=True)
+    if params.get("spacing") is None or params.get("grooveDepth") is None:
+        raise MifOpError("cell_pattern needs spacing and grooveDepth (metres). %s" % tail)
+    depth = finite_float(params["grooveDepth"], "grooveDepth")
+    seed = take_int(params, "seed", default=1)
+    tilt = params.get("tilt")
+    t_dir, t_amt = None, 0.0
+    if tilt is not None:
+        if not isinstance(tilt, dict) or set(tilt) - {"direction", "amount"} or tilt.get("direction") is None:
+            raise MifOpError("tilt is {direction [x,y,z], amount (metres)}, got %r. %s" % (tilt, tail))
+        t_dir = Vector(finite_floats(list(tilt["direction"]), "tilt.direction"))
+        if t_dir.length < 1e-9:
+            raise MifOpError("tilt.direction has no length. %s" % tail)
+        t_dir.normalize()
+        t_amt = finite_float(tilt.get("amount", 0.0), "tilt.amount")
+    attr = take(params, "attribute", default="cell_id", kind=str)
+    vattr = take(params, "valueAttribute", default="cell_value", kind=str)
+    name = take(params, "name", default=None, kind=str)
+    import random as _random                 # noqa: PLC0415
+    from mathutils.kdtree import KDTree      # noqa: PLC0415 - after the refusals (offline stub)
+    bm, shift = _world_edit(src, "cell_pattern")
+    try:
+        bm.verts.ensure_lookup_table()
+        bm.normal_update()
+        if not len(bm.faces):
+            raise MifOpError("'%s' has no faces. %s" % (src.name, tail))
+        spacing_v, smallest = _cell_spacing(params["spacing"], src, bm, tail)
+        gw = finite_float(params.get("grooveWidth", smallest * 0.08), "grooveWidth")
+        bevel = finite_float(params.get("bevel", min(smallest / 4.0, smallest / 3.0 - gw / 2.0)), "bevel")
+        lens = sorted(e.calc_length() for e in bm.edges)
+        med = lens[len(lens) // 2] if lens else 0.0
+        if gw < med:
+            raise MifOpError("grooveWidth %g is under the mesh's median edge %.4g - the groove would fall between "
+                             "vertices; subdivide or remesh first, or widen it. %s" % (gw, med, tail))
+        if gw * 2.0 > smallest:
+            raise MifOpError("grooveWidth %g is over half the smallest spacing %g - the grooves would be the whole "
+                             "surface. %s" % (gw, smallest, tail))
+        if bevel < 0:
+            raise MifOpError("bevel is 0 or more (metres). %s" % tail)
+        normals = [v.normal.copy() for v in bm.verts]
+        # ---- Poisson-disk seeds on the vertices
+        gen = _random.Random(seed)
+        order = list(range(len(bm.verts)))
+        gen.shuffle(order)
+        cell = max(1e-9, 0.85 * smallest / math.sqrt(3.0))
+        grid = {}
+        seeds = []
+        for i in order:
+            p = bm.verts[i].co
+            r = 0.85 * spacing_v[i]
+            key = (int(math.floor(p.x / cell)), int(math.floor(p.y / cell)), int(math.floor(p.z / cell)))
+            reach = int(math.ceil(r / cell))
+            ok = True
+            for dx in range(-reach, reach + 1):
+                for dy in range(-reach, reach + 1):
+                    for dz in range(-reach, reach + 1):
+                        for j in grid.get((key[0] + dx, key[1] + dy, key[2] + dz), ()):
+                            if (bm.verts[j].co - p).length < r:
+                                ok = False
+                                break
+                        if not ok:
+                            break
+                    if not ok:
+                        break
+                if not ok:
+                    break
+            if ok:
+                grid.setdefault(key, []).append(i)
+                seeds.append(i)
+        if len(seeds) < 2:
+            raise MifOpError("only %d cell fits at spacing %g on '%s' - the spacing is the part's size or more. %s"
+                             % (len(seeds), smallest, src.name, tail))
+        kd = KDTree(len(seeds))
+        for k, i in enumerate(seeds):
+            kd.insert(bm.verts[i].co, k)
+        kd.balance()
+        values = [gen.random() for _ in seeds]
+        ids, groove, deepest = [], 0, 0.0
+        half = gw / 2.0
+        for v in bm.verts:
+            p = v.co.copy()
+            near = kd.find_n(p, 2)
+            (c1, k1, _d1), (c2, _k2, _d2) = near[0], near[1]
+            u = c2 - c1
+            dist = abs((p - (c1 + c2) / 2.0).dot(u.normalized())) if u.length > 1e-12 else 1e9
+            if dist < half:
+                h = -depth
+                groove += 1
+            elif bevel > 0 and dist < half + bevel:
+                h = -depth * (1.0 - (dist - half) / bevel)
+            else:
+                h = 0.0
+            if t_dir is not None and t_amt:
+                n = normals[v.index]
+                td = t_dir - n * t_dir.dot(n)
+                if td.length > 1e-9:
+                    sp = spacing_v[v.index]
+                    h += t_amt * max(-0.5, min(0.5, (p - c1).dot(td.normalized()) / sp))
+            if h:
+                v.co = p + normals[v.index] * h
+                deepest = max(deepest, abs(h))
+            ids.append(k1)
+        id_layer = bm.verts.layers.int.get(attr) or bm.verts.layers.int.new(attr)
+        val_layer = bm.verts.layers.float.get(vattr) or bm.verts.layers.float.new(vattr)
+        for v, k in zip(bm.verts, ids):
+            v[id_layer] = k
+            v[val_layer] = values[k]
+        area = sum(f.calc_area() for f in bm.faces)
+        target = src
+        if name is not None:
+            me = src.data.copy()
+            target = bpy.data.objects.new(name, me)
+            for col in src.users_collection:
+                col.objects.link(target)
+            target.matrix_world = src.matrix_world.copy()
+        _write_world(bm, target, shift)
+    finally:
+        bm.free()
+    used = len(set(ids))
+    out = {"object": target.name, "source": src.name, "copied": name is not None, "cells": used,
+           "requestedName": name, "nameWasSuffixed": name is not None and target.name != name,
+           "expectedCells": round(area / (0.866 * smallest * smallest), 1) if not isinstance(params["spacing"], dict)
+           else None,
+           "meanCellArea": round(area / max(used, 1), 6), "surfaceArea": round(area, 6),
+           "grooveWidth": gw, "grooveDepth": depth, "bevel": round(bevel, 6), "medianEdge": round(med, 6),
+           "verticesInGroove": groove, "deepest": round(deepest, 9),
+           "tilt": {"direction": [round(x, 6) for x in t_dir], "amount": t_amt} if t_dir is not None else None,
+           "attributes": {"cellId": {"name": attr, "type": "INT", "domain": "POINT"},
+                          "cellValue": {"name": vattr, "type": "FLOAT", "domain": "POINT"}},
+           "counts": mesh_counts(target)}
+    out.update(shared_data_note(target))
+    return out
+
+
 OPS = {
     "clear_envelope": op_clear_envelope,
     "points_inside": op_points_inside,
@@ -8635,6 +9482,8 @@ OPS = {
     "build_sole": op_build_sole,
     "attach_sleeve": op_attach_sleeve,
     "displace_by_rule": op_displace_by_rule,
+    "conform_sheet": op_conform_sheet,
+    "cell_pattern": op_cell_pattern,
     "mesh_distance": op_mesh_distance,
     "deformation_stretch": op_deformation_stretch,
     "blend_weights": op_blend_weights,

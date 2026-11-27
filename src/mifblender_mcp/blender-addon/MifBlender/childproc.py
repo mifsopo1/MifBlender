@@ -22,7 +22,7 @@ THREE THINGS, one module so every spawn path takes them the same way:
                    Memory is private commit on Windows (what ran the machine out) and resident size elsewhere.
 
 KEPT IN STEP: tools/blender-addon/MifBlender/childproc.py is a byte copy of this file - the add-on ships and loads on
-its own, without the server - and tools/test_child_processes.py fails when the two differ. Edit this one, copy it there.
+its own, without the server - and a dev test fails when the two differ. Edit this one, copy it there.
 Standard library only.
 """
 
@@ -350,30 +350,93 @@ def memory_limit_bytes(gb=None):
 # ---- slots: one heavy job at a time, machine-wide ------------------------------------------------------------------
 
 _LOCK = threading.Lock()
+_STALE_LOCK_SECONDS = 30
+
+
+def _holder_tag(pid):
+    """"<pid> <creation time>" - a process, not just a number Windows may give the next process (FOUND 2026-11-22:
+    liveness was the pid alone, so a reused pid kept a dead holder's slot or lock alive)."""
+    return "%d %s" % (int(pid), started(pid))
+
+
+def _holder_alive(tag):
+    """True while the process a _holder_tag names still runs: the pid is alive and, when the tag has a creation time,
+    it is the same one. A bare pid (a row written before the tag) is checked by pid alone."""
+    parts = str(tag or "").split()
+    if not parts or not parts[0].isdigit():
+        return False
+    pid = int(parts[0])
+    if not alive(pid):
+        return False
+    if len(parts) > 1 and parts[1] != "None":
+        return str(started(pid)) == parts[1]
+    return True
+
+
+def _write_json_atomic(path, row):
+    tmp = "%s.%d.%d.tmp" % (path, os.getpid(), threading.get_ident() % 100000)
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(row, fh)
+    os.replace(tmp, path)
 
 
 def _registry_lock(timeout=5.0):
-    """An exclusive lock file for the slot folder, or None when it could not be had in `timeout` seconds - a lock
-    left by a process that died is taken over after 30 seconds."""
+    """An exclusive lock file for the slot folder, or None when it could not be had in `timeout` seconds.
+
+    A lock whose holder is gone (its pid and creation time, _holder_tag) or that is older than _STALE_LOCK_SECONDS is
+    taken over - by RENAMING it to a name of this process's own, so of two processes that both find it stale only one
+    gets it (FOUND 2026-11-22: both removed it and both went on to hold a lock). The renamed file is read again: when it
+    is not the stale lock that was judged (another process took it over and made a fresh one in between), it is put
+    back. Every path waits on the deadline and sleeps - a failed take-over or a file Windows has pending delete (which
+    answers PermissionError, not FileExistsError) used to spin with neither."""
     os.makedirs(JOBS_DIR, exist_ok=True)
     path = os.path.join(JOBS_DIR, ".lock")
     deadline = time.monotonic() + timeout
+    me = _holder_tag(os.getpid())
     while True:
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, str(os.getpid()).encode())
-            os.close(fd)
-            return path
-        except FileExistsError:
             try:
-                if time.time() - os.path.getmtime(path) > 30:
-                    os.remove(path)
-                    continue
+                os.write(fd, me.encode())
+            finally:
+                os.close(fd)
+            return path
+        except (FileExistsError, PermissionError):
+            pass
+        try:
+            with open(path, encoding="utf-8") as fh:
+                seen = fh.read().strip()
+            age = time.time() - os.path.getmtime(path)
+        except OSError:
+            seen, age = None, 0.0           # gone or pending delete: try again after the wait
+        if seen is not None and seen and (not _holder_alive(seen) or age > _STALE_LOCK_SECONDS) or (seen == "" and age > 2):
+            grab = "%s.takeover.%d.%d" % (path, os.getpid(), threading.get_ident() % 100000)
+            try:
+                os.rename(path, grab)
             except OSError:
-                continue
-            if time.monotonic() > deadline:
-                return None
-            time.sleep(0.05)
+                grab = None                 # another process renamed it first
+            if grab:
+                try:
+                    with open(grab, encoding="utf-8") as fh:
+                        got = fh.read().strip()
+                except OSError:
+                    got = None
+                if got == seen:
+                    try:
+                        os.remove(grab)
+                    except OSError:
+                        pass
+                    continue                # the stale lock is gone: create ours at once
+                try:
+                    os.rename(grab, path)   # not the one judged stale: give it back
+                except OSError:
+                    try:
+                        os.remove(grab)
+                    except OSError:
+                        pass
+        if time.monotonic() > deadline:
+            return None
+        time.sleep(0.05)
 
 
 def running():
@@ -392,9 +455,12 @@ def running():
                 row = json.load(fh)
         except (OSError, ValueError):
             continue
-        # a slot lives while its job runs - or, before the job has a pid, while the process that took it runs
-        holder = row.get("pid") or row.get("owner")
-        if not alive(holder):
+        if not isinstance(row, dict):
+            continue
+        # a slot lives while its job runs - or, before the job has a pid, while the process that took it runs; each is
+        # checked by pid AND creation time where the row has one (pidTag, ownerTag)
+        holder = (row.get("pidTag") or row.get("pid")) if row.get("pid") else (row.get("ownerTag") or row.get("owner"))
+        if not _holder_alive(holder):
             try:
                 os.remove(path)
             except OSError:
@@ -415,10 +481,9 @@ def acquire(kind, label=""):
             if len(held) >= max_jobs():
                 return None, held
             sid = "%d_%d_%d" % (os.getpid(), int(time.time() * 1000), threading.get_ident() % 100000)
-            row = {"id": sid, "kind": kind, "label": label, "owner": os.getpid(), "pid": None,
-                   "started": time.strftime("%Y-%m-%dT%H:%M:%S")}
-            with open(os.path.join(JOBS_DIR, sid + ".json"), "w", encoding="utf-8") as fh:
-                json.dump(row, fh)
+            row = {"id": sid, "kind": kind, "label": label, "owner": os.getpid(), "ownerTag": _holder_tag(os.getpid()),
+                   "pid": None, "started": time.strftime("%Y-%m-%dT%H:%M:%S")}
+            _write_json_atomic(os.path.join(JOBS_DIR, sid + ".json"), row)
             return sid, None
         finally:
             try:
@@ -428,16 +493,26 @@ def acquire(kind, label=""):
 
 
 def attach(sid, pid):
-    """Record the job's pid on its slot, so the slot lives exactly as long as the job."""
+    """Record the job's pid on its slot, so the slot lives exactly as long as the job. Under the registry lock and
+    written whole (FOUND 2026-11-22: it rewrote the row outside the lock, so a running() in another process could read
+    it half written, or free it between the read and the write and have it written back)."""
     path = os.path.join(JOBS_DIR, "%s.json" % sid)
-    try:
-        with open(path, encoding="utf-8") as fh:
-            row = json.load(fh)
-        row["pid"] = int(pid)
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(row, fh)
-    except (OSError, ValueError):
-        pass
+    with _LOCK:
+        lock = _registry_lock()
+        try:
+            with open(path, encoding="utf-8") as fh:
+                row = json.load(fh)
+            row["pid"] = int(pid)
+            row["pidTag"] = _holder_tag(pid)
+            _write_json_atomic(path, row)
+        except (OSError, ValueError, TypeError):
+            pass
+        finally:
+            if lock:
+                try:
+                    os.remove(lock)
+                except OSError:
+                    pass
 
 
 def release(sid):
@@ -519,6 +594,12 @@ def watch(proc, sid=None, limit=None, kind="job", interval=0.5):
 def start(args, kind, label="", limit_gb=None, **popen_kwargs):
     """Start a heavy job: a slot, the child with no window, the watchdog. (Popen, Watch, None) or (None, None, the
     refusal) when every slot is taken or the program could not start (the slot is freed again then)."""
+    # the ceiling first (FOUND 2026-11-22): memory_limit_bytes raises on a non-finite one, and read after Popen that left
+    # a child running with its slot held and no watchdog
+    try:
+        limit = None if limit_gb is None else memory_limit_bytes(limit_gb)
+    except ValueError as exc:
+        return None, None, "%s not started: %s" % (kind, exc)
     sid, held = acquire(kind, label)
     if sid is None:
         return None, None, busy_message(kind, held)
@@ -527,7 +608,7 @@ def start(args, kind, label="", limit_gb=None, **popen_kwargs):
     except OSError as exc:
         release(sid)
         return None, None, "%s could not start %s: %s" % (kind, args[0] if isinstance(args, (list, tuple)) else args, exc)
-    return proc, watch(proc, sid, None if limit_gb is None else memory_limit_bytes(limit_gb), kind), None
+    return proc, watch(proc, sid, limit, kind), None
 
 
 def run(args, kind, label="", limit_gb=None, timeout=None, **popen_kwargs):

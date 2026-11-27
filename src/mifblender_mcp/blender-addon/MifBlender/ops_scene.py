@@ -16,7 +16,7 @@ from .ops_common import (remove_objects, MifOpError, UU_PER_BU, VIS_FLAGS, assig
                          exclude_rows, finite_float,
                          finite_floats, get_object, jsonable,
                          limit_rows, material_slot_names, mesh_counts, object_info, reject_unknown,
-                         require_editable, take,
+                         require_editable, rnd, take,
                          take_bool, take_float, take_int, vis_target, visibility_readback)
 
 
@@ -35,7 +35,7 @@ def op_ping(params):
     reject_unknown(params, {"echo"}, "ping")
     from . import server as _server  # local import: avoids an import cycle
     # THE VERSION IS bl_info's. This op kept its own ADDON_VERSION tuple, and both copies sat at 0.1.0 from 0.3.0 to
-    # 1.0.0. make_release's check_addon_version holds bl_info to the uplugin; reading it here keeps ping on the same
+    # 1.0.0. the release script's check_addon_version holds bl_info to the uplugin; reading it here keeps ping on the same
     # number.
     from . import bl_info as _bl_info
     from . import ops_gen as _gen
@@ -109,6 +109,20 @@ def op_ping(params):
 # How many calls disk:true returns when no limit is given. Memory holds 64 at most and needs no default; the part of the
 # file that is read back can hold a couple of thousand.
 _CALL_LOG_DISK_DEFAULT = 50
+
+
+def op_request_status(params):
+    """What happened to a call that timed out, by the requestId its timeout reply named: state running, done (resultOk,
+    resultError, responseKept, responseBytes, requestEndpoint; includeResult adds the kept reply as result) or unknown.
+
+    The request id store is reqids.py. A request_status frame is answered on the socket thread before it would reach
+    this entry (server._handle_client), so it is read while the main thread is still inside the call it asks about;
+    this entry is what describe_op, ping's op list and a batch reach. Changes nothing and records nothing.
+    """
+    reject_unknown(params, {"requestId", "includeResult"}, "request_status",
+                   {"id": "spell it requestId", "rid": "spell it requestId"})
+    from . import reqids
+    return reqids.status_for(params.get("requestId"), take_bool(params, "includeResult", default=False))
 
 
 def op_call_log(params):
@@ -388,7 +402,7 @@ def op_scene_info(params):
 
     # THE OBJECT LIST IS THE ONLY PART OF THIS ANSWER THAT GROWS, and it is the largest single response in the
     # add-on: detail:true measures about 506 bytes an object, so a thousand-object scene is roughly 126 000 tokens
-    # in one reply (docs/25_TOKEN_COST.md, 2026-09-14). objectCount stays the TRUE total whatever the limit, because
+    # in one reply. objectCount stays the TRUE total whatever the limit, because
     # every other field here describes the whole scene and a caller reading a scene summary must not be handed a
     # partial count as if it were the scene's size.
     objects = exclude_rows(objects, params)
@@ -426,12 +440,101 @@ def op_scene_info(params):
 # object_info
 # ---------------------------------------------------------------------------
 
+def _world_points(obj):
+    """An object's EVALUATED points in world space, as an (n, 3) numpy array: a mesh's (or anything that evaluates to
+    one) vertices through matrix_world, else its bounding box corners."""
+    import numpy as np                                        # noqa: PLC0415
+    dg = bpy.context.evaluated_depsgraph_get()
+    ev = obj.evaluated_get(dg)
+    mw = np.array(ev.matrix_world, dtype=np.float64)
+    mesh = None
+    try:
+        mesh = ev.to_mesh() if obj.type in ("MESH", "CURVE", "SURFACE", "FONT", "META") else None
+        if mesh is not None and len(mesh.vertices):
+            co = np.empty(len(mesh.vertices) * 3, dtype=np.float64)
+            mesh.vertices.foreach_get("co", co)
+            local = co.reshape(-1, 3)
+        else:
+            local = np.array([tuple(c) for c in ev.bound_box], dtype=np.float64)
+    finally:
+        if mesh is not None:
+            ev.to_mesh_clear()
+    return local @ mw[:3, :3].T + mw[:3, 3]
+
+
+def _bounds_row(pts, prefix):
+    lo, hi = pts.min(axis=0), pts.max(axis=0)
+    return {prefix + "MinBU": rnd(lo.tolist()), prefix + "MaxBU": rnd(hi.tolist()), prefix + "SizeBU": rnd((hi - lo).tolist())}
+
+
+def _info_frame(raw, obj):
+    """object_info's frame: (4x4 world matrix of the frame with no scale, how it was named)."""
+    from mathutils import Euler, Matrix, Quaternion        # noqa: PLC0415
+    tail = "frame is an object's name (or \"self\"), {object}, {armature, bone}, {quaternion: [w,x,y,z]} or {euler: [x,y,z]}"
+
+    def unscaled(m):
+        loc, rot, _scale = m.decompose()
+        return Matrix.Translation(loc) @ rot.to_matrix().to_4x4()
+    if isinstance(raw, str):
+        src = obj if raw == "self" else get_object(raw)
+        return unscaled(src.matrix_world), {"object": src.name}
+    if not isinstance(raw, dict) or len(raw) == 0:
+        raise MifOpError("%s, got %r." % (tail, raw))
+    if raw.get("bone") is not None:
+        arm = get_object(raw.get("armature") or raw.get("object"))
+        pb = arm.pose.bones.get(raw["bone"]) if arm.type == "ARMATURE" else None
+        if pb is None:
+            raise MifOpError("'%s' has no pose bone %r for the frame." % (arm.name, raw["bone"]))
+        return unscaled(arm.matrix_world @ pb.matrix), {"armature": arm.name, "bone": pb.name}
+    if raw.get("object") is not None:
+        src = get_object(raw["object"])
+        return unscaled(src.matrix_world), {"object": src.name}
+    if raw.get("quaternion") is not None:
+        q = finite_floats(list(raw["quaternion"]), "frame.quaternion") if len(raw["quaternion"]) == 4 else None
+        if q is None:
+            raise MifOpError("frame.quaternion is [w, x, y, z].")
+        return Quaternion(q).normalized().to_matrix().to_4x4(), {"quaternion": q}
+    if raw.get("euler") is not None:
+        e = finite_floats(list(raw["euler"]), "frame.euler") if len(raw["euler"]) == 3 else None
+        if e is None:
+            raise MifOpError("frame.euler is [x, y, z] in radians (XYZ).")
+        return Euler(e, "XYZ").to_matrix().to_4x4(), {"euler": e}
+    raise MifOpError("%s, got %r." % (tail, raw))
+
+
 def op_object_info(params):
     """One object's full record by name: type, transform (basis and world location, rotation mode, scale), visibility,
-    parent and children, material slots, and per-type detail such as a mesh's counts or a light's settings."""
-    reject_unknown(params, {"object", "name"}, "object_info")
+    parent and children, material slots, and per-type detail such as a mesh's counts or a light's settings.
+
+    WORLD BOUNDS BESIDE THE LOCAL ONES (2026-11-25): boundsWorldMinBU / MaxBU / SizeBU from the EVALUATED vertices
+    through matrix_world - not the local box transformed, which is larger for a rotated part. Found 2026-11-18: comparing
+    proportions across parts held only while every part had an identity transform. `objects` (a list) adds the union
+    of their world bounds (unionBoundsWorld*). `frame` measures the bounds in another frame - an object (or "self"),
+    {armature, bone}, {quaternion} or {euler}, its axes without scale - as boundsFrame*: a tilted head's height along
+    its own up axis, a cube rotated 30 degrees measured in its own frame reading its edge lengths."""
+    reject_unknown(params, {"object", "name", "objects", "frame"}, "object_info")
     name = take(params, "object", "name", required=True, kind=str)
-    return {"object": object_info(get_object(name))}
+    obj = get_object(name)
+    rec = object_info(obj)
+    pts = _world_points(obj)
+    rec.update(_bounds_row(pts, "boundsWorld"))
+    out = {"object": rec}
+    if params.get("frame") is not None:
+        fm, shown = _info_frame(params["frame"], obj)
+        inv = fm.inverted()
+        import numpy as np                                    # noqa: PLC0415
+        m = np.array(inv, dtype=np.float64)
+        rec.update(_bounds_row(pts @ m[:3, :3].T + m[:3, 3], "boundsFrame"))
+        rec["frame"] = shown
+    others = params.get("objects")
+    if others is not None:
+        if not isinstance(others, list) or not others or not all(isinstance(n, str) for n in others):
+            raise MifOpError("objects is a list of object names whose world bounds are united with this one's.")
+        import numpy as np                                    # noqa: PLC0415
+        every = [pts] + [_world_points(get_object(n)) for n in dict.fromkeys(others) if n != obj.name]
+        out.update(_bounds_row(np.concatenate(every), "unionBoundsWorld"))
+        out["unionOf"] = [obj.name] + [n for n in dict.fromkeys(others) if n != obj.name]
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -775,14 +878,24 @@ def _colour_management_kept(sc):
     return kept, note
 
 
+_CLEAR_SCENE_KEYS = ("type", "objectType", "purgeOrphans", "purge", "dryRun", "previewId", "previewTtlSeconds")
+
+
 def op_clear_scene(params):
     """Delete every object in the file, or every one of a type; purgeOrphans defaults TRUE and is file-wide. Collections
-    stay and are named when left empty; a baked rigid body world losing a body has its bake freed."""
-    reject_unknown(params, {"type", "objectType", "purgeOrphans", "purge"}, "clear_scene")
-    want_type = take(params, "type", "objectType")
-    purge = take_bool(params, "purgeOrphans", "purge", default=True)
-    if want_type is not None:
-        want_type = str(want_type).upper()
+    stay and are named when left empty; a baked rigid body world losing a body has its bake freed.
+
+    dryRun:true IS THE BULK PREVIEW: every object the clear would delete with its
+    type and data, every data-block the purge would take with its users before, and a previewId that {previewId} alone
+    commits - planned again, refused on any difference, read back. A clear over the change cap answers the same preview
+    instead of a refusal, so a scratch scene of any size clears in two calls. Nothing brings a deleted object back, so a
+    commit never rolls back: a mismatch is reported per object or data-block (partial)."""
+    reject_unknown(params, _CLEAR_SCENE_KEYS, "clear_scene")
+    want_type, purge = _clear_scene_request(params)
+    if take_bool(params, "dryRun", default=False):
+        # Reached inside a batch: a call of its own previews through the handshake (server._dispatch, ops_preview.py).
+        plan = _plan_clear_scene(params)
+        return dict(plan["response"], dryRun=True, changed=False, note="DRY RUN - nothing was deleted.")
 
     targets = [o for o in bpy.data.objects if not want_type or o.type == want_type]
     removed, (purged, purged_names), freed, not_freed, joints = _delete(targets, purge)
@@ -812,10 +925,134 @@ def op_clear_scene(params):
                                if empty else None}
 
 
+def _clear_scene_request(params):
+    """(type or None, purge) - clear_scene's two choices, read the same way by the op and its plan."""
+    want_type = take(params, "type", "objectType")
+    purge = take_bool(params, "purgeOrphans", "purge", default=True)
+    return (str(want_type).upper() if want_type is not None else None), purge
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# THE BULK PREVIEW of clear_scene. One change per object deleted - the targets
+# and the rigid body joints that go with them, as _delete takes them - one per data-block the purge would take, and one
+# tally of the file's objects and purgeable data-blocks, which catches a purge that took something the plan did not list.
+#
+# THE PURGE IS PREDICTED FROM bpy.data.user_map, which reads every ID's users and writes nothing: a data-block goes when
+# it has no fake user and every ID that uses it goes too, repeated until nothing more goes - _delete's passes, run on
+# the map instead of the file. A data-block that already has no user goes on the first pass, as it does in the purge.
+# A shape key ID points back at its mesh without being a user of it, so it is not counted as one.
+# ---------------------------------------------------------------------------------------------------------------------
+_CLEAR_NO_ROLLBACK = "a deleted object and a purged data-block are freed, and no inverse brings them back"
+
+
+def _purgeable():
+    """[(collection name, data-block)] of every data-block in _PURGE_COLLS this build has. READ ONLY."""
+    out = []
+    for coll_name in _PURGE_COLLS:
+        coll = getattr(bpy.data, coll_name, None)
+        if coll is not None:
+            out.extend((coll_name, db) for db in coll)
+    return out
+
+
+def _owners():
+    """{pointer of an ID another ID owns: pointer of its owner} - an embedded node tree (a material's, a world's, a
+    light's) and a shape key ID. Each is freed with its owner, so a use by one is a use by the owner. READ ONLY."""
+    out = {}
+    for coll_name in ("materials", "worlds", "lights", "textures", "linestyles", "scenes"):
+        for idb in getattr(bpy.data, coll_name, None) or ():
+            tree = getattr(idb, "node_tree", None)
+            if tree is not None:
+                out[tree.as_pointer()] = idb.as_pointer()
+    for key in getattr(bpy.data, "shape_keys", None) or ():
+        if getattr(key, "user", None) is not None:
+            out[key.as_pointer()] = key.user.as_pointer()
+    return out
+
+
+def _predict_purge(doomed):
+    """[(collection name, data-block)] the file-wide purge would take once `doomed` objects are gone. READ ONLY."""
+    pool = _purgeable()
+    users = bpy.data.user_map(subset=[db for _c, db in pool])
+    owner = _owners()
+    gone = set(o.as_pointer() for o in doomed)
+    taken, left = [], list(pool)
+    while True:
+        now = []
+        for coll_name, db in left:
+            if getattr(db, "use_fake_user", False):
+                continue
+            me = db.as_pointer()
+            real = [p for p in (owner.get(u.as_pointer(), u.as_pointer()) for u in users.get(db, ())) if p != me]
+            if db.users == 0 or (real and all(p in gone for p in real)):
+                now.append((coll_name, db))
+        if not now:
+            return taken
+        taken.extend(now)
+        gone.update(db.as_pointer() for _c, db in now)
+        left = [row for row in left if row[1].as_pointer() not in gone]
+
+
+def _object_state(obj):
+    data = getattr(obj, "data", None)
+    return {"type": obj.type, "data": data.name if data is not None else None}
+
+
+def _tally():
+    return {"objects": len(bpy.data.objects), "purgeable": len(_purgeable())}
+
+
+def _plan_clear_scene(request):
+    reject_unknown(request, _CLEAR_SCENE_KEYS, "clear_scene")
+    want_type, purge = _clear_scene_request(dict(request))
+    targets = [o for o in bpy.data.objects if not want_type or o.type == want_type]
+    joints = _joints_holding(targets)
+    doomed = sorted(targets + joints, key=lambda o: o.name)
+    purged = sorted(_predict_purge(doomed), key=lambda row: (row[0], row[1].name)) if purge else []
+    changes = [{"kind": "object", "op": "delete", "target": "object:" + o.name, "before": _object_state(o),
+                "after": None} for o in doomed]
+    changes += [{"kind": "datablock", "op": "delete", "target": "%s:%s" % (c, db.name),
+                 "before": {"users": int(db.users), "fakeUser": bool(getattr(db, "use_fake_user", False))},
+                 "after": None} for c, db in purged]
+    before = _tally()
+    if changes:
+        changes.append({"kind": "file", "op": "modify", "target": "file", "field": "counts", "before": before,
+                        "after": {"objects": before["objects"] - len(doomed),
+                                  "purgeable": before["purgeable"] - len(purged)}})
+    stale = _stale_rigid_bakes(doomed)
+    commit = {k: v for k, v in request.items() if k not in ("dryRun", "previewId", "previewTtlSeconds")}
+    return {"changes": changes, "unchanged": [],
+            "context": ["type:%s" % (want_type or "every"), "purgeOrphans:%s" % purge],
+            "commit": commit,
+            "response": {"wouldRemove": [o.name for o in doomed], "wouldRemoveCount": len(doomed),
+                         "jointsWithBodies": [j.name for j in joints] or None,
+                         "wouldPurge": ["%s:%s" % (c, db.name) for c, db in purged], "wouldPurgeCount": len(purged),
+                         "wouldFreeRigidBodyBake": [s[0].name for s in stale] or None,
+                         "purgeOrphans": purge}}
+
+
+def _read_clear_scene(change, _kept):
+    if change["kind"] == "file":
+        return _tally()
+    kind, _sep, name = change["target"].partition(":")
+    if kind == "object":
+        obj = bpy.data.objects.get(name)
+        return None if obj is None else _object_state(obj)
+    db = getattr(bpy.data, kind).get(name)
+    return None if db is None else {"users": int(db.users), "fakeUser": bool(getattr(db, "use_fake_user", False))}
+
+
+PREVIEW = {"clear_scene": {"plan": _plan_clear_scene, "read": _read_clear_scene, "capture": None, "restore": None,
+                           "noRollback": _CLEAR_NO_ROLLBACK}}
+
+
 def op_delete_object(params):
     """Delete one object or a list of them by name; purgeOrphans (default false) then removes only the object data they
     leave without a user. A baked rigid body world losing a body has its bake freed."""
-    reject_unknown(params, {"object", "name", "objects", "purgeOrphans", "purge"},
+    # previewId is the change cap's commit (cap.PREVIEWABLE): server.py hands {previewId} alone to cap.take_commit, which
+    # swaps in the stored request before this runs, so the op never reads it - it is listed so the declared contract
+    # (describe_op, parity_check) matches what a caller sends, as every other previewed op lists it.
+    reject_unknown(params, {"object", "name", "objects", "purgeOrphans", "purge", "previewId"},
                    "delete_object")
     purge = take_bool(params, "purgeOrphans", "purge", default=False)
     names = take(params, "objects")
@@ -881,7 +1118,7 @@ def op_run_python(params):
     left in the shared namespace, with a warning. `fresh: true` runs the code in a clean namespace of its own - the
     pre-imported modules only - and leaves the shared one exactly as it was; nothing the fresh call defines carries
     over. The default stays shared, decided after benchmark round six, where 4 of 9 failed Blender calls used a
-    name an earlier call had defined (docs/TOKEN_OPTIMIZATION.md 2.10).
+    name an earlier call had defined.
     """
     reject_unknown(params, {"code", "script", "file", "filepath", "returnLocals", "fresh"},
                    "run_python", {"reset": "fresh:true runs one call in a clean namespace; the shared one is cleared "
@@ -923,7 +1160,9 @@ def op_run_python(params):
     try:
         with redirect_stdout(out_buf), redirect_stderr(err_buf):
             exec(compile(code, "<mifblender:run_python>", "exec"), namespace)  # noqa: S102
-    except Exception as exc:  # noqa: BLE001
+    # SystemExit IS AN ANSWER, NOT AN EXIT (FOUND 2026-11-22): sys.exit() and exit() raise SystemExit, which is not an
+    # Exception, so it passed this handler and the server's own, ended the accept loop, and took a headless Blender down.
+    except (Exception, SystemExit) as exc:  # noqa: BLE001
         return {
             "ok": False,
             "error": "%s: %s" % (type(exc).__name__, exc),
@@ -990,7 +1229,7 @@ def _host_teardown(code):
 
 
 # ONE NAMESPACE FOR EVERY run_python CALL UNTIL A .blend LOADS, decided after benchmark round six
-# (docs/TOKEN_OPTIMIZATION.md 2.10). Each call got a fresh one, and agents write Python the way a console keeps it:
+#. Each call got a fresh one, and agents write Python the way a console keeps it:
 # 4 of the round's 9 failed Blender calls used a name an earlier call had imported or defined (Vector three times on
 # the walk cycle, where raw Python - whose namespace persists - failed none). A loaded file clears it, since its
 # objects are not the ones an old name would point at; `result` is reset on every call. mathutils' Vector, Matrix,
@@ -1116,6 +1355,9 @@ _VIS_FLAGS = VIS_FLAGS
 # while looking supported everywhere else, which is the worst of both.
 _VISIBILITY_KEYS = {
     "object", "name",
+    # MANY OBJECTS IN ONE CALL (FOUND 2026-11-18): hiding ~110 bake sources took one call each - read by
+    # visibility_selection, which the change cap counts through too (cap._count_set_object_visibility)
+    "objects", "pattern", "collection",
     "hideViewport", "hideRender", "hiddenInViewLayer",
     "visibleCamera", "visibleDiffuse", "visibleGlossy", "visibleTransmission",
     "visibleVolumeScatter", "visibleShadow",
@@ -1203,7 +1445,9 @@ def op_set_object_visibility(params):
     property, and a mesh acting as a reflector or a holdout needs it as much as a lamp does.
 
     params:
-      object (str, required)
+      object (str)                   one object; or
+      objects [names] | pattern (glob over names) | collection   many in one call - one selector, a match of none is
+                                     refused, every object checked before the first write, the change cap counting each
       hideViewport / hideRender (bool)
       visibleCamera / visibleDiffuse / visibleGlossy / visibleTransmission /
       visibleVolumeScatter / visibleShadow (bool)
@@ -1222,19 +1466,109 @@ def op_set_object_visibility(params):
     mistake create_light's `shadow` made until it was fixed the same day.
     """
     reject_unknown(params, _VISIBILITY_KEYS, "set_object_visibility", _VISIBILITY_NOTES)
-    want = take(params, "object", "name", default=None, kind=str)
-    if not want:
-        raise MifOpError("'object' is required. NOTHING was changed.")
-    obj = bpy.data.objects.get(want)
-    if obj is None:
-        raise MifOpError("no object named '%s'. NOTHING was changed." % want)
+    objs, selector = visibility_selection(params)
     # hide_viewport AND hide_render LIVE ON THE OBJECT DATABLOCK, not on the local scene's base, so
     # on linked data they are as unsaveable as a transform. Measured on 5.0.1: this hid a linked
     # cube and reported before/after as fact, and the hide is gone on the next reload.
-    require_editable(obj, "hide or show")
+    for obj in objs:
+        require_editable(obj, "hide or show")
 
-    # RESOLVE EVERY REQUESTED FLAG BEFORE WRITING ANY, so a flag this build lacks refuses the whole
-    # call rather than leaving half of them applied.
+    # RESOLVE EVERY REQUESTED FLAG ON EVERY OBJECT BEFORE WRITING ANY, so a flag this build lacks (or an object outside
+    # the view layer) refuses the whole call rather than leaving half of them applied.
+    plans = [_visibility_plan(obj, params) for obj in objs]
+    if not any(p[0] or p[1] is not None or p[2] for p in plans):
+        raise MifOpError("no visibility flag was given. Pass at least one of %s. NOTHING was "
+                         "changed." % ", ".join(sorted([k for k, _a, _c in _VIS_FLAGS] + ["hiddenInViewLayer"]
+                                                       + [k for k, _a, _c in _DISPLAY_FLAGS])))
+
+    rows = []
+    for obj, (plan, layer_hide, display) in zip(objs, plans):
+        before = dict(_visibility_readback(obj), **_display_readback(obj))
+        for _key, (holder, attr), value in plan:
+            setattr(holder, attr, value)
+        for attr, value in display:
+            setattr(obj, attr, value)
+        if layer_hide is not None:
+            obj.hide_set(layer_hide)
+        after = dict(_visibility_readback(obj), **_display_readback(obj))
+        changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+        rows.append({
+            "object": obj.name,
+            "before": before,
+            "after": after,
+            "changedFields": changed,
+            "changedAnything": bool(changed),
+            # THE QUESTION PEOPLE ACTUALLY ASK. Two flags decide whether this object appears at all,
+            # and they are easy to set and then forget about.
+            "appearsInRender": not after.get("hideRender", False)
+                               and after.get("visibleCamera", True),
+        })
+    if selector == "object":
+        return rows[0]
+    return {"selector": selector, "count": len(rows), "changedCount": sum(1 for r in rows if r["changedAnything"]),
+            "objects": [r["object"] for r in rows],
+            "rows": [{k: r[k] for k in ("object", "changedFields", "appearsInRender")} for r in rows],
+            "changedAnything": any(r["changedAnything"] for r in rows),
+            "after": rows[0]["after"] if len(rows) == 1 else None}
+
+
+_VIS_SELECTORS = ("object", "objects", "pattern", "collection")
+
+
+def visibility_selection(params):
+    """([objects], selector) for set_object_visibility - exactly one of object / objects / pattern / collection.
+
+    pattern is an fnmatch glob over object names ('*_high', 'SM_Bolt*'), case-sensitive; collection takes every object in
+    the collection and its children. A selector that matches nothing is REFUSED: an empty change is not a clean one.
+    The change cap counts what this returns (cap._count_set_object_visibility)."""
+    given = [k for k in _VIS_SELECTORS if params.get(k) is not None] + (["name"] if params.get("name") is not None
+                                                                         and params.get("object") is None else [])
+    given = ["object" if k == "name" else k for k in given]
+    if not given:
+        raise MifOpError("'object' is required - or objects (a list of names), pattern (a glob over names) or collection. "
+                         "NOTHING was changed.")
+    if len(set(given)) > 1:
+        raise MifOpError("pass one of object, objects, pattern or collection - %s were given. NOTHING was changed."
+                         % ", ".join(sorted(set(given))))
+    sel = given[0]
+    if sel == "object":
+        want = take(params, "object", "name", default=None, kind=str)
+        obj = bpy.data.objects.get(want) if want else None
+        if obj is None:
+            raise MifOpError("no object named '%s'. NOTHING was changed." % want)
+        return [obj], sel
+    if sel == "objects":
+        names = params.get("objects")
+        if not isinstance(names, list) or not names or not all(isinstance(n, str) and n for n in names):
+            raise MifOpError("objects is a non-empty list of object names, got %r. NOTHING was changed." % (names,))
+        missing = [n for n in names if bpy.data.objects.get(n) is None]
+        if missing:
+            raise MifOpError("no object named %s. NOTHING was changed." % ", ".join(repr(n) for n in missing[:20]))
+        seen, objs = set(), []
+        for n in names:
+            if n not in seen:
+                seen.add(n)
+                objs.append(bpy.data.objects[n])
+        return objs, sel
+    if sel == "pattern":
+        pat = take(params, "pattern", kind=str)
+        objs = [o for o in bpy.data.objects if fnmatch.fnmatchcase(o.name, str(pat))]
+        if not objs:
+            raise MifOpError("pattern %r matches no object name (a case-sensitive glob: '*_high', 'SM_Bolt*'). NOTHING "
+                             "was changed." % pat)
+        return sorted(objs, key=lambda o: o.name), sel
+    cname = take(params, "collection", kind=str)
+    coll = bpy.data.collections.get(cname)
+    if coll is None:
+        raise MifOpError("no collection named '%s'. NOTHING was changed." % cname)
+    objs = sorted(coll.all_objects, key=lambda o: o.name)
+    if not objs:
+        raise MifOpError("collection '%s' holds no object (its children included). NOTHING was changed." % coll.name)
+    return objs, sel
+
+
+def _visibility_plan(obj, params):
+    """(flag plan, view-layer hide, display plan) for one object - every check, no write."""
     # THE VIEW LAYER'S HIDE is a method pair (hide_set / hide_get), not a flag the table below can set - parsed here,
     # with the other values, before anything is written.
     layer_hide = take_bool(params, "hiddenInViewLayer", default=None) if "hiddenInViewLayer" in params else None
@@ -1252,32 +1586,7 @@ def op_set_object_visibility(params):
                              % (key, ", ".join(attrs),
                                 " and cycles.%s" % cyc if cyc else ""))
         plan.append((key, tgt, take_bool(params, key, default=True)))
-    display = _display_plan(obj, params)
-    if not plan and layer_hide is None and not display:
-        raise MifOpError("no visibility flag was given. Pass at least one of %s. NOTHING was "
-                         "changed." % ", ".join(sorted([k for k, _a, _c in _VIS_FLAGS] + ["hiddenInViewLayer"]
-                                                       + [k for k, _a, _c in _DISPLAY_FLAGS])))
-
-    before = dict(_visibility_readback(obj), **_display_readback(obj))
-    for _key, (holder, attr), value in plan:
-        setattr(holder, attr, value)
-    for attr, value in display:
-        setattr(obj, attr, value)
-    if layer_hide is not None:
-        obj.hide_set(layer_hide)
-    after = dict(_visibility_readback(obj), **_display_readback(obj))
-    changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
-    return {
-        "object": obj.name,
-        "before": before,
-        "after": after,
-        "changedFields": changed,
-        "changedAnything": bool(changed),
-        # THE QUESTION PEOPLE ACTUALLY ASK. Two flags decide whether this object appears at all,
-        # and they are easy to set and then forget about.
-        "appearsInRender": not after.get("hideRender", False)
-                           and after.get("visibleCamera", True),
-    }
+    return plan, layer_hide, _display_plan(obj, params)
 
 
 _CUSTOM_SKIP = {"_RNA_UI", "cycles", "cycles_visibility"}
@@ -1574,7 +1883,7 @@ def op_create_scene(params):
     bpy.context.window.scene needs a window, so it cannot work in background mode". Measured
     2026-09-20 on 3.6.23, 4.2.17 LTS, 4.4.0, 5.0.1 and 5.2.1 LTS, `blender -b --factory-startup`
     has one window manager and ONE WINDOW, bpy.context.window is not None, and the assignment works
-    on all five (tools/probe_blender_background_window.py, ledger B153). What really needs a UI context is
+    on all five. What really needs a UI context is
     bpy.ops.scene.*, which is a different thing and is covered two paragraphs up.
 
     So creation still does not activate, but now as a CHOICE rather than a limitation: building a
@@ -1629,7 +1938,7 @@ def op_create_scene(params):
         # one, with bpy.context.window not None and window.scene assignable. create_scene still does not
         # activate what it makes - that is a choice, so a caller building a scene is not moved out
         # of the one they are working in - but the caller is now told what to call, not that it is
-        # impossible. See tools/probe_blender_background_window.py.
+        # impossible. See a dev test.
         "activeNote": "The new scene is NOT activated - the one you were in stays current. Switch "
                       "with set_current_scene, or leave it and pass the name to ops that take a "
                       "scene.",
@@ -1648,8 +1957,8 @@ def op_delete_scene(params):
     EVERY OTHER CREATABLE THING HAS A REMOVER - delete_object, delete_collection,
     delete_view_layer, remove_constraint, remove_driver, remove_modifier, remove_node - and a scene
     did not. So a scene made through the bridge lived for the rest of the Blender session and was
-    written into the .blend if the file was saved, with no way back except run_python, which is off
-    by default and is not an answer. It bit a suite immediately: test_blender_listings left
+    written into the .blend if the file was saved, with no way back except run_python, which a user
+    may have unticked and is not an answer. It bit a suite immediately: test_blender_listings left
     MifLsScene behind, the next run added MifLsScene.001, and a row about nameExcludes failed on the
     accumulation rather than on the thing it was testing.
 
@@ -1752,7 +2061,7 @@ def op_set_current_scene(params):
     every one of them, bpy.context.window is not None, `bpy.context.window.scene = other` raises
     nothing, and bpy.context.scene follows it immediately. The premise was wrong on every build this addon
     supports, and it had propagated into two response fields, one refusal, the MCP wrapper's
-    docstring and the spec. tools/probe_blender_background_window.py re-runs the measurement.
+    docstring and the spec. a dev test re-runs the measurement.
 
     WHAT SWITCHING ACTUALLY MOVES, and it is more than the name. bpy.context.scene is what almost
     every op in this addon reads - render settings, frame range, the active view layer, the world,
@@ -1922,7 +2231,7 @@ def op_list_scenes(params):
 # ---------------------------------------------------------------------------
 # call_operator, list_recent_operators, enable_addon - behind Allow run_python (2026-10-05)
 # ---------------------------------------------------------------------------
-# DECIDED 2026-10-04 (FEATURE_PARITY_SPEC "Run a registered Blender operator by id ..."): a generic operator call and
+# DECIDED 2026-10-04: a generic operator call and
 # an add-on install both run arbitrary code, so they sit behind the run_python preference.
 
 # REFUSED BY ID: what quits or replaces the session (the server dies with it), what writes the user's files or
@@ -2491,6 +2800,7 @@ OPS = {
     "set_custom_property": op_set_custom_property,
     "ping": op_ping,
     "call_log": op_call_log,
+    "request_status": op_request_status,
     "scene_info": op_scene_info,
     "list_objects": op_list_objects,
     "object_info": op_object_info,

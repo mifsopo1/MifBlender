@@ -1,26 +1,80 @@
-# Runs only when a release tag is pushed: builds the package, publishes it to PyPI with trusted publishing (no stored token),
-# and attaches the add-on zip to the GitHub release.
+# Runs only when a release tag is pushed. The check job (no special permissions) refuses a tag that is not v<pyproject
+# version> or that names a commit off the default branch. The build job, also with read rights only, builds the package
+# and the add-on zip and hands them on as artifacts - so no third-party build step ever runs where a publishing identity
+# is held. Only then does the publish job, which holds that identity in the protected pypi environment, take the built
+# files, create the GitHub release as a draft, publish to PyPI with trusted publishing (no stored token) and make the
+# release public. It checks nothing out and builds nothing. Actions are pinned by commit.
 name: publish
 on:
   push:
     tags: ["v*"]
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: The tag is a release of the default branch at the package's version
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: python3 .github/release_check.py --tag "$GITHUB_REF_NAME" --branch "origin/$DEFAULT_BRANCH"
+  build:
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5.4.2
+        with:
+          version: "0.9.27"     # named, not whichever uv is current (FOUND 2026-11-22); the uv the build was tested with
+      - run: uv build
+      - name: Build the add-on zip
+        run: |
+          export MIF_VERSION="${GITHUB_REF_NAME#v}"
+          mkdir release
+          PYTHONPATH=src python3 -c "import os; from mifblender_mcp.setup_cli import build_addon_zip; build_addon_zip('release/MifBlender-%s.zip' % os.environ['MIF_VERSION'])"
+          cp RELEASE_NOTES.md release/
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: release
+          path: release/
+          if-no-files-found: error
   publish:
+    needs: build
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
       contents: write
       id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: uv build
-      - name: Build the add-on zip
-        run: |
-          V="${GITHUB_REF_NAME#v}"
-          PYTHONPATH=src python3 -c "from mifblender_mcp.setup_cli import build_addon_zip; build_addon_zip('MifBlender-$V.zip')"
-      - uses: pypa/gh-action-pypi-publish@release/v1
-      - name: Create the release
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: dist
+          path: dist/
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: release
+          path: release/
+      - name: Create the release as a draft
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" MifBlender-*.zip --title "MifBlender ${GITHUB_REF_NAME#v}" --notes-file RELEASE_NOTES.md
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$GITHUB_REF_NAME" release/MifBlender-*.zip --draft --title "MifBlender ${GITHUB_REF_NAME#v}" --notes-file release/RELEASE_NOTES.md
+      - uses: pypa/gh-action-pypi-publish@76f52bc884231f62b9a034ebfe128415bbaabdfc  # v1.12.4
+      - name: Make the release public
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false

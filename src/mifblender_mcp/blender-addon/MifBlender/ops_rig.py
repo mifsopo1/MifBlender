@@ -33,6 +33,7 @@ from __future__ import annotations
 import array
 import hashlib
 import math
+import os
 
 import bpy
 from mathutils import Vector
@@ -217,6 +218,39 @@ def _group_weight_scan(obj):
     return acc
 
 
+def _influence_report(obj):
+    """How many bones weight each vertex, and whether a root bone does (2026-11-20, for a game engine's skinning limits:
+    Roblox allows 4 influences a vertex and none on the root). A bone influence is a vertex group, above zero, that names a
+    bone of the armature the mesh's first Armature modifier points at; with no such armature every group counts and
+    armature is None. rootBones are that armature's bones with no parent."""
+    arm = next((m.object for m in obj.modifiers if m.type == "ARMATURE" and getattr(m, "object", None) is not None
+                and m.object.type == "ARMATURE"), None)
+    bones = {b.name for b in arm.data.bones} if arm is not None else None
+    roots = sorted(b.name for b in arm.data.bones if b.parent is None) if arm is not None else []
+    counted = {g.index: g.name for g in obj.vertex_groups if bones is None or g.name in bones}
+    root_idx = {i for i, n in counted.items() if n in roots}
+    hist, worst, over4, on_root = {}, [], 0, 0
+    top = 0
+    for v in obj.data.vertices:
+        n = 0
+        root_hit = False
+        for ge in v.groups:
+            if ge.weight > 0.0 and ge.group in counted:
+                n += 1
+                root_hit = root_hit or ge.group in root_idx
+        hist[n] = hist.get(n, 0) + 1
+        if n > top:
+            top, worst = n, [v.index]
+        elif n == top and len(worst) < 20:
+            worst.append(v.index)
+        over4 += n > 4
+        on_root += root_hit
+    return {"armature": arm.name if arm is not None else None,
+            "counted": "groups naming a bone of %s" % arm.name if arm is not None else "every vertex group",
+            "maxPerVertex": top, "verticesAtMax": worst if top else [], "perVertex": {str(k): hist[k] for k in sorted(hist)},
+            "verticesOver4": over4, "rootBones": roots, "verticesOnRoot": on_root}
+
+
 def _weight_stats(entry):
     """One group's scan entry as {weightedVerts, min, max, mean, total} - None-safe for a group nothing is in."""
     weighted = entry[1] if entry else 0
@@ -297,6 +331,7 @@ def op_list_vertex_groups(params):
         "object": obj.name,
         "count": matched,
         "vertexGroups": rows,
+        "influences": _influence_report(obj),
     }, **extra, **region_reply)
 
 
@@ -1638,6 +1673,56 @@ def _gp_evaluated(ev):
     return {"strokes": strokes, "points": len(coords) // 3, "shape": hashlib.sha256(coords.tobytes()).hexdigest()[:16]}
 
 
+# A SUBDIVISION'S MEMORY (found 2026-11-18: add_modifier SUBSURF levels 1 on a 204k-quad sculpt took a 6 GB worker past
+# its watchdog in 19 s, twice, with no estimate or budget anywhere). Measured 2026-11-25 on 5.0.1, peak paged memory of
+# the whole call on grids: 90k quads at level 1 (360k faces) +0.15 GB, level 2 (1.44M) +0.27 GB, 202k at level 1 (810k)
+# +0.32 GB - about 200-420 bytes an evaluated face. The estimate takes 1 KB a face, for the attributes, UV layers and
+# shape keys a sculpt carries that a grid does not; faces are the mesh's corners times 4^(levels-1).
+_SUBSURF_BYTES_PER_FACE = 1024
+_SUBSURF_RESERVE = 4 * 1024 ** 3
+_SUBSURF_RESERVE_MIN = 512 * 1024 ** 2
+
+
+def _subsurf_memory_guard(obj, mod_type, settings, params):
+    """add_modifier SUBSURF: the evaluated size estimated from the corner count and the levels, refused past
+    memoryBudgetGB or the memory free less a reserve that fits the job. None for other types or objects."""
+    budget_gb = take_float(params, "memoryBudgetGB", default=None)
+    if mod_type != "SUBSURF" or obj.type != "MESH":
+        if budget_gb is not None:
+            raise MifOpError("memoryBudgetGB bounds a SUBSURF's evaluated size; this is a %s on a %s. NOTHING was "
+                             "changed." % (mod_type, obj.type))
+        return None
+    if budget_gb is not None and (not math.isfinite(budget_gb) or budget_gb <= 0):
+        raise MifOpError("memoryBudgetGB is a size in GB above 0, got %r. NOTHING was changed." % budget_gb)
+    levels = settings.get("levels", 1)
+    render = settings.get("renderLevels", settings.get("render_levels", 2))
+    if not all(isinstance(v, int) and not isinstance(v, bool) for v in (levels, render)):
+        return None                                             # the settings write refuses it by name
+    corners = len(obj.data.loops)
+
+    def faces(lv):
+        return 0 if lv <= 0 else corners * 4 ** (lv - 1)
+    est = faces(levels) * _SUBSURF_BYTES_PER_FACE
+    from . import childproc                                     # noqa: PLC0415
+    avail = childproc.available_memory_bytes()
+    reserve = min(_SUBSURF_RESERVE, max(_SUBSURF_RESERVE_MIN, est))
+    budget = int(budget_gb * 1024 ** 3) if budget_gb is not None else (None if avail is None else
+                                                                       max(0, avail - reserve))
+    row = {"levels": levels, "renderLevels": render, "evaluatedFacesEstimate": faces(levels),
+           "renderFacesEstimate": faces(render), "estimatedGB": round(est / 1024 ** 3, 3),
+           "budgetGB": None if budget is None else round(budget / 1024 ** 3, 2),
+           "budgetFrom": "memoryBudgetGB" if budget_gb is not None else (
+               None if avail is None else "memory free now less a %.1f GB reserve" % (reserve / 1024 ** 3))}
+    if budget is not None and est > budget:
+        raise MifOpError(
+            "a SUBSURF at levels %d on '%s' (%d corners) evaluates to about %d faces, estimated %.2f GB (1 KB a face), "
+            "over the %.2f GB %s. Decimate or quad-remesh first, use fewer levels (renderLevels sets the export's "
+            "separately), or pass memoryBudgetGB if the machine can spare it. NOTHING was changed."
+            % (levels, obj.name, corners, faces(levels), est / 1024 ** 3, budget / 1024 ** 3,
+               "budget you gave" if budget_gb is not None else row["budgetFrom"]))
+    return row
+
+
 def _evaluated_counts(obj):
     """What the modifier stack currently PRODUCES, not what the mesh data holds.
 
@@ -1746,7 +1831,7 @@ def _copy_modifier_props(src, dst, target):
     return skipped
 
 
-# A SOLIDIFY ON A CLOSED MESH (decided 2026-11-02; measured on 5.2.1, ledger). It has no edge to thicken from, so it
+# A SOLIDIFY ON A CLOSED MESH. It has no edge to thicken from, so it
 # makes a second closed shell inside the first, facing inward, where no outside view reaches it. A cube of 12 triangles
 # becomes 24 and looks exactly the same at offset -1, and mesh_quality gameReady fails it as a closed part facing inward. At
 # offset 1 the surface grows, and SHRINK_FATTEN makes that same surface (a 2 m cube: x 1.0289, volume 8.71301, both ways)
@@ -1919,7 +2004,8 @@ def op_add_modifier(params):
 
     A SOLIDIFY THAT WOULD MAKE A SECOND SHELL INSIDE A CLOSED MESH IS REFUSED unless hollow is true (_SOLIDIFY_CLOSED says why).
     """
-    reject_unknown(params, ("object", "name", "type", "modifier", "settings", "index", "copyFrom", "to", "hollow"),
+    reject_unknown(params, ("object", "name", "type", "modifier", "settings", "index", "copyFrom", "to", "hollow",
+                            "memoryBudgetGB"),
                    "add_modifier", {
         "apply": "adding and applying are SEPARATE on purpose. A modifier left in the stack still "
                  "changes what export_mesh writes, so adding one is usually all you want; "
@@ -1969,6 +2055,7 @@ def op_add_modifier(params):
         raise MifOpError("settings must be an object of {name: value} - curated camelCase names or the modifier's "
                          "own RNA identifiers. NOTHING was changed.")
 
+    subsurf_memory = _subsurf_memory_guard(obj, mod_type, asked_settings or {}, params)
     mod_name = take(params, "modifier", default=None) or mod_type.title()
     if mod_name in _stack(obj):
         raise MifOpError("'%s' already has a modifier named '%s'. Names must be unique on an "
@@ -2071,10 +2158,16 @@ def op_add_modifier(params):
     folded = (overlap_after is not None and overlap_after > _FOLD_RATIO
               and (overlap_before is None or overlap_before <= _FOLD_RATIO))
 
+    from . import childproc                                     # noqa: PLC0415
+    proc = childproc.memory_bytes(os.getpid())
     return {
         "object": obj.name,
         "modifier": mod.name,
         "type": mod_type,
+        # A SUBSURF's estimate and budget (None for other types), and this Blender's memory after the call, so a driver
+        # sees the climb before a watchdog does.
+        "memoryEstimate": subsurf_memory,
+        "processMemoryGB": round(proc / 1024 ** 3, 2) if proc else None,
         "settingsApplied": applied,
         "stackBefore": before,
         "stackAfter": [m.name for m in _stack(obj)],
@@ -2925,7 +3018,7 @@ def op_apply_modifier(params):
     than the operator's.
 
     dryRun reports what is on the stack and what applying would touch, and changes
-    nothing. It is also the BULK PREVIEW (docs/15 section 5): the apply run on a scratch copy of the object, every
+    nothing. It is also the BULK PREVIEW: the apply run on a scratch copy of the object, every
     change it makes (each moved vertex, or the geometry when the topology changes, and the stack), and a previewId that
     {previewId} alone commits - planned again, refused on any difference, read back, and the mesh and the modifier put
     back on a mismatch. A simulation modifier cannot be previewed: the copy does not share its cache.
@@ -3240,7 +3333,7 @@ def op_rename_bones(params):
     through unique temporary names first. That is invisible in the result and stated here because a
     reader will otherwise wonder why the two-pass exists.
 
-    dryRun:true is the BULK PREVIEW (docs/15 section 5): one change per bone, its name before and after, the skinned
+    dryRun:true is the BULK PREVIEW: one change per bone, its name before and after, the skinned
     meshes as context, and a previewId that {previewId} alone commits - planned again, refused on any difference, read
     back by the bone's index, renamed back on a mismatch.
     """
@@ -3371,7 +3464,7 @@ def op_rename_bones(params):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# THE BULK PREVIEW of rename_bones (ops_preview.py; docs/15 section 5). A bone is named by its INDEX in the armature, which a
+# THE BULK PREVIEW of rename_bones. A bone is named by its INDEX in the armature, which a
 # rename does not move, so the read-back finds it whatever it is called; the inverse renames back through temporary
 # names, as the op itself does, so a swap goes back too.
 # ---------------------------------------------------------------------------------------------------------------------
@@ -3455,6 +3548,18 @@ def op_set_bone_pose(params):
                                rest pose), and the end keeps its world rotation. Refused before any write: a target out
                                of reach (the distance and the reach named), a chain whose joints do not meet, a straight
                                chain with no pole, a constrained chain bone.
+      aim (dict)               {direction: [x,y,z] (WORLD) | swing: [xDeg, zDeg], keepTwist true, frames [s, e], key}
+                               (1.4) - turn the bone so it points along direction (or swung about its own current X,
+                               then Z axis), by the shortest arc about its posed head, and with keepTwist (default)
+                               then turn it about its own new axis by whatever its twist relative to its parent changed:
+                               the shortest arc alone changes that twist 17-25 degrees at 40-70 degree swings and the
+                               joint skin wraps like a candy. frames [s, e] does it on every frame of the
+                               range from the pose there, keyed (key defaults to true with frames and false without, and
+                               frames with key false is refused - the next frame change would undo it). Reply aim.frames
+                               per frame: turnedDeg, twistChangeDeg (after - before, about bone Y of
+                               parent^-1 @ bone, 2*atan2(q.y, q.w)), arcTwistChangeDeg (what the arc alone changed),
+                               directionErrorDeg; and the largest |twistChangeDeg|. Refused: a constrained bone, aim
+                               with any other value in the same call.
 
     THE READ-BACK IS EVALUATED. A pose bone with a constraint on it - an IK chain, a copy
     rotation, a limit - does not end up where you put it, and pose_bone.matrix is the raw value
@@ -3462,7 +3567,7 @@ def op_set_bone_pose(params):
     so this reports both and says which is which.
     """
     reject_unknown(params, {"object", "name", "bone", "location", "rotation", "quaternion",
-                            "scale", "rotationMode", "mirror", "turn", "ik"}, "set_bone_pose")
+                            "scale", "rotationMode", "mirror", "turn", "ik", "aim"}, "set_bone_pose")
     obj = get_object(take(params, "object", "name", required=True))
     if obj.type != "ARMATURE":
         raise MifOpError("'%s' is a %s, not an ARMATURE. NOTHING was changed."
@@ -3542,9 +3647,14 @@ def op_set_bone_pose(params):
                            or scl is not None or params.get("mirror") is not None):
         raise MifOpError("ik writes the whole chain's pose itself - pass it alone (with rotationMode at most); a turn, "
                          "a mirror or channel values go in a call of their own. NOTHING was changed.")
+    aim = _parse_aim(obj, pb, params.get("aim")) if params.get("aim") is not None else None
+    if aim is not None and (ik is not None or turn is not None or loc is not None or rot is not None or quat is not None
+                            or scl is not None or params.get("mirror") is not None):
+        raise MifOpError("aim writes the bone's rotation itself (on every frame of its range) - pass it alone (with "
+                         "rotationMode at most). NOTHING was changed.")
     if loc is None and rot is None and quat is None and scl is None and want_mode is None and turn is None \
-            and ik is None:
-        raise MifOpError("nothing to set - pass location, rotation, quaternion, scale, rotationMode, turn or ik. "
+            and ik is None and aim is None:
+        raise MifOpError("nothing to set - pass location, rotation, quaternion, scale, rotationMode, turn, ik or aim. "
                          "NOTHING was changed.")
     # THE MIRROR IS CHECKED BEFORE THE FIRST WRITE (2026-10-04): its partner, and that partner's rotation mode against
     # the mode this bone will have.
@@ -3567,6 +3677,7 @@ def op_set_bone_pose(params):
         pb.scale = scl
     turned = _apply_turn(obj, pb, turn) if turn is not None else None
     solved = _apply_ik(obj, pb, ik) if ik is not None else None
+    aimed = _apply_aim(obj, pb, aim) if aim is not None else None
     mirrored = None
     if mirror is not None:
         from .ops_pose import mirror_bone_pose   # noqa: PLC0415
@@ -3603,6 +3714,8 @@ def op_set_bone_pose(params):
         reply["turn"] = turned
     if solved is not None:
         reply["ik"] = solved
+    if aimed is not None:
+        reply["aim"] = aimed
     return reply
 
 
@@ -3696,6 +3809,127 @@ def _apply_turn(obj, pb, turn):
         out["note"] = ("the tail lies on the axis, so the turn spun the bone about its own length and the angle cannot "
                        "be read off the tail")
     return out
+
+
+def _twist_deg(obj_pose_parent, mat):
+    """Twist about bone Y of parent^-1 @ bone (the armature frame for a root), in degrees - the internal notes's measure."""
+    rel = (obj_pose_parent.inverted_safe() @ mat) if obj_pose_parent is not None else mat
+    q = rel.to_quaternion()
+    return math.degrees(2.0 * math.atan2(q.y, q.w))
+
+
+def _wrap_deg(d):
+    return (d + 180.0) % 360.0 - 180.0
+
+
+def _parse_aim(obj, pb, raw):
+    if not isinstance(raw, dict):
+        raise MifOpError("aim is {direction | swing, keepTwist, frames, key}, got %r. %s" % (raw, _UNCHANGED))
+    unknown = sorted(str(k) for k in raw if k not in ("direction", "swing", "keepTwist", "frames", "key"))
+    if unknown:
+        raise MifOpError("aim takes direction, swing, keepTwist, frames and key; %s %s not among them. %s"
+                         % (", ".join(unknown), "is" if len(unknown) == 1 else "are", _UNCHANGED))
+    if ("direction" in raw) == ("swing" in raw):
+        raise MifOpError("aim needs direction (a world vector the bone should point along) OR swing ([xDeg, zDeg] "
+                         "about its own X then Z axis) - exactly one. %s" % _UNCHANGED)
+    out = {"direction": None, "swing": None}
+    if "direction" in raw:
+        d = _world_vec(raw["direction"], "aim.direction")
+        if d.length < 1e-9:
+            raise MifOpError("aim.direction is a zero vector, which points nowhere. %s" % _UNCHANGED)
+        out["direction"] = d.normalized()
+    else:
+        sw = raw["swing"]
+        if not isinstance(sw, (list, tuple)) or len(sw) != 2:
+            raise MifOpError("aim.swing is [xDeg, zDeg], got %r. %s" % (sw, _UNCHANGED))
+        out["swing"] = finite_floats(sw, "aim.swing")
+    keep = raw.get("keepTwist", True)
+    if not isinstance(keep, bool):
+        raise MifOpError("aim.keepTwist is true or false, got %r. %s" % (keep, _UNCHANGED))
+    fr = raw.get("frames")
+    if fr is not None and (not isinstance(fr, (list, tuple)) or len(fr) != 2
+                           or any(isinstance(v, bool) or not isinstance(v, int) for v in fr) or fr[1] < fr[0]):
+        raise MifOpError("aim.frames is [start, end] whole frames, got %r. %s" % (fr, _UNCHANGED))
+    key = raw.get("key", fr is not None)
+    if not isinstance(key, bool):
+        raise MifOpError("aim.key is true or false, got %r. %s" % (key, _UNCHANGED))
+    if fr is not None and not key:
+        raise MifOpError("aim.frames with key false would be undone by the next frame change - key it, or aim one "
+                         "frame without frames. %s" % _UNCHANGED)
+    if len(pb.constraints):
+        raise MifOpError("'%s' carries constraints (%s), which would move it after the aim is written and the twist "
+                         "measured - mute them first. %s" % (pb.name, ", ".join(c.type for c in pb.constraints),
+                                                             _UNCHANGED))
+    out.update(keepTwist=keep, frames=list(fr) if fr is not None else None, key=key)
+    return out
+
+
+def _aim_once(obj, pb, aim):
+    from mathutils import Matrix, Quaternion   # noqa: PLC0415
+    ev, epb = _evaluated_bone(obj, pb.name)
+    par = ev.pose.bones[pb.parent.name].matrix.copy() if pb.parent else None
+    m0 = epb.matrix.copy()
+    head = m0.translation.copy()
+    y0 = m0.col[1].to_3d().normalized()
+    if aim["direction"] is not None:
+        want = _arm_dir(obj, aim["direction"])
+    else:
+        xa, za = m0.col[0].to_3d().normalized(), m0.col[2].to_3d().normalized()
+        want = (Quaternion(za, math.radians(aim["swing"][1])) @ Quaternion(xa, math.radians(aim["swing"][0]))) @ y0
+        want.normalize()
+    tw0 = _twist_deg(par, m0)
+    arc = y0.rotation_difference(want).to_matrix().to_4x4()
+    m1 = Matrix.Translation(head) @ arc @ Matrix.Translation(-head) @ m0
+    arc_change = _wrap_deg(_twist_deg(par, m1) - tw0)
+    if aim["keepTwist"]:
+        m1 = m1 @ Matrix.Rotation(math.radians(-arc_change), 4, "Y")
+    _write_pose_matrix(pb, m1)
+    ev, epb = _evaluated_bone(obj, pb.name)
+    m2 = epb.matrix
+    y2 = m2.col[1].to_3d().normalized()
+    par2 = ev.pose.bones[pb.parent.name].matrix if pb.parent else None
+    return {"turnedDeg": round(math.degrees(y0.angle(want, 0.0)), 4),
+            "twistChangeDeg": round(_wrap_deg(_twist_deg(par2, m2) - tw0), 4),
+            "arcTwistChangeDeg": round(arc_change, 4),
+            "directionErrorDeg": round(math.degrees(y2.angle(want, 0.0)), 4)}
+
+
+def _apply_aim(obj, pb, aim):
+    from .ops_pose import rotation_path   # noqa: PLC0415
+    scene = bpy.context.scene
+    frames = range(aim["frames"][0], aim["frames"][1] + 1) if aim["frames"] else [scene.frame_current]
+    keep_frame = scene.frame_current
+    rows, prev = [], None
+    try:
+        for f in frames:
+            if aim["frames"]:
+                scene.frame_set(f)
+            row = _aim_once(obj, pb, aim)
+            if pb.rotation_mode == "QUATERNION":
+                q = pb.rotation_quaternion.copy()
+                if prev is not None:
+                    q.make_compatible(prev)
+                pb.rotation_quaternion = q
+                prev = q
+            elif pb.rotation_mode != "AXIS_ANGLE":
+                e = pb.rotation_euler.copy()
+                if prev is not None:
+                    e = e.to_matrix().to_euler(pb.rotation_mode, prev)
+                pb.rotation_euler = e
+                prev = e.copy()
+            if aim["key"]:
+                pb.keyframe_insert(rotation_path(pb), frame=f, group=pb.name)
+            row["frame"] = f
+            rows.append(row)
+    finally:
+        if aim["frames"]:
+            scene.frame_set(keep_frame)
+    worst = max(rows, key=lambda r: abs(r["twistChangeDeg"]))
+    return {"keepTwist": aim["keepTwist"], "keyed": aim["key"], "framesDone": len(rows),
+            "maxAbsTwistChangeDeg": abs(worst["twistChangeDeg"]), "worstFrame": worst["frame"],
+            "maxAbsArcTwistChangeDeg": max(abs(r["arcTwistChangeDeg"]) for r in rows),
+            "maxDirectionErrorDeg": max(r["directionErrorDeg"] for r in rows), "frames": rows[:1000],
+            "framesTruncated": len(rows) > 1000}
 
 
 def _parse_ik(obj, pb, raw):
@@ -6260,7 +6494,7 @@ def op_set_bone_properties(params):
     customShapeRotation (degrees) and customShapeScale ([x, y, z]), color {normal, select, active} ([r, g, b] 0-1, the
     palette set to CUSTOM) or colorPalette (a theme set, THEME01 ... from this build's list) - bone colours are per
     bone from Blender 4.0 and refused before it. dryRun reports what would change. Each bone's previous and new values come back, read
-    off the data after the write. dryRun is also the BULK PREVIEW (docs/15 section 5): one change per bone per property,
+    off the data after the write. dryRun is also the BULK PREVIEW: one change per bone per property,
     and a previewId that {previewId} alone commits - planned again, refused on any difference, read back, put back on a
     mismatch.
     """
@@ -6446,7 +6680,7 @@ def op_set_bone_properties(params):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# THE BULK PREVIEW of set_bone_properties (ops_preview.py; docs/15 section 5, 2026-10-09). One change per bone per property
+# THE BULK PREVIEW of set_bone_properties. One change per bone per property
 # set, before as the op reads it and after as it will write it (connected only where the bone has a parent then; color
 # with the palette CUSTOM). A parent or connected change is undone in edit mode - parent, then each bone's matrix and
 # length, then connected - because connecting moved the head onto the parent's tail.
