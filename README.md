@@ -107,9 +107,17 @@ again:
 }
 ```
 
+<!-- IMAGE SLOT (Claude Desktop): its connector settings with only mifblender visible, cropped and redacted.
+     Save it beside the other step images as step_claude_desktop.png and add a centred img line here, the same as
+     the Claude Code one above, with alt text saying what it shows. -->
+
 ### Cursor
 
 Add the same `mifblender` entry to `~/.cursor/mcp.json`. Cursor lists its MCP servers under **Customize**.
+
+<!-- IMAGE SLOT (Cursor): Customize > MCP with mifblender enabled, from the signed-in scratch profile only.
+     Save it beside the other step images as step_cursor.png and add a centred img line here, the same as
+     the Claude Code one above, with alt text saying what it shows. -->
 
 ### Any other MCP client
 
