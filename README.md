@@ -8,6 +8,14 @@
   <img alt="Blender 3.6 to 5.2" src="https://img.shields.io/badge/Blender-3.6%20to%205.2-7C4DEB?style=flat-square&labelColor=1a1038">
   <a href="https://registry.modelcontextprotocol.io/v0/servers?search=io.github.mifsopo1/mifblender"><img alt="Listed on the MCP Registry" src="https://img.shields.io/badge/MCP%20Registry-listed-7C4DEB?style=flat-square&labelColor=1a1038"></a>
   <img alt="Free" src="https://img.shields.io/badge/price-free-7C4DEB?style=flat-square&labelColor=1a1038">
+  <img alt="469 tools" src="https://img.shields.io/badge/tools-469-7C4DEB?style=flat-square&labelColor=1a1038">
+  <img alt="Tested on Windows" src="https://img.shields.io/badge/tested%20on-Windows-7C4DEB?style=flat-square&labelColor=1a1038">
+  <br>
+  <a href="https://pypi.org/project/mifblender-mcp/"><img alt="PyPI downloads a month" src="https://img.shields.io/pypi/dm/mifblender-mcp?style=flat-square&label=downloads&labelColor=1a1038&color=7C4DEB"></a>
+  <a href="https://pypi.org/project/mifblender-mcp/"><img alt="Python versions" src="https://img.shields.io/pypi/pyversions/mifblender-mcp?style=flat-square&labelColor=1a1038&color=7C4DEB"></a>
+  <a href="https://github.com/mifsopo1/MifBlender/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/mifsopo1/MifBlender?style=flat-square&labelColor=1a1038&color=7C4DEB"></a>
+  <a href="https://glama.ai/mcp/servers/mifsopo1/MifBlender"><img alt="MifBlender MCP server on Glama" src="https://glama.ai/mcp/servers/mifsopo1/MifBlender/badges/score.svg"></a>
+  <a href="https://mcpservers.org/servers/mifsopo1/mifblender"><img alt="Listed on mcpservers.org" src="https://mcpservers.org/badge.svg"></a>
 </p>
 
 <p align="center">
@@ -380,8 +388,3 @@ MifBlender is the Blender half of [MifBridge](https://mifshowcase.store/mifbridg
 5.8 and the tools that move models between the two. MifBlender stands on its own and needs neither.
 
 Questions and bug reports: [open an issue](https://github.com/mifsopo1/MifBlender/issues).
-
-<p align="center"><sub>Also listed on</sub><br>
-  <a href="https://glama.ai/mcp/servers/mifsopo1/MifBlender"><img alt="MifBlender MCP server on Glama" src="https://glama.ai/mcp/servers/mifsopo1/MifBlender/badges/score.svg"></a>
-  <a href="https://mcpservers.org/servers/mifsopo1/mifblender"><img alt="Listed on mcpservers.org" src="https://mcpservers.org/badge.svg"></a>
-</p>
